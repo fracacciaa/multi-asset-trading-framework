@@ -33,7 +33,8 @@ def run_backtest(
         turnover      — one-way turnover on rebalance days, 0 otherwise
     """
     trading_days = returns.index
-    rebalance_dates = set(returns.resample(rebalance_freq).last().index)
+    freq = rebalance_freq.rstrip("E") + "E" if rebalance_freq in ("M", "Q", "Y") else rebalance_freq
+    rebalance_dates = set(returns.resample(freq).last().index)
 
     navs = np.empty(len(trading_days))
     daily_rets = np.zeros(len(trading_days))

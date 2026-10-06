@@ -62,7 +62,7 @@ def expected_shortfall(returns: pd.Series, confidence: float = 0.95) -> float:
     var = value_at_risk(returns, confidence)
     return returns[returns <= var].mean()
 
-def summary(nav: pd.Series, returns: pd.Series | None = None, risk_free: float = 0.0) -> pd.Series:
+def summary(nav: pd.Series, returns=None, risk_free: float = 0.0) -> pd.Series:
     """
     Return a Series of all key performance metrics.
     If returns is None it is inferred from nav.

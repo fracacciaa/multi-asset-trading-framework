@@ -52,7 +52,17 @@ def run_research_backtest(
         if not prev_weights:
             return pd.Series(dtype=float)
 
-        return pd.concat(list(prev_weights.values()))
+        combined = pd.concat(list(prev_weights.values()))
+
+        # Normalize to unit gross exposure: longs sum to +1, shorts sum to -1
+        longs  = combined[combined > 0]
+        shorts = combined[combined < 0]
+        if longs.sum() > 0:
+            combined[combined > 0] = longs / longs.sum()
+        if shorts.sum() < 0:
+            combined[combined < 0] = shorts / shorts.abs().sum()
+
+        return combined
 
     return run_backtest(
         returns=returns,
