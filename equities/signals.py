@@ -1,6 +1,7 @@
 """
 Equities signals: momentum, mean reversion, carry.
-All signals return a cross-sectional z-scored DataFrame indexed date × ticker.
+All signals return a cross-sectional winsorized DataFrame indexed date × ticker.
+Normalization (z-score, Grinold, beta-orthogonalization) is handled by ViewFormationXS.
 """
 
 import pandas as pd
@@ -25,12 +26,11 @@ def momentum(
     skip:       days excluded at the recent end to avoid short-term reversal
                 (default 21 = ~1 month, giving classic 12-1m momentum)
     half_life:  if set, uses exponentially weighted log returns within the
-                formation window (inspired by toraniko's factor_mom).
-                Smooths the cliff-effect when old returns roll off the window.
-                Default 126 = ~6-month half-life. Set to None for plain cumret.
+                formation window. Set to None for plain cumulative return.
     winsor_pct: symmetric cross-sectional winsorization percentile (default 1%)
 
-    Returns date × ticker DataFrame of z-scored scores; NaN until sufficient history.
+    Returns date × ticker DataFrame of winsorized raw returns (not z-scored).
+    All normalization is delegated to ViewFormationXS.
     """
     if half_life is not None:
         # Exponentially weighted: recent months count more, old history decays smoothly
@@ -47,12 +47,7 @@ def momentum(
     q_hi = cumret.quantile(1 - winsor_pct, axis=1)
     cumret = cumret.clip(lower=q_lo, upper=q_hi, axis=0)
 
-    # Cross-sectional z-score per date
-    mean   = cumret.mean(axis=1)
-    std    = cumret.std(axis=1)
-    scores = cumret.sub(mean, axis=0).div(std.replace(0, np.nan), axis=0)
-
-    return scores
+    return cumret
 
 
 def mean_reversion(prices: pd.DataFrame, lookback: int = 21) -> pd.DataFrame:

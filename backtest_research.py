@@ -1,68 +1,89 @@
 """
 Research backtest wrapper.
-Runs run_backtest() using raw signal DataFrames as portfolio weights,
-without requiring the full optimization pipeline.
+Runs run_backtest() with signals processed through ViewFormationXS.
 
-Each asset class contributes a daily view (signal row). Missing views are held
-at the last available weights for that asset class — no forced liquidation.
+Every signal always goes through the full view formation pipeline — the same
+path that would be used in production. Raw signals are never used directly as
+weights.
 """
 
 import pandas as pd
 import numpy as np
+from typing import Optional
+
 from backtest import run_backtest
+from optimization import estimate_covariance
+from view_formation import ViewFormationXS, _DEFAULT_PARAMS
 
 
 def run_research_backtest(
-    signal_dfs: dict[str, pd.DataFrame],
+    signal_dfs: dict,
     returns: pd.DataFrame,
+    vf_params: Optional[dict] = None,
+    cov_window: int = 756,
+    vol_halflife: int = 21,
+    cor_halflife: int = 63,
+    shrinkage_intensity: float = 0.0,
     rebalance_freq: str = "M",
     transaction_cost_bps: float = 5.0,
     initial_capital: float = 1_000_000.0,
 ) -> pd.DataFrame:
     """
-    Research-mode walk-forward backtest.
+    Research-mode walk-forward backtest with ViewFormationXS.
 
-    signal_dfs:           dict mapping asset_class -> signal DataFrame (date x instrument).
-                          Signal values are used directly as portfolio weights.
-                          Instruments not present in `returns` are ignored.
-    returns:              daily returns DataFrame (dates x instruments)
+    signal_dfs:           dict mapping asset_class -> signal DataFrame (date × ticker).
+                          Signals should be raw (not z-scored); VF handles normalization.
+    returns:              daily returns DataFrame (date × ticker), used for both the
+                          backtest P&L and covariance estimation.
+    vf_params:            ViewFormationXS params dict; defaults to tuned params.
+    cov_window:           rows of return history for covariance estimation (default 756 = 3yr)
+    vol_halflife:         EWM halflife for volatility in the risk model (default 21)
+    cor_halflife:         EWM halflife for correlation in the risk model (default 63)
+    shrinkage_intensity:  linear shrinkage toward identity (default 0.0)
     rebalance_freq:       pandas offset alias ('M', 'W', 'Q', ...)
     transaction_cost_bps: one-way cost in basis points
     initial_capital:      starting NAV
 
-    Returns the same DataFrame as run_backtest():
-        nav, daily_return, turnover
+    Returns the same DataFrame as run_backtest(): nav, daily_return, turnover
     """
-    prev_weights: dict[str, pd.Series] = {}
+    params = {**_DEFAULT_PARAMS, **(vf_params or {})}
 
     def signal_fn(date: pd.Timestamp) -> pd.Series:
+        # Collect the latest available signal row for each asset class
+        signals = {}
         for ac, sig_df in signal_dfs.items():
-            # Use data available up to (and including) the rebalance date
             available = sig_df.loc[:date].dropna(how="all")
-            if len(available) == 0:
+            if available.empty:
                 continue
-            view = available.iloc[-1].dropna()
-            if len(view) == 0:
-                continue
-            # Keep only instruments that exist in the returns universe
-            view = view.reindex(returns.columns).dropna()
-            if len(view) > 0:
-                prev_weights[ac] = view
+            sig = available.iloc[-1].dropna()
+            if len(sig) >= 10:
+                signals[ac] = sig
 
-        if not prev_weights:
+        if not signals:
             return pd.Series(dtype=float)
 
-        combined = pd.concat(list(prev_weights.values()))
+        # Combine signals across asset classes (simple average for now)
+        combined = pd.concat(list(signals.values())).groupby(level=0).mean()
 
-        # Normalize to unit gross exposure: longs sum to +1, shorts sum to -1
-        longs  = combined[combined > 0]
-        shorts = combined[combined < 0]
-        if longs.sum() > 0:
-            combined[combined > 0] = longs / longs.sum()
-        if shorts.sum() < 0:
-            combined[combined < 0] = shorts / shorts.abs().sum()
+        # Estimate covariance from returns up to this date
+        ret_history = returns.loc[:date].dropna(how="all").iloc[-cov_window:]
+        if len(ret_history) < vol_halflife * 2:
+            return pd.Series(dtype=float)
 
-        return combined
+        cov = estimate_covariance(
+            ret_history,
+            vol_halflife=vol_halflife,
+            cor_halflife=cor_halflife,
+            shrinkage_intensity=shrinkage_intensity,
+        )
+
+        common = combined.index.intersection(cov.index)
+        if len(common) < 10:
+            return pd.Series(dtype=float)
+
+        return ViewFormationXS(
+            combined.loc[common], cov.loc[common, common], params
+        ).generate_view()
 
     return run_backtest(
         returns=returns,
