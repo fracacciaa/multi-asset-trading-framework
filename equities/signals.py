@@ -55,15 +55,17 @@ def momentum(
 def tsmom(
     prices: pd.DataFrame,
     lookback: int = 252,
+    skip: int = 21,
     winsor_pct: float = 0.01,
 ) -> pd.DataFrame:
     """
     Time-series momentum signal (absolute directional).
 
-    Like momentum() but skip=0 — includes the most recent month.
+    skip=21 (default): mirrors CSMOM's 12-1m convention, removes short-term
+    reversal noise — empirically better than skip=0 across train/val periods.
     Returns raw winsorized cumulative returns; normalization by ViewFormationTS.
     """
-    cumret = prices.shift(1) / prices.shift(lookback + 1) - 1
+    cumret = prices.shift(1 + skip) / prices.shift(lookback + 1 + skip) - 1
     q_lo = cumret.quantile(winsor_pct, axis=1)
     q_hi = cumret.quantile(1 - winsor_pct, axis=1)
     return cumret.clip(lower=q_lo, upper=q_hi, axis=0)
