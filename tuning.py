@@ -23,11 +23,10 @@ import performance
 
 
 _DEFAULT_GRID = {
-    "vol_halflife": [10, 21, 42],
-    "cor_halflife": [63, 126, 252],
-    "shrinkage":    [False, True],
-    "tanh_scale":   [0.75, 1.25, 2.0],
-    "pct_prop":     [0.0, 0.5, 1.0],
+    "cor_halflife":        [63, 126, 252],
+    "shrinkage_intensity": [0.0, 0.1, 0.2, 0.3],
+    "tanh_scale":          [0.75, 1.25, 2.0],
+    "use_grinold":         [True, False],
 }
 
 
@@ -75,10 +74,18 @@ def tune_view_formation(
     for i, combo in enumerate(combos):
         params = dict(zip(keys, combo))
 
-        risk_params  = {k: params[k] for k in ("vol_halflife", "cor_halflife", "shrinkage")}
-        view_params  = {k: params[k] for k in ("tanh_scale", "pct_prop")}
-        view_params["use_rank"] = True
-        view_params["desired_vol"] = 0.10
+        risk_params = {
+            "vol_halflife":        21,
+            "cor_halflife":        params["cor_halflife"],
+            "shrinkage_intensity": params["shrinkage_intensity"],
+        }
+        view_params = {
+            "tanh_scale":  params["tanh_scale"],
+            "use_grinold": params["use_grinold"],
+            "use_rank":    False,
+            "pct_prop":    0.5,
+            "desired_vol": 0.10,
+        }
 
         try:
             signal_fn = _make_signal_fn(
@@ -138,7 +145,7 @@ def _make_signal_fn(
             ret_history,
             vol_halflife=risk_params["vol_halflife"],
             cor_halflife=risk_params["cor_halflife"],
-            shrinkage=risk_params["shrinkage"],
+            shrinkage_intensity=risk_params["shrinkage_intensity"],
         )
 
         common = signal.index.intersection(cov.index)

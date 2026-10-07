@@ -17,7 +17,7 @@ Steps (all applied per rebalance date):
   9.  Re-orthogonalize (tanh reintroduces beta)
   10. Normalize to 2× leverage
   11. Combine raw and rank signals (optional)
-  12. Grinold scaling (conviction → position size)
+  12. Re-normalize leverage after blend
   13. Scale to target volatility
 """
 
@@ -27,10 +27,12 @@ from typing import Optional
 
 
 _DEFAULT_PARAMS = {
-    "tanh_scale":  1.25,
+    "tanh_scale":  0.75,
     "pct_prop":    0.5,
     "desired_vol": 0.10,
-    "use_rank":    True,
+    "use_rank":    False,
+    "use_grinold": True,
+    "use_demean":  True,
 }
 
 
@@ -50,6 +52,7 @@ class ViewFormationXS:
                       1 = rank only, 0.5 = equal blend (default 0.5)
         desired_vol — annualized target vol for the output view (default 0.10)
         use_rank    — whether to compute and blend the rank signal (default True)
+        use_grinold — whether to divide by idio_vol in step 5 (default True)
     """
 
     def __init__(
@@ -63,6 +66,8 @@ class ViewFormationXS:
         self.pct_prop    = p["pct_prop"]
         self.desired_vol = p["desired_vol"]
         self.use_rank    = p["use_rank"]
+        self.use_grinold = p["use_grinold"]
+        self.use_demean  = p["use_demean"]
 
         # Align signal and covariance to common tickers
         common = signal.dropna().index.intersection(cov.index)
@@ -85,14 +90,10 @@ class ViewFormationXS:
         else:
             combined = raw_view
 
-        # Step 12: Grinold scaling (conviction → position size)
-        combined = combined / idio_vols.reindex(combined.index).replace(0, np.nan)
-        combined = combined.dropna()
+        # Re-normalize leverage after blending (blend of two 2x views may drift at coverage edges)
+        combined = self._normalize_leverage(combined)
 
-        # Re-orthogonalize after Grinold (dividing by idio_vol reintroduces beta)
-        combined = self._orthogonalize(combined, betas.reindex(combined.index))
-
-        # Step 13: Scale to target volatility (desired_vol is annualized → convert to daily)
+        # Step 12 → Step 13: Scale to target volatility (desired_vol is annualized → convert to daily)
         combined = self._scale_to_vol(combined)
 
         return combined
@@ -121,9 +122,10 @@ class ViewFormationXS:
         betas = pd.Series(cov_arr @ w_arr / port_var, index=self.cov.index)
 
         # Idiosyncratic vol: sqrt(total_var - systematic_var)
+        # Floor at 5% of total variance so high-beta stocks don't blow up in Grinold scaling
         total_var = pd.Series(np.diag(cov_arr), index=self.cov.index)
         sys_var   = (betas ** 2) * port_var
-        idio_var  = (total_var - sys_var).clip(lower=1e-12)
+        idio_var  = (total_var - sys_var).clip(lower=total_var * 0.05)
         idio_vols = np.sqrt(idio_var)
 
         return betas, idio_vols
@@ -135,12 +137,14 @@ class ViewFormationXS:
         idio_vols: pd.Series,
     ) -> pd.Series:
         """Steps 4–10 applied to a single signal vector."""
-        # Step 4: Demean
-        s = s - s.mean()
+        # Step 4: Demean (optional)
+        if self.use_demean:
+            s = s - s.mean()
 
-        # Step 5: Divide by idiosyncratic vol (Grinold step 1)
-        s = s / idio_vols.reindex(s.index).replace(0, np.nan)
-        s = s.dropna()
+        # Step 5: Grinold — divide by idio_vol to convert signal → conviction (optional)
+        if self.use_grinold:
+            s = s / idio_vols.reindex(s.index).replace(0, np.nan)
+            s = s.dropna()
 
         # Steps 6 + 9 share the same orthogonalization
         s = self._orthogonalize(s, betas.reindex(s.index))

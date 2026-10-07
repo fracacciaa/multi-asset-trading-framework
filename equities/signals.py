@@ -5,35 +5,51 @@ All signals return a cross-sectional z-scored DataFrame indexed date × ticker.
 
 import pandas as pd
 import numpy as np
+from typing import Optional
 
 
-def momentum(prices: pd.DataFrame, lookback: int = 252, skip: int = 21) -> pd.DataFrame:
+def momentum(
+    prices: pd.DataFrame,
+    lookback: int = 252,
+    skip: int = 21,
+    half_life: Optional[int] = 126,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
     """
-    Classic 12-1 month cross-sectional momentum.
+    Cross-sectional momentum signal.
 
-    For each date t and ticker i:
-        cumret[t, i] = price[t - skip] / price[t - (lookback + skip)] - 1
+    For each date t and ticker i, computes a formation-window return, then
+    winsorizes and z-scores cross-sectionally.
 
-    Then per-date: winsorize at 1% tails, z-score cross-sectionally.
-
-    lookback: formation window in trading days (default 252 = ~12 months)
-    skip:     most-recent days excluded to avoid short-term reversal (default 21 = ~1 month)
+    lookback:   formation window in trading days (default 252 = ~12 months)
+    skip:       days excluded at the recent end to avoid short-term reversal
+                (default 21 = ~1 month, giving classic 12-1m momentum)
+    half_life:  if set, uses exponentially weighted log returns within the
+                formation window (inspired by toraniko's factor_mom).
+                Smooths the cliff-effect when old returns roll off the window.
+                Default 126 = ~6-month half-life. Set to None for plain cumret.
+    winsor_pct: symmetric cross-sectional winsorization percentile (default 1%)
 
     Returns date × ticker DataFrame of z-scored scores; NaN until sufficient history.
     """
-    # Lagged prices at start and end of the formation window
-    price_end   = prices.shift(skip)
-    price_start = prices.shift(lookback + skip)
-    cumret = price_end / price_start - 1
+    if half_life is not None:
+        # Exponentially weighted: recent months count more, old history decays smoothly
+        log_ret = np.log(prices / prices.shift(1))
+        lagged  = log_ret.shift(skip)
+        cumret  = lagged.ewm(halflife=half_life, min_periods=lookback).mean()
+    else:
+        price_end   = prices.shift(skip)
+        price_start = prices.shift(lookback + skip)
+        cumret = price_end / price_start - 1
 
-    # Cross-sectional winsorize at 1% tails per date (inspired by toraniko's winsor_factor=0.01)
-    q_lo = cumret.quantile(0.01, axis=1)
-    q_hi = cumret.quantile(0.99, axis=1)
+    # Cross-sectional winsorize per date
+    q_lo = cumret.quantile(winsor_pct, axis=1)
+    q_hi = cumret.quantile(1 - winsor_pct, axis=1)
     cumret = cumret.clip(lower=q_lo, upper=q_hi, axis=0)
 
     # Cross-sectional z-score per date
-    mean = cumret.mean(axis=1)
-    std  = cumret.std(axis=1)
+    mean   = cumret.mean(axis=1)
+    std    = cumret.std(axis=1)
     scores = cumret.sub(mean, axis=0).div(std.replace(0, np.nan), axis=0)
 
     return scores
