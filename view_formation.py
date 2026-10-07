@@ -26,6 +26,10 @@ import pandas as pd
 from typing import Optional
 
 
+_DEFAULT_TS_PARAMS = {
+    "desired_vol": 0.10,
+}
+
 _DEFAULT_PARAMS = {
     "tanh_scale":  0.75,
     "pct_prop":    0.5,
@@ -194,6 +198,88 @@ class ViewFormationXS:
 
     def _scale_to_vol(self, weights: pd.Series) -> pd.Series:
         """Step 13: Scale portfolio to desired_vol (annualized). Cov is in daily units."""
+        desired_vol_daily = self.desired_vol / np.sqrt(252)
+        w = weights.reindex(self.cov.index).fillna(0.0).values
+        port_var = float(w @ self.cov.values @ w)
+        port_vol = np.sqrt(max(port_var, 1e-12))
+        return weights * (desired_vol_daily / port_vol)
+
+
+class ViewFormationTS:
+    """
+    Time-series momentum view: signal ÷ annualized total vol → beta-ortho → vol scale.
+
+    Parameters
+    ----------
+    signal : pd.Series
+        Raw TSMOM signal indexed by ticker (one rebalance date).
+    cov : pd.DataFrame
+        Covariance matrix (daily units, EWMA halflife=21). Used for total-vol
+        normalization and portfolio vol scaling.
+    params : dict, optional
+        desired_vol — annualized target vol for the output view (default 0.10)
+    """
+
+    def __init__(
+        self,
+        signal: pd.Series,
+        cov: pd.DataFrame,
+        params=None,
+    ):
+        p = {**_DEFAULT_TS_PARAMS, **(params or {})}
+        self.desired_vol = p["desired_vol"]
+        common = signal.dropna().index.intersection(cov.index)
+        self.signal = signal.loc[common].astype(float)
+        self.cov    = cov.loc[common, common]
+
+    def generate_view(self) -> pd.Series:
+        """Run the TSMOM pipeline and return portfolio weights."""
+        # Step 1: signal / annualized total vol from cov diagonal (Sharpe-ratio-like)
+        total_vols = pd.Series(
+            np.sqrt(np.diag(self.cov.values)) * np.sqrt(252),
+            index=self.cov.index,
+        ).replace(0, np.nan)
+        s = (self.signal / total_vols).dropna()
+
+        # Step 2: orthogonalize to market beta (removes directional market exposure)
+        betas, _ = self._risk_decomposition()
+        s = self._orthogonalize(s, betas.reindex(s.index))
+
+        # Step 3: portfolio vol scale
+        return self._scale_to_vol(s)
+
+    def _risk_decomposition(self):
+        """Betas and idiosyncratic vols from the covariance matrix."""
+        vols = np.sqrt(np.diag(self.cov.values))
+        vols = pd.Series(vols, index=self.cov.index).replace(0, np.nan).dropna()
+
+        w_mkt = (1.0 / vols)
+        w_mkt = w_mkt / w_mkt.sum()
+        w_mkt = w_mkt.reindex(self.cov.index).fillna(0.0)
+
+        cov_arr  = self.cov.values
+        w_arr    = w_mkt.values
+        port_var = float(w_arr @ cov_arr @ w_arr)
+        betas    = pd.Series(cov_arr @ w_arr / port_var, index=self.cov.index)
+
+        total_var = pd.Series(np.diag(cov_arr), index=self.cov.index)
+        sys_var   = (betas ** 2) * port_var
+        idio_var  = (total_var - sys_var).clip(lower=total_var * 0.05)
+        idio_vols = np.sqrt(idio_var)
+
+        return betas, idio_vols
+
+    def _orthogonalize(self, s: pd.Series, betas: pd.Series) -> pd.Series:
+        """Project out the beta component: s -= (s·b / b·b) * b."""
+        b = betas.reindex(s.index).fillna(0.0)
+        b_dot_b = float(b @ b)
+        if b_dot_b < 1e-12:
+            return s
+        coeff = float(s @ b) / b_dot_b
+        return s - coeff * b
+
+    def _scale_to_vol(self, weights: pd.Series) -> pd.Series:
+        """Scale portfolio to desired_vol (annualized). Cov is in daily units."""
         desired_vol_daily = self.desired_vol / np.sqrt(252)
         w = weights.reindex(self.cov.index).fillna(0.0).values
         port_var = float(w @ self.cov.values @ w)
