@@ -284,6 +284,59 @@ def extract_factors(
     return df
 
 
+def fetch_zero_curves(
+    market: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    use_ois: bool = True,
+) -> pd.DataFrame:
+    """
+    Bootstrap and interpolate OIS (or par yield) curves for one market.
+
+    Pipeline: raw rates → bootstrap (par → zero) → monotone-preserving
+    interpolation onto the 0.5Y grid (0.5, 1.0, 1.5, … 30.0).
+
+    Returns date × tenor (years) DataFrame of continuously compounded zero
+    rates (%), with tenors at every 0.5Y from 0.5 to 30.
+    """
+    if use_ois:
+        raw = fetch_ois_curves(market, start=start, end=end)
+        coupon_freq = OIS_COUPON_FREQ
+        min_tenors = 6
+    else:
+        raw = fetch_curves(market, start=start, end=end)
+        coupon_freq = COUPON_FREQ[market]
+        min_tenors = 4
+
+    zeros = bootstrap_curves(raw, coupon_freq=coupon_freq, min_tenors=min_tenors)
+    return build_full_curves(zeros, method="monotone_preserving")
+
+
+def build_zero_curves_all_markets(
+    markets: Optional[list[str]] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    use_ois: bool = True,
+) -> pd.DataFrame:
+    """
+    Bootstrap and interpolate zero coupon curves for all (or selected) markets.
+
+    Returns date × (market, tenor) MultiIndex column DataFrame.
+    Each market's zero curve covers tenors 0.5, 1.0, 1.5, … 30.0 years.
+    """
+    if markets is None:
+        markets = OIS_MARKETS if use_ois else list(MARKET_PREFIXES.values())
+
+    frames = {}
+    for market in markets:
+        frames[market] = fetch_zero_curves(market, start=start, end=end,
+                                           use_ois=use_ois)
+
+    result = pd.concat(frames, axis=1)
+    result.columns.names = ["market", "tenor"]
+    return result
+
+
 def build_factors_all_markets(
     markets: Optional[list[str]] = None,
     start: Optional[str] = None,
