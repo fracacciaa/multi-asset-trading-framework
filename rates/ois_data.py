@@ -12,7 +12,7 @@ Stride = 3 columns per tenor.
 OIS bootstrap convention: annual coupon for all markets (freq=1).
 Short end ≤ 1Y treated as zero coupon (single payment at maturity).
 
-Market universe (15 markets):
+Market universe (11 markets):
   G10 — full curve (25-26 tenors), long history:
     US          → USDEFFR  (EFFR OIS, 2001+)
     EUR         → EUR      (€STR OIS, 2007+)
@@ -25,15 +25,10 @@ Market universe (15 markets):
 
   G10 — full curve, shorter history:
     Switzerland → CHF      (SARON OIS, 2009+)
-    Norway      → NOK      (NOWA OIS, 2022+)
 
-  EM — limited tenors (15-24) but tradeable:
-    Turkey      → TRY      (2007+, 15 tenors)
+  EM — limited tenors but tradeable:
     India       → INR      (1999+, 15 tenors)
-    Colombia    → COP      (2015+, 17 tenors)
     China       → CNY      (2008+, 11 tenors — borderline MIN_GRID_PTS)
-    Israel      → ILS      (2024+, 24 tenors — 2y history only)
-    Philippines → PHP      (2024+, 12 tenors — 2y history only)
 
 Returns: synthetic constant-maturity 10Y receiver swap
   return_t ≈ −duration × Δy_t / 100
@@ -60,14 +55,9 @@ OIS_SHEETS: dict[str, str] = {
     "Sweden":      "SEK",
     # G10 — full curve, shorter history
     "Switzerland": "CHF",    # 2017+
-    "Norway":      "NOK",    # 2022+
     # EM
-    "Turkey":      "TRY",    # 2007+, 15 tenors
     "India":       "INR",    # 1999+, 15 tenors
-    "Colombia":    "COP",    # 2015+, 17 tenors
     "China":       "CNY",    # 2008+, 11 tenors
-    "Israel":      "ILS",    # 2024+, 24 tenors
-    "Philippines": "PHP",    # 2024+, 12 tenors
 }
 
 OIS_MARKETS = list(OIS_SHEETS.keys())

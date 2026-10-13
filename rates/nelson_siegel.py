@@ -49,7 +49,7 @@ _MIN_CALIBRATION_DATES = 100  # below this, per-market median is unreliable
 # Index in TARGET_TENORS closest to 10Y
 _TEN_YR_IDX: int = int(np.argmin(np.abs(TARGET_TENORS - 10.0)))
 
-ModelType = str  # 'ns_calibrated' | 'ns_free' | 'nss_calibrated' | 'nss_free'
+ModelType = str  # 'ns_calibrated' | 'ns_free' | 'nss_calibrated' | 'nss_free' | 'ns_ewm' | 'nss_ewm'
 
 
 # ── Loading matrices ───────────────────────────────────────────────────────────
@@ -298,20 +298,21 @@ def extract_factors(
     prev_lam1    = lam1 if lam1 is not None else _LAM1_INIT_NSS
     prev_lam2    = lam2 if lam2 is not None else _LAM2_INIT_NSS
 
+    tenors = zero_curve.columns.values.astype(float)
     rows = []
     for date, row in zero_curve.iterrows():
         y = row.values.astype(float)
 
         if model == "ns_calibrated":
-            result = fit_ns_fixed(TARGET_TENORS, y, lam=lam)
+            result = fit_ns_fixed(tenors, y, lam=lam)
         elif model == "ns_free":
-            result = fit_ns_free(TARGET_TENORS, y, lam_init=prev_lam)
+            result = fit_ns_free(tenors, y, lam_init=prev_lam)
             if result is not None:
                 prev_lam = result["lambda"]
         elif model == "nss_calibrated":
-            result = fit_nss_fixed(TARGET_TENORS, y, lam1=lam1, lam2=lam2)
+            result = fit_nss_fixed(tenors, y, lam1=lam1, lam2=lam2)
         elif model == "nss_free":
-            result = fit_nss_free(TARGET_TENORS, y,
+            result = fit_nss_free(tenors, y,
                                    lam1_init=prev_lam1, lam2_init=prev_lam2)
             if result is not None:
                 prev_lam1 = result["lambda1"]
@@ -414,31 +415,217 @@ def _reconstruct_fitted(
     valid = factors.dropna(subset=fc)
     common = zc.index.intersection(valid.index)
     betas_arr = valid.loc[common, fc].values  # (N, 3 or 4)
+    tenors = zc.columns.values.astype(float)
 
     if model == "ns_calibrated":
-        X = _ns_loadings(TARGET_TENORS, lam)           # (70, 3)
-        fitted_arr = (X @ betas_arr.T).T               # (N, 70)
-
-    elif model == "nss_calibrated":
-        X = _nss_loadings(TARGET_TENORS, lam1, lam2)
+        X = _ns_loadings(tenors, lam)
         fitted_arr = (X @ betas_arr.T).T
 
-    elif model == "ns_free":
+    elif model == "nss_calibrated":
+        X = _nss_loadings(tenors, lam1, lam2)
+        fitted_arr = (X @ betas_arr.T).T
+
+    elif model in ("ns_free", "ns_ewm", "ns_blend"):
         lams = valid.loc[common, "lambda"].values
         fitted_arr = np.array([
-            _ns_loadings(TARGET_TENORS, float(l)) @ b
+            _ns_loadings(tenors, float(l)) @ b
             for l, b in zip(lams, betas_arr)
         ])
 
-    else:  # nss_free
+    else:  # nss_free, nss_ewm, nss_blend
         lam1s = valid.loc[common, "lambda1"].values
         lam2s = valid.loc[common, "lambda2"].values
         fitted_arr = np.array([
-            _nss_loadings(TARGET_TENORS, float(l1), float(l2)) @ b
+            _nss_loadings(tenors, float(l1), float(l2)) @ b
             for l1, l2, b in zip(lam1s, lam2s, betas_arr)
         ])
 
-    return pd.DataFrame(fitted_arr, index=common, columns=TARGET_TENORS)
+    return pd.DataFrame(fitted_arr, index=common, columns=tenors)
+
+
+def extract_factors_ewm(
+    zero_curve: pd.DataFrame,
+    ns_or_nss: str = "ns",
+    halflife: float = 252,
+    lam_init: Optional[float] = None,
+    lam1_init: Optional[float] = None,
+    lam2_init: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    NS or NSS factor extraction with EWM-smoothed λ.
+
+    Steps:
+      1. Run the free-λ model on every date (warm-started) to collect raw λ(t).
+      2. Apply causal EWM smoothing: λ̃(t) = ewm(halflife).mean() of the raw series.
+      3. Re-fit OLS per date using λ̃(t) as a fixed input.
+
+    Returns the same column structure as ns_free / nss_free (factors + smoothed
+    lambda columns), so _reconstruct_fitted works with model='ns_ewm'/'nss_ewm'.
+
+    Parameters
+    ----------
+    ns_or_nss : 'ns' or 'nss'
+    halflife  : EWM halflife in trading days (controls adaptation speed)
+    lam_init  : warm-start for NS free-λ optimisation (optional)
+    lam1_init, lam2_init : warm-start for NSS (optional)
+    """
+    tenors = zero_curve.columns.values.astype(float)
+    prev_lam  = lam_init  if lam_init  is not None else _LAM_INIT_NS
+    prev_lam1 = lam1_init if lam1_init is not None else _LAM1_INIT_NSS
+    prev_lam2 = lam2_init if lam2_init is not None else _LAM2_INIT_NSS
+
+    # ── pass 1: collect raw daily optimal λ ──────────────────────────────────
+    raw_lam, raw_lam1, raw_lam2, dates = [], [], [], []
+    for date, row in zero_curve.iterrows():
+        y = row.values.astype(float)
+        if ns_or_nss == "ns":
+            r = fit_ns_free(tenors, y, lam_init=prev_lam)
+            if r is not None:
+                prev_lam = r["lambda"]
+                raw_lam.append(r["lambda"])
+            else:
+                raw_lam.append(np.nan)
+        else:
+            r = fit_nss_free(tenors, y, lam1_init=prev_lam1, lam2_init=prev_lam2)
+            if r is not None:
+                prev_lam1, prev_lam2 = r["lambda1"], r["lambda2"]
+                raw_lam1.append(r["lambda1"])
+                raw_lam2.append(r["lambda2"])
+            else:
+                raw_lam1.append(np.nan)
+                raw_lam2.append(np.nan)
+        dates.append(date)
+
+    # ── pass 2: EWM smoothing (causal) ───────────────────────────────────────
+    if ns_or_nss == "ns":
+        lam_s = (pd.Series(raw_lam, index=dates)
+                   .ewm(halflife=halflife, min_periods=1).mean())
+    else:
+        lam1_s = (pd.Series(raw_lam1, index=dates)
+                    .ewm(halflife=halflife, min_periods=1).mean())
+        lam2_s = (pd.Series(raw_lam2, index=dates)
+                    .ewm(halflife=halflife, min_periods=1).mean())
+
+    # ── pass 3: OLS per date using smoothed λ̃(t) ────────────────────────────
+    if ns_or_nss == "ns":
+        fc = ["level", "slope", "curvature"]
+    else:
+        fc = ["level", "slope", "curvature1", "curvature2"]
+
+    rows = []
+    for date, row in zero_curve.iterrows():
+        y = row.values.astype(float)
+        if ns_or_nss == "ns":
+            lam_t = float(lam_s.loc[date])
+            result = fit_ns_fixed(tenors, y, lam=lam_t)
+            if result is not None:
+                d = dict(zip(fc, result["betas"]))
+                d["lambda"] = lam_t
+                rows.append(pd.Series(d, name=date))
+            else:
+                rows.append(pd.Series({c: np.nan for c in fc + ["lambda"]}, name=date))
+        else:
+            lam1_t = float(lam1_s.loc[date])
+            lam2_t = float(lam2_s.loc[date])
+            result = fit_nss_fixed(tenors, y, lam1=lam1_t, lam2=lam2_t)
+            if result is not None:
+                d = dict(zip(fc, result["betas"]))
+                d["lambda1"] = lam1_t
+                d["lambda2"] = lam2_t
+                rows.append(pd.Series(d, name=date))
+            else:
+                rows.append(pd.Series(
+                    {c: np.nan for c in fc + ["lambda1", "lambda2"]}, name=date))
+
+    df = pd.DataFrame(rows)
+    df.index.name = "date"
+    return df
+
+
+def extract_factors_blend(
+    zero_curve: pd.DataFrame,
+    ns_or_nss: str = "ns",
+    alpha: float = 0.5,
+    lam_calibrated: Optional[float] = None,
+    lam1_calibrated: Optional[float] = None,
+    lam2_calibrated: Optional[float] = None,
+    free_factors: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """
+    NS or NSS factor extraction with blended λ:
+      λ_blend(t) = α × λ_free(t) + (1−α) × λ_calibrated
+
+    α = 0 → pure calibrated;  α = 1 → pure free.
+
+    The free optimisation runs once (or can be passed in as `free_factors` to
+    avoid re-running when sweeping α). Re-fits OLS per date with the blended λ.
+
+    Returns same column structure as ns_free / nss_free (including per-date
+    lambda columns), so _reconstruct_fitted works with model='ns_blend'/'nss_blend'.
+
+    Parameters
+    ----------
+    alpha            : blend weight on the free lambda (0 = calibrated, 1 = free)
+    lam_calibrated   : fixed NS lambda (from calibrate_lambda)
+    lam1_calibrated,
+    lam2_calibrated  : fixed NSS lambdas
+    free_factors     : pre-computed output of extract_factors(model='ns_free' /
+                       'nss_free') — reuse to avoid re-running the optimisation
+    """
+    tenors = zero_curve.columns.values.astype(float)
+
+    # ── get per-date free lambdas (run once or reuse) ─────────────────────────
+    if free_factors is None:
+        free_model = "ns_free" if ns_or_nss == "ns" else "nss_free"
+        free_factors = extract_factors(zero_curve, model=free_model)
+
+    # ── blend ─────────────────────────────────────────────────────────────────
+    if ns_or_nss == "ns":
+        if lam_calibrated is None:
+            raise ValueError("lam_calibrated required for ns_blend")
+        lam_blend = (alpha * free_factors["lambda"]
+                     + (1 - alpha) * lam_calibrated)
+        fc = ["level", "slope", "curvature"]
+    else:
+        if lam1_calibrated is None or lam2_calibrated is None:
+            raise ValueError("lam1_calibrated and lam2_calibrated required for nss_blend")
+        lam1_blend = (alpha * free_factors["lambda1"]
+                      + (1 - alpha) * lam1_calibrated)
+        lam2_blend = (alpha * free_factors["lambda2"]
+                      + (1 - alpha) * lam2_calibrated)
+        fc = ["level", "slope", "curvature1", "curvature2"]
+
+    # ── re-fit OLS per date with blended λ ───────────────────────────────────
+    rows = []
+    for date, row in zero_curve.iterrows():
+        if date not in free_factors.index:
+            continue
+        y = row.values.astype(float)
+        if ns_or_nss == "ns":
+            lam_t = float(lam_blend.loc[date])
+            result = fit_ns_fixed(tenors, y, lam=lam_t)
+            if result is not None:
+                d = dict(zip(fc, result["betas"]))
+                d["lambda"] = lam_t
+                rows.append(pd.Series(d, name=date))
+            else:
+                rows.append(pd.Series({c: np.nan for c in fc + ["lambda"]}, name=date))
+        else:
+            l1_t = float(lam1_blend.loc[date])
+            l2_t = float(lam2_blend.loc[date])
+            result = fit_nss_fixed(tenors, y, lam1=l1_t, lam2=l2_t)
+            if result is not None:
+                d = dict(zip(fc, result["betas"]))
+                d["lambda1"] = l1_t
+                d["lambda2"] = l2_t
+                rows.append(pd.Series(d, name=date))
+            else:
+                rows.append(pd.Series(
+                    {c: np.nan for c in fc + ["lambda1", "lambda2"]}, name=date))
+
+    df = pd.DataFrame(rows)
+    df.index.name = "date"
+    return df
 
 
 # ── Benchmarking ───────────────────────────────────────────────────────────────

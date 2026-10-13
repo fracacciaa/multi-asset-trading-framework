@@ -17,8 +17,8 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from rates.nelson_siegel import build_factors_all_markets
-from rates.ois_data import fetch_ois_returns, OIS_MARKETS
+from rates.nelson_siegel import extract_factors_all_markets
+from rates.ois_data import OIS_MARKETS
 
 
 def _get_factor(factors: pd.DataFrame, factor_name: str) -> pd.DataFrame:
@@ -80,40 +80,39 @@ def build_signals(
     mom_lookback: int = 252,
     mom_skip: int = 21,
     mr_lookback: int = 252,
-    use_ois: bool = True,
     mr_model: str = "ns_free",
 ) -> dict[str, pd.DataFrame]:
     """
     Run the full rates signal pipeline.
 
-    Momentum and carry use NS_fixed (fast, OLS).
-    Mean reversion uses `mr_model` (default: NS_free) for a more accurate
-    level estimate. NS_free adapts λ to unusual curve shapes (flat, inverted)
-    without the β₁ sign instability seen in NSS_free at near-zero rates.
+    Momentum and carry use ns_calibrated (fast, OLS).
+    Mean reversion uses `mr_model` (default: ns_free) for a more accurate
+    level estimate. ns_free adapts λ to unusual curve shapes (flat, inverted)
+    without the β₁ sign instability seen in nss_free at near-zero rates.
 
     Parameters
     ----------
-    mr_model : model for mean reversion level — 'ns_fixed', 'ns_free',
-               'nss_fixed', or 'nss_free'
+    mr_model : model for mean reversion level — 'ns_calibrated', 'ns_free',
+               'nss_calibrated', or 'nss_free'
 
     Returns
     -------
     dict with keys 'momentum', 'carry', 'mean_reversion'.
     Each value is a date × market DataFrame of raw (unnormalised) signals.
     """
-    # NS_fixed for momentum + carry
-    ns_factors = build_factors_all_markets(
+    # ns_calibrated for momentum + carry
+    ns_factors = extract_factors_all_markets(
         markets=markets, start=start, end=end,
-        model="ns_fixed", use_ois=use_ois,
+        model="ns_calibrated",
     )
 
     # Separate model for mean reversion level
-    if mr_model == "ns_fixed":
+    if mr_model == "ns_calibrated":
         mr_factors = ns_factors
     else:
-        mr_factors = build_factors_all_markets(
+        mr_factors = extract_factors_all_markets(
             markets=markets, start=start, end=end,
-            model=mr_model, use_ois=use_ois,
+            model=mr_model,
         )
 
     return {
