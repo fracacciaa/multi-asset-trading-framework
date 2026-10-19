@@ -16,8 +16,8 @@ Covers every test specified in carry_signal_spec.md §11 test_measures.py:
 import numpy as np
 import pytest
 
-from rates.ns_core import fit_ns
-from rates.carry.measures import (
+from rates.production.ns_core import fit_ns
+from rates.production.carry.measures import (
     approx_dv01,
     carry_pickup,
     carry_rolldown_dur,
