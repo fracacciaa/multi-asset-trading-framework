@@ -27,6 +27,16 @@ from rates.nelson_siegel import (
 from rates.ois_data import OIS_MARKETS, fetch_ois_curves
 from rates.yc_builder import build_zero_curve
 
+# ── Cross-country carry constants ──────────────────────────────────────────────
+
+CC_LAM             = 0.3
+CC_BASIS           = "ns"
+CC_TAU_TARGET      = 10.0   # 10Y anchor
+CC_VOL_LOOKBACK    = 252
+CC_MIN_OBS         = 63
+CC_MIN_MARKETS     = 4      # minimum countries for a valid cross-section
+CC_LAG             = 1      # mandatory 1-day signal lag
+
 # ── RV mean-reversion constants ────────────────────────────────────────────────
 
 RV_TRAIN_END  = "2018-12-31"   # lambda calibration window
@@ -164,6 +174,101 @@ def mean_reversion_rv(
     return df
 
 
+def carry_cross_country(
+    markets: Optional[list[str]] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Cross-country carry position book (DV01-neutral, CC DV01-only variant).
+
+    For each DM market: fit NS daily, compute carry at 10Y via carry_reprice,
+    divide by duration to get yield-space carry.  Then cross-section across
+    countries: z-score, inverse-vol size, zero-net, DV01-project.
+
+    Returns
+    -------
+    date × market DataFrame of position weights.
+    Positions are ready-to-trade: inverse-vol sized, zero-net, DV01-neutral,
+    normalised to gross = 1.0, lagged by 1 day.  Positive = receive fixed
+    (long duration); negative = pay fixed (short duration).
+    """
+    from src.nsrv.ns_core import fit_ns
+    from src.nsrv.carry.cross_country import (
+        country_carry_at_target, build_cross_country_positions, DM_MARKETS,
+    )
+    from src.nsrv.carry.experiment import BASELINE
+
+    if markets is None:
+        markets = DM_MARKETS
+
+    # ── Load data and fit NS per market ───────────────────────────────────────
+    curves_dict: dict = {}
+    funding_dict: dict = {}
+    fits_dict: dict = {}
+
+    for mkt in markets:
+        try:
+            c = fetch_ois_curves(mkt, start=start, end=end)
+            t = CC_TAU_TARGET / 40  # 0.25 → 3M OIS funding rate
+            col = 0.25 if 0.25 in c.columns else min(c.columns, key=lambda x: abs(x - 0.25))
+            curves_dict[mkt]  = c
+            funding_dict[mkt] = c[col]
+            fits: dict = {}
+            for date in c.index:
+                row = c.loc[date].dropna()
+                if len(row) < 4:
+                    continue
+                try:
+                    fits[date] = fit_ns(
+                        row.index.to_numpy(float),
+                        row.to_numpy(float) * 100.0,
+                        lam=CC_LAM, basis=CC_BASIS,
+                    )
+                except Exception:
+                    pass
+            if len(fits) >= CC_MIN_OBS:
+                fits_dict[mkt] = fits
+        except Exception:
+            pass
+
+    # ── Carry time series per market ──────────────────────────────────────────
+    cc_series: dict = {}
+    for mkt in markets:
+        if mkt not in fits_dict:
+            continue
+        rf_bp = funding_dict[mkt] * 100.0          # % → bp
+        carry_ts = country_carry_at_target(
+            fits_dict[mkt], curves_dict[mkt], rf_bp, CC_TAU_TARGET, BASELINE,
+        )
+        if len(carry_ts) > 0:
+            cc_series[mkt] = carry_ts
+
+    if len(cc_series) < 2:
+        return pd.DataFrame()
+
+    country_carry_df = pd.DataFrame(cc_series).sort_index()
+
+    # ── Build positions (DV01-neutral, no global-beta hedge) ──────────────────
+    pos_df = build_cross_country_positions(
+        country_carry_df,
+        curves_dict,
+        tau_vol_ref=CC_TAU_TARGET,
+        universe="DM",
+        vol_lookback=CC_VOL_LOOKBACK,
+        min_obs=CC_MIN_OBS,
+        fits_dict=fits_dict,
+        global_beta_neutralize=False,
+    )
+
+    valid = pos_df.notna().sum(axis=1) >= CC_MIN_MARKETS
+    pos_df = pos_df.where(valid)
+    gross  = pos_df.abs().sum(axis=1).replace(0, np.nan)
+    pos_df = pos_df.div(gross, axis=0).shift(CC_LAG)
+    pos_df.index.name = "date"
+    return pos_df
+
+
 def build_signals(
     markets: Optional[list[str]] = None,
     start: Optional[str] = None,
@@ -176,11 +281,16 @@ def build_signals(
 
     Momentum and carry use ns_calibrated (fast, OLS).
     Mean reversion uses the ex_raw factor-neutral NS residual signal.
+    Cross-country carry uses carry_reprice on NS-fitted 10Y curves with DV01
+    neutralisation; returns a ready-to-trade position book.
 
     Returns
     -------
-    dict with keys 'momentum', 'carry', 'mean_reversion'.
-    Each value is a date × market DataFrame of raw (unnormalised) signals.
+    dict with keys:
+      'momentum'            — date × market raw signal (unnormalised)
+      'carry'               — date × market raw signal (unnormalised)
+      'mean_reversion'      — date × market raw signal (unnormalised)
+      'carry_cross_country' — date × market position weights (ready-to-trade)
     """
     ns_factors = extract_factors_all_markets(
         markets=markets, start=start, end=end,
@@ -188,7 +298,8 @@ def build_signals(
     )
 
     return {
-        "momentum":       momentum(ns_factors, lookback=mom_lookback, skip=mom_skip),
-        "carry":          carry(ns_factors),
-        "mean_reversion": mean_reversion_rv(markets=markets, start=start, end=end),
+        "momentum":            momentum(ns_factors, lookback=mom_lookback, skip=mom_skip),
+        "carry":               carry(ns_factors),
+        "mean_reversion":      mean_reversion_rv(markets=markets, start=start, end=end),
+        "carry_cross_country": carry_cross_country(markets=markets, start=start, end=end),
     }
