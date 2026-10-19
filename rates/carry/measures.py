@@ -33,7 +33,7 @@ import numpy as np
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.nsrv.ns_core import NSFit
+    from rates.ns_core import NSFit
 
 
 # ── DV01 / duration helper ─────────────────────────────────────────────────────

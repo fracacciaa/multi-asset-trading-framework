@@ -7,7 +7,7 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 from rates.ois_data import fetch_ois_curves
-from src.nsrv.carry.experiment import run_grid, GRID
+from rates.carry.experiment import run_grid, GRID
 
 MARKETS = ["US", "EUR"]
 

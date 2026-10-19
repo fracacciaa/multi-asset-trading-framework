@@ -20,12 +20,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.nsrv.ns_core import fit_ns
-from src.nsrv.carry.measures import carry_reprice, approx_dv01
-from src.nsrv.carry.signal import build_positions, carry_per_duration, xs_score
-from src.nsrv.carry.returns import cm_total_return_bp, compute_dur_panel
-from src.nsrv.carry.config import CarryConfig
-from src.nsrv.carry.experiment import run_carry_spec
+from rates.ns_core import fit_ns
+from rates.carry.measures import carry_reprice, approx_dv01
+from rates.carry.signal import build_positions, carry_per_duration, xs_score
+from rates.carry.returns import cm_total_return_bp, compute_dur_panel
+from rates.carry.config import CarryConfig
+from rates.carry.experiment import run_carry_spec
 
 
 # ── Synthetic data generator ──────────────────────────────────────────────────

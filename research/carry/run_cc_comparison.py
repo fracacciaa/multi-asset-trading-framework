@@ -19,14 +19,14 @@ warnings.filterwarnings("ignore")
 
 from rates.ois_data import fetch_ois_curves, OIS_MARKETS
 from rates.carry_ois import ois_carry_panel
-from src.nsrv.ns_core import fit_ns
-from src.nsrv.carry.experiment import BASELINE, _compute_carry_panel, _compute_pnl_series
-from src.nsrv.carry.signal import xs_score, dv01_positions, _rebalance_dates, build_positions
-from src.nsrv.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
-from src.nsrv.carry.cross_country import (
+from rates.ns_core import fit_ns
+from rates.carry.experiment import BASELINE, _compute_carry_panel, _compute_pnl_series
+from rates.carry.signal import xs_score, dv01_positions, _rebalance_dates, build_positions
+from rates.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
+from rates.carry.cross_country import (
     country_carry_at_target, build_cross_country_positions, DM_MARKETS,
 )
-from src.nsrv.carry.config import CarryConfig
+from rates.carry.config import CarryConfig
 
 LAM   = 0.3
 BASIS = "ns"

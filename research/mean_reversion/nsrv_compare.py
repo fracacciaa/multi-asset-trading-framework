@@ -23,7 +23,7 @@ from rates.yc_builder    import build_zero_curve
 from rates.nelson_siegel import (
     calibrate_lambda, extract_factors, _reconstruct_fitted, _ns_loadings,
 )
-from src.nsrv.ns_core import fit_ns, ns_loadings as nsrv_loadings
+from rates.ns_core import fit_ns, ns_loadings as nsrv_loadings
 
 TRAIN_END = "2018-12-31"
 OOS_START = "2019-01-01"

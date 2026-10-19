@@ -201,8 +201,8 @@ def momentum_mop(
 
     OOS Sharpe (2019–today): US 0.49, EUR 0.41, AU 0.52, Japan 0.59, NZ 0.37.
     """
-    from src.nsrv.momentum.returns import build_rx_monthly
-    from src.nsrv.carry.cross_country import DM_MARKETS
+    from rates.momentum.returns import build_rx_monthly
+    from rates.carry.cross_country import DM_MARKETS
 
     if markets is None:
         markets = DM_MARKETS
@@ -249,11 +249,11 @@ def carry_cross_country(
     normalised to gross = 1.0, lagged by 1 day.  Positive = receive fixed
     (long duration); negative = pay fixed (short duration).
     """
-    from src.nsrv.ns_core import fit_ns
-    from src.nsrv.carry.cross_country import (
+    from rates.ns_core import fit_ns
+    from rates.carry.cross_country import (
         country_carry_at_target, build_cross_country_positions, DM_MARKETS,
     )
-    from src.nsrv.carry.experiment import BASELINE
+    from rates.carry.experiment import BASELINE
 
     if markets is None:
         markets = DM_MARKETS

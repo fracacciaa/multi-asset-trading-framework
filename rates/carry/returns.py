@@ -23,7 +23,7 @@ import numpy as np
 from typing import TYPE_CHECKING, Tuple
 
 if TYPE_CHECKING:
-    from src.nsrv.ns_core import NSFit
+    from rates.ns_core import NSFit
 
 from .measures import approx_dv01
 

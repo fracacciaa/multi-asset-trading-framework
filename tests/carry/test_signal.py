@@ -13,14 +13,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.nsrv.carry.signal import (
+from rates.carry.signal import (
     carry_per_duration,
     xs_score,
     dv01_positions,
     build_positions,
     _rebalance_dates,
 )
-from src.nsrv.carry.measures import approx_dv01
+from rates.carry.measures import approx_dv01
 
 
 # ── DV01 neutrality ──────────────────────────────────────────────────────────

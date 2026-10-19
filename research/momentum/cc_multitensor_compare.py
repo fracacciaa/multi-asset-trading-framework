@@ -11,12 +11,12 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 from rates.ois_data import fetch_ois_curves
-from src.nsrv.ns_core import fit_ns
-from src.nsrv.carry.experiment import BASELINE
-from src.nsrv.carry.cross_country import (
+from rates.ns_core import fit_ns
+from rates.carry.experiment import BASELINE
+from rates.carry.cross_country import (
     country_carry_at_target, build_cross_country_positions, DM_MARKETS,
 )
-from src.nsrv.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
+from rates.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
 
 LAM, BASIS = 0.3, "ns"
 MIN_TENORS = 4

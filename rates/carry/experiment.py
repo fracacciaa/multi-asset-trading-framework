@@ -28,8 +28,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.nsrv.ns_core import fit_ns, NSFit
-from src.nsrv.evaluate import SpecResult
+from rates.ns_core import fit_ns, NSFit
+from rates.evaluate import SpecResult
 from .config import CarryConfig
 from .measures import (
     approx_dv01, carry_pickup, carry_rolldown_dur,

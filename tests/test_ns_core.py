@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pytest
-from src.nsrv.ns_core import fit_ns, ns_loadings, NFACTORS
+from rates.ns_core import fit_ns, ns_loadings, NFACTORS
 
 
 RNG = np.random.default_rng(42)

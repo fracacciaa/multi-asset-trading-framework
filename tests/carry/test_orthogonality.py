@@ -24,14 +24,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.nsrv.ns_core import fit_ns
-from src.nsrv.carry.measures import (
+from rates.ns_core import fit_ns
+from rates.carry.measures import (
     carry_rolldown_dur,
     carry_rolldown_raw,
     approx_dv01,
 )
-from src.nsrv.carry.signal import carry_per_duration, xs_score, dv01_positions
-from src.nsrv.carry.returns import cm_total_return_bp, compute_dur_panel
+from rates.carry.signal import carry_per_duration, xs_score, dv01_positions
+from rates.carry.returns import cm_total_return_bp, compute_dur_panel
 
 
 # ── Simulation helpers ────────────────────────────────────────────────────────

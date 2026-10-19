@@ -18,7 +18,7 @@ OOS: 2019-01-01 → today.
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import warnings
 import numpy as np
@@ -27,8 +27,8 @@ warnings.filterwarnings("ignore")
 
 from rates.ois_data import fetch_ois_curves
 from rates.yc_builder import build_zero_curve
-from src.nsrv.momentum.returns import cm_return_bp, swap_duration, _dfs_from_zero_row
-from src.nsrv.momentum.signal_c import (
+from rates.momentum.returns import cm_return_bp, swap_duration, _dfs_from_zero_row
+from rates.momentum.signal_c import (
     MIDPOINTS, N_BUCKETS, durham_momentum, durham_long_short,
 )
 

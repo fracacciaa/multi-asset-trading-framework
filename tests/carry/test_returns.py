@@ -12,9 +12,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.nsrv.ns_core import fit_ns, NSFit
-from src.nsrv.carry.measures import approx_dv01, carry_reprice
-from src.nsrv.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
+from rates.ns_core import fit_ns, NSFit
+from rates.carry.measures import approx_dv01, carry_reprice
+from rates.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

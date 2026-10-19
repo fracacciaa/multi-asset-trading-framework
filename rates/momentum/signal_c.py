@@ -37,7 +37,7 @@ try:
 except ImportError as exc:
     raise ImportError("Signal C requires scipy.optimize.linprog") from exc
 
-from src.nsrv.momentum.returns import swap_duration, _dfs_from_zero_row
+from rates.momentum.returns import swap_duration, _dfs_from_zero_row
 
 # ── Bucket definitions ────────────────────────────────────────────────────────
 

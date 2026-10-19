@@ -24,10 +24,10 @@ warnings.filterwarnings("ignore")
 
 from rates.ois_data import fetch_ois_curves
 from rates.carry_ois import ois_carry_panel
-from src.nsrv.ns_core import fit_ns
-from src.nsrv.carry.experiment import run_carry_spec, BASELINE
-from src.nsrv.carry.signal import xs_score, dv01_positions, _rebalance_dates, build_positions
-from src.nsrv.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
+from rates.ns_core import fit_ns
+from rates.carry.experiment import run_carry_spec, BASELINE
+from rates.carry.signal import xs_score, dv01_positions, _rebalance_dates, build_positions
+from rates.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
 
 MARKETS = ["US", "EUR", "UK"]
 LAM = 0.3
@@ -195,7 +195,7 @@ def _print_comparison(rows: list[dict]) -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-from src.nsrv.carry.experiment import _compute_carry_panel, _compute_pnl_series
+from rates.carry.experiment import _compute_carry_panel, _compute_pnl_series
 
 all_rows = []
 pnl_by_market: dict[str, dict] = {}   # {market: {"A": total_pnl, "B": total_pnl}}
