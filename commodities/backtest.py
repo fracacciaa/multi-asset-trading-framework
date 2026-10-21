@@ -60,15 +60,18 @@ def roll_safe_returns(
     tickers: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Daily excess returns with NaN on roll dates.
+    Daily excess returns with NaN on roll dates and non-positive price days.
 
-    Roll dates are rows where the front-month ticker changes from the prior
-    day; the price jump on that day reflects the spread between expiring and
-    new contract, not a tradeable P&L.
+    Two masks applied:
+    - Roll dates: ticker changes day-over-day (price jump is roll spread, not P&L).
+    - Non-positive prices: price <= 0 on day t OR t-1.  The t-1 case removes the
+      day-after garbage return caused by a non-positive base (e.g. WTI -$37.63 on
+      2020-04-20 would otherwise produce a nonsensical +127% return on 2020-04-21).
     """
     ret = prices.pct_change()
     roll_mask = tickers.ne(tickers.shift(1)) & tickers.notna() & tickers.shift(1).notna()
-    return ret.where(~roll_mask)
+    bad_price  = (prices <= 0) | (prices.shift(1) <= 0)
+    return ret.where(~roll_mask & ~bad_price)
 
 
 # ── Volatility and scaling ────────────────────────────────────────────────────
