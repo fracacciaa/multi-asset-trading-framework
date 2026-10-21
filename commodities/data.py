@@ -319,6 +319,65 @@ def fetch_oi_agg_all(
     return pd.concat([gen, power], axis=1).sort_index()
 
 
+# ── Tenor utilities ───────────────────────────────────────────────────────────
+
+_MONTH_CODES: dict[str, int] = {
+    'F': 1, 'G': 2, 'H': 3, 'J': 4, 'K': 5, 'M': 6,
+    'N': 7, 'Q': 8, 'U': 9, 'V': 10, 'X': 11, 'Z': 12,
+}
+# Match the month letter followed by 1 or 2 digits at end of ticker
+# e.g. CLF91, XBF06, CLU6, C Z90, C U6, LHDU21
+_EXPIRY_RE = re.compile(r'([FGHJKMNQUVXZ])(\d{1,2})\s*$')
+
+
+def _parse_expiry(ticker: str) -> pd.Timestamp:
+    """
+    Approximate expiry (15th of contract month) from a Bloomberg futures ticker.
+
+    Handles both 1-digit (2020s shorthand, e.g. CLU6 → Sep 2026) and 2-digit
+    (e.g. CLF91 → Jan 1991, XBF06 → Jan 2006) year conventions.
+    Returns NaT on parse failure.
+    """
+    if not isinstance(ticker, str):
+        return pd.NaT
+    m = _EXPIRY_RE.search(ticker.strip())
+    if m is None:
+        return pd.NaT
+    month = _MONTH_CODES[m.group(1)]
+    yr_raw = m.group(2)
+    if len(yr_raw) == 1:
+        year = 2020 + int(yr_raw)   # Bloomberg 2020s single-digit shorthand
+    else:
+        yr2 = int(yr_raw)
+        year = 2000 + yr2 if yr2 < 70 else 1900 + yr2
+    try:
+        return pd.Timestamp(year=year, month=month, day=15)
+    except Exception:
+        return pd.NaT
+
+
+def tenor_from_tickers(
+    tk_front: pd.DataFrame,
+    tk_back: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Actual tenor in years between front and back contract expiry dates,
+    estimated from Bloomberg ticker names.
+
+    Returns a date × commodity DataFrame (intersection of both inputs).
+    NaN where either ticker cannot be parsed, or where tenor ≤ 0.
+    """
+    cols = tk_front.columns.intersection(tk_back.columns)
+    idx  = tk_front.index.intersection(tk_back.index)
+    exp_f = tk_front.loc[idx, cols].map(_parse_expiry)
+    exp_b = tk_back.loc[idx, cols].map(_parse_expiry)
+    days = pd.DataFrame(
+        {col: (exp_b[col] - exp_f[col]).dt.days.astype(float) for col in cols},
+        index=idx,
+    )
+    return (days / 365.25).where(days > 0)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _slice(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:

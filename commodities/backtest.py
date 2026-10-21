@@ -22,6 +22,7 @@ from commodities.data import (
     fetch_term_structure_power,
     fetch_tickers,
     fetch_tickers_power,
+    tenor_from_tickers,
 )
 from commodities.signals import (
     tsmom,
@@ -231,15 +232,20 @@ def _subperiod_sharpes(pnl: pd.Series, td: int = TD) -> dict:
 def _build_signals(
     prices: pd.DataFrame,
     ts: dict,
+    tk: dict,
     p: dict,
 ) -> dict[str, pd.DataFrame]:
     """
     Return a dict of raw (unscaled) signal DataFrames keyed by signal label.
-    All signals are defined on the intersection of columns present in prices and ts.
+    tk: dict keyed 'front','second','third','fourth' of active contract tickers.
     """
     F1 = ts["front"]
     F2 = ts["second"]
     F4 = ts["fourth"] if "fourth" in ts else None
+
+    # Tenor in years between adjacent generics, for carry normalisation
+    tenor_12 = tenor_from_tickers(tk["front"], tk["second"])
+    tenor_14 = tenor_from_tickers(tk["front"], tk["fourth"]) if "fourth" in tk else None
 
     sigs: dict[str, pd.DataFrame] = {}
 
@@ -256,15 +262,20 @@ def _build_signals(
     sigs["breakout_55"]  = channel_breakout(prices, window=55)
     sigs["breakout_120"] = channel_breakout(prices, window=120)
 
-    # ── Carry signals (cross-sectional: relative rank within universe) ─────────
-    sigs["xs_carry_f1f2"] = xs_carry(F1, F2).reindex(columns=prices.columns)
+    # ── Carry signals (cross-sectional, tenor-normalised) ──────────────────────
+    sigs["xs_carry_f1f2"] = xs_carry(
+        F1, F2, tenor=tenor_12,
+    ).reindex(columns=prices.columns)
     if F4 is not None:
         f4_aligned = F4.reindex(columns=prices.columns)
-        sigs["xs_carry_f1f4"] = xs_carry(F1.reindex(columns=prices.columns),
-                                          f4_aligned).reindex(columns=prices.columns)
-        sigs["curvature"]     = curve_curvature(F1.reindex(columns=prices.columns),
-                                                F2.reindex(columns=prices.columns),
-                                                f4_aligned).reindex(columns=prices.columns)
+        sigs["xs_carry_f1f4"] = xs_carry(
+            F1.reindex(columns=prices.columns), f4_aligned, tenor=tenor_14,
+        ).reindex(columns=prices.columns)
+        sigs["curvature"] = curve_curvature(
+            F1.reindex(columns=prices.columns),
+            F2.reindex(columns=prices.columns),
+            f4_aligned,
+        ).reindex(columns=prices.columns)
 
     # ── Existing signals ───────────────────────────────────────────────────────
     sigs["mom_magnitude"] = momentum(prices)
@@ -320,7 +331,7 @@ def run_comparison(
     returns = roll_safe_returns(prices, front_tickers)
 
     # ── Build raw signals ──────────────────────────────────────────────────────
-    raw_signals = _build_signals(prices, ts, p)
+    raw_signals = _build_signals(prices, ts, tk, p)
 
     # ── Run each signal through the pipeline ──────────────────────────────────
     rows: dict[str, dict] = {}

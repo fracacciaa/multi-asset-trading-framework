@@ -147,17 +147,26 @@ def channel_breakout(
 def xs_carry(
     front: pd.DataFrame,
     back: pd.DataFrame,
+    tenor: Optional[pd.DataFrame] = None,
     annualize: int = 12,
     winsor_pct: float = 0.01,
 ) -> pd.DataFrame:
     """
     Cross-sectional carry signal (Gorton/Hayashi/Rouwenhorst 2013).
 
-    Raw carry = log(front / back) × annualize.  Cross-sectional mean is
-    subtracted each day so the signal is relative rank within the universe,
-    not an absolute level.  Long high-carry-vs-universe, short low-carry.
+    carry_i = log(F1_i / FN_i) / tenor_i          if tenor provided (years)
+            = log(F1_i / FN_i) * annualize         otherwise
+
+    Demeaned cross-sectionally each day so the signal captures relative
+    attractiveness within the universe, not absolute carry level.
+
+    tenor: date × commodity DataFrame in years from tenor_from_tickers().
     """
-    raw = np.log(front / back) * annualize
+    if tenor is not None:
+        t = tenor.reindex(index=front.index, columns=front.columns)
+        raw = np.log(front / back) / t.replace(0, np.nan)
+    else:
+        raw = np.log(front / back) * annualize
     xs = raw.sub(raw.mean(axis=1), axis=0)
     q_lo = xs.quantile(winsor_pct, axis=1)
     q_hi = xs.quantile(1 - winsor_pct, axis=1)
