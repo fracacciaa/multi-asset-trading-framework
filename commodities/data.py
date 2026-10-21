@@ -12,8 +12,16 @@ File map (all under ~/Downloads):
   GEN_OI_AGG.xlsx             agg OI,   front only,    21 commodities
   GEN_TICKER (1).xlsx         tickers,  contracts 1-4, 21 commodities
   ULTIMO TOMMI BBG (2).xlsx   prices/OI/tickers, contracts 5-8, 21 commodities
+  POWER_PRICE.xlsx            prices,   contracts 1-4, 10 power instruments
+  POWER_OI.xlsx               OI,       contracts 1-4, 10 power instruments
+  POWER_OI_AGG.xlsx           agg OI,   front only,    10 power instruments
+  POWER_TICKERS.xlsx          tickers,  contracts 1-4, 10 power instruments
+
+Most-liquid power subset (by mean aggregated OI):
+  DET (~395k), ITP (~74k), FAC (~64k), PHB (~32k)
 """
 
+import re
 import pandas as pd
 import numpy as np
 from functools import lru_cache
@@ -26,6 +34,13 @@ _PATH_OI     = _BASE + "GEN_OI.xlsx"
 _PATH_OI_AGG = _BASE + "GEN_OI_AGG.xlsx"
 _PATH_TICKER = _BASE + "GEN_TICKER (1).xlsx"
 _PATH_FAR    = _BASE + "ULTIMO TOMMI BBG (2).xlsx"
+
+_PATH_POWER_PRICE  = _BASE + "POWER_PRICE.xlsx"
+_PATH_POWER_OI     = _BASE + "POWER_OI.xlsx"
+_PATH_POWER_OI_AGG = _BASE + "POWER_OI_AGG.xlsx"
+_PATH_POWER_TICKER = _BASE + "POWER_TICKERS.xlsx"
+
+_POWER_LIQUID = ["DET", "ITP", "FAC", "PHB"]
 
 _FAR_SHEET = {"price": "gen price", "oi": "gen OI", "ticker": "gen ticker"}
 
@@ -79,8 +94,9 @@ def _parse_bloomberg_wide(
 
     for i in range(n_commodities):
         base = i * stride
-        col_name = str(raw.columns[base + 1])   # e.g. "CL1", "C 1", "W 1"
-        ticker = col_name[:-1].strip()           # "CL", "C", "W"
+        col_name = str(raw.columns[base + 1])   # e.g. "CL1", "C 1", "PHB1M"
+        m = re.match(r'^[A-Za-z ]+', col_name)
+        ticker = m.group(0).strip() if m else col_name[:-1].strip()
 
         dates = _coerce_dates(raw.iloc[:, base])
         valid = dates.notna()
@@ -212,6 +228,95 @@ def fetch_tickers_far(
     rename = dict(zip(["front", "second", "third", "fourth"],
                       ["fifth", "sixth", "seventh", "eighth"]))
     return {rename[k]: _slice(v, start, end) for k, v in data.items()}
+
+
+# ── Power (liquid subset: DET, ITP, FAC, PHB) ─────────────────────────────────
+
+def _power_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the 4 most-liquid power tickers present in df."""
+    cols = [c for c in _POWER_LIQUID if c in df.columns]
+    return df[cols]
+
+
+def fetch_prices_power(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """Front-month prices for the 4 most-liquid power instruments (date × ticker)."""
+    df = _cached_parse(_PATH_POWER_PRICE, 0, 4, True)["front"]
+    return _slice(_power_filter(df), start, end)
+
+
+def fetch_term_structure_power(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> dict[str, pd.DataFrame]:
+    """Term structure keyed 'front'–'fourth' for the 4 liquid power instruments."""
+    data = _cached_parse(_PATH_POWER_PRICE, 0, 4, True)
+    return {k: _slice(_power_filter(v), start, end) for k, v in data.items()}
+
+
+def fetch_open_interest_power(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> dict[str, pd.DataFrame]:
+    """Open interest keyed 'front'–'fourth' for the 4 liquid power instruments."""
+    data = _cached_parse(_PATH_POWER_OI, 0, 4, True)
+    return {k: _slice(_power_filter(v), start, end) for k, v in data.items()}
+
+
+def fetch_oi_agg_power(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """Aggregated OI (all expirations) for the 4 liquid power instruments."""
+    df = _cached_parse(_PATH_POWER_OI_AGG, 0, 1, True)["front"]
+    return _slice(_power_filter(df), start, end)
+
+
+def fetch_tickers_power(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> dict[str, pd.DataFrame]:
+    """Active contract tickers keyed 'front'–'fourth' for the 4 liquid power instruments."""
+    data = _cached_parse(_PATH_POWER_TICKER, 0, 4, False)
+    return {k: _slice(_power_filter(v), start, end) for k, v in data.items()}
+
+
+# ── Merged (general + power) ──────────────────────────────────────────────────
+
+def fetch_prices_all(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """Front-month prices: all 21 general commodities + 4 liquid power instruments."""
+    gen   = fetch_prices(start=start, end=end)
+    power = fetch_prices_power(start=start, end=end)
+    return pd.concat([gen, power], axis=1).sort_index()
+
+
+def fetch_term_structure_all(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> dict[str, pd.DataFrame]:
+    """
+    Term structure for all 21 general + 4 liquid power instruments, keyed
+    'front'–'fourth'.  Power instruments have no contracts 5–8; those slots
+    are intentionally absent from the far-contract fetch.
+    """
+    gen   = fetch_term_structure(start=start, end=end)
+    power = fetch_term_structure_power(start=start, end=end)
+    return {k: pd.concat([gen[k], power[k]], axis=1).sort_index() for k in gen}
+
+
+def fetch_oi_agg_all(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """Aggregated OI for all 21 general commodities + 4 liquid power instruments."""
+    gen   = fetch_oi_agg(start=start, end=end)
+    power = fetch_oi_agg_power(start=start, end=end)
+    return pd.concat([gen, power], axis=1).sort_index()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
