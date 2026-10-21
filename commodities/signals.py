@@ -144,6 +144,26 @@ def channel_breakout(
     return out.clip(lower=q_lo, upper=q_hi, axis=0)
 
 
+def xs_carry(
+    front: pd.DataFrame,
+    back: pd.DataFrame,
+    annualize: int = 12,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Cross-sectional carry signal (Gorton/Hayashi/Rouwenhorst 2013).
+
+    Raw carry = log(front / back) × annualize.  Cross-sectional mean is
+    subtracted each day so the signal is relative rank within the universe,
+    not an absolute level.  Long high-carry-vs-universe, short low-carry.
+    """
+    raw = np.log(front / back) * annualize
+    xs = raw.sub(raw.mean(axis=1), axis=0)
+    q_lo = xs.quantile(winsor_pct, axis=1)
+    q_hi = xs.quantile(1 - winsor_pct, axis=1)
+    return xs.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
 def curve_slope(
     front: pd.DataFrame,
     back: pd.DataFrame,

@@ -27,7 +27,7 @@ from commodities.signals import (
     tsmom,
     ma_crossover,
     channel_breakout,
-    carry,
+    xs_carry,
     curve_slope,
     curve_curvature,
     momentum,
@@ -256,15 +256,15 @@ def _build_signals(
     sigs["breakout_55"]  = channel_breakout(prices, window=55)
     sigs["breakout_120"] = channel_breakout(prices, window=120)
 
-    # ── Carry signals ──────────────────────────────────────────────────────────
-    sigs["carry_f1f2"] = carry(F1, F2).reindex(columns=prices.columns)
+    # ── Carry signals (cross-sectional: relative rank within universe) ─────────
+    sigs["xs_carry_f1f2"] = xs_carry(F1, F2).reindex(columns=prices.columns)
     if F4 is not None:
         f4_aligned = F4.reindex(columns=prices.columns)
-        sigs["carry_f1f4"]   = curve_slope(F1.reindex(columns=prices.columns),
-                                            f4_aligned).reindex(columns=prices.columns)
-        sigs["curvature"]    = curve_curvature(F1.reindex(columns=prices.columns),
-                                               F2.reindex(columns=prices.columns),
-                                               f4_aligned).reindex(columns=prices.columns)
+        sigs["xs_carry_f1f4"] = xs_carry(F1.reindex(columns=prices.columns),
+                                          f4_aligned).reindex(columns=prices.columns)
+        sigs["curvature"]     = curve_curvature(F1.reindex(columns=prices.columns),
+                                                F2.reindex(columns=prices.columns),
+                                                f4_aligned).reindex(columns=prices.columns)
 
     # ── Existing signals ───────────────────────────────────────────────────────
     sigs["mom_magnitude"] = momentum(prices)
