@@ -24,7 +24,7 @@ import pandas as pd
 from typing import Optional
 
 from commodities.data import fetch_term_structure, fetch_term_structure_far
-from commodities.mean_reversion.ns_core import (
+from commodities.mean_reversion.research.ns_core import (
     calibrate_lambda, extract_residuals, tenors_for, TRAIN_END,
 )
 
@@ -159,3 +159,52 @@ def compute_positions(
     z = compute_signal(n_contracts=n_contracts, lambdas=lambdas,
                        start=start, end=end)
     return z.apply(_hysteresis)
+
+
+def compute_pnl(
+    n_contracts: int = N_CONTRACTS,
+    lambdas: Optional[dict] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    BC calibrated LOO fly daily log-return PnL per commodity.
+
+    Position entered at close of t, earns t→t+1 fly log return:
+      ΔlogF1 + ΔlogFN − w_fly·ΔlogF_mid
+    Returns DataFrame (date × commodity).
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        curves = _build_log_curves(n_contracts=n_contracts)
+
+    if lambdas is None:
+        lambdas = calibrate_lambda(curves, train_end=TRAIN_END)
+
+    out: dict[str, pd.Series] = {}
+    for com, log_curve in curves.items():
+        lam    = lambdas["bc"].get(com)
+        tenors = tenors_for(log_curve.shape[1])
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                _, resid_loo = extract_residuals(log_curve, model=MODEL, lam=lam)
+        except Exception:
+            continue
+
+        raw   = _fly_signal(resid_loo, tenors)
+        pos   = _hysteresis(_zscore(raw))
+
+        n     = log_curve.shape[1]
+        mid   = (1 + n) // 2
+        w     = (tenors[0] + tenors[-1]) / tenors[mid - 1]
+        fly_r = log_curve[1].diff() + log_curve[n].diff() - w * log_curve[mid].diff()
+        out[com] = pos.shift(1) * fly_r
+
+    df = pd.concat(out.values(), axis=1, keys=out.keys())
+    df.index.name = "date"
+    if start is not None:
+        df = df.loc[start:]
+    if end is not None:
+        df = df.loc[:end]
+    return df

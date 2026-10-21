@@ -29,7 +29,7 @@ import pandas as pd
 from typing import Optional
 
 from commodities.data import fetch_term_structure, fetch_term_structure_far
-from commodities.mean_reversion.ns_core import (
+from commodities.mean_reversion.research.ns_core import (
     calibrate_lambda, extract_factors, extract_residuals,
     factor_neutral_residuals, tenors_for, TRAIN_END, LOADINGS,
 )
