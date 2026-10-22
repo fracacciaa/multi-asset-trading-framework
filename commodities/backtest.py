@@ -25,14 +25,11 @@ from commodities.data import (
     tenor_from_tickers,
 )
 from commodities.signals import (
+    COMMODITY_SECTORS,
     tsmom,
-    ma_crossover,
-    channel_breakout,
     xs_carry,
-    curve_slope,
+    xs_carry_enhanced,
     curve_curvature,
-    momentum,
-    mean_reversion,
 )
 
 TD = 252  # trading days per year
@@ -239,50 +236,40 @@ def _build_signals(
     p: dict,
 ) -> dict[str, pd.DataFrame]:
     """
-    Return a dict of raw (unscaled) signal DataFrames keyed by signal label.
-    tk: dict keyed 'front','second','third','fourth' of active contract tickers.
+    Production signal set: tsmom_252, xs_carry_f1f2, xs_carry_enh_f1f2, curvature.
     """
     F1 = ts["front"]
     F2 = ts["second"]
     F4 = ts["fourth"] if "fourth" in ts else None
 
-    # Tenor in years between adjacent generics, for carry normalisation
     tenor_12 = tenor_from_tickers(tk["front"], tk["second"])
-    tenor_14 = tenor_from_tickers(tk["front"], tk["fourth"]) if "fourth" in tk else None
+    front_tickers = tk["front"].reindex(columns=prices.columns)
 
     sigs: dict[str, pd.DataFrame] = {}
 
-    # ── Trend signals ──────────────────────────────────────────────────────────
-    sigs["tsmom_21"]    = tsmom(prices, lookbacks=(21,),  mode=p["mode"], clip=p["clip"])
-    sigs["tsmom_63"]    = tsmom(prices, lookbacks=(63,),  mode=p["mode"], clip=p["clip"])
-    sigs["tsmom_252"]   = tsmom(prices, lookbacks=(252,), mode=p["mode"], clip=p["clip"])
-    sigs["tsmom_blend"] = tsmom(prices, lookbacks=p["lookbacks"], mode=p["mode"], clip=p["clip"])
-    sigs["tsmom_scaled"]= tsmom(prices, lookbacks=p["lookbacks"], mode="clip",  clip=p["clip"])
+    sigs["tsmom_252"] = tsmom(prices, lookbacks=(252,), mode=p["mode"], clip=p["clip"])
 
-    sigs["ma_20_120"]   = ma_crossover(prices, fast=20,  slow=120)
-    sigs["ma_50_200"]   = ma_crossover(prices, fast=50,  slow=200)
-
-    sigs["breakout_55"]  = channel_breakout(prices, window=55)
-    sigs["breakout_120"] = channel_breakout(prices, window=120)
-
-    # ── Carry signals (cross-sectional, tenor-normalised) ──────────────────────
     sigs["xs_carry_f1f2"] = xs_carry(
         F1, F2, tenor=tenor_12,
     ).reindex(columns=prices.columns)
+
+    sigs["xs_carry_enh_f1f2"] = xs_carry_enhanced(
+        F1.reindex(columns=prices.columns),
+        F2.reindex(columns=prices.columns),
+        tenor=tenor_12,
+        tickers_front=front_tickers,
+        sector_map=COMMODITY_SECTORS,
+        seasonal=True,
+        roll_filter_days=5,
+    ).reindex(columns=prices.columns)
+
     if F4 is not None:
         f4_aligned = F4.reindex(columns=prices.columns)
-        sigs["xs_carry_f1f4"] = xs_carry(
-            F1.reindex(columns=prices.columns), f4_aligned, tenor=tenor_14,
-        ).reindex(columns=prices.columns)
         sigs["curvature"] = curve_curvature(
             F1.reindex(columns=prices.columns),
             F2.reindex(columns=prices.columns),
             f4_aligned,
         ).reindex(columns=prices.columns)
-
-    # ── Existing signals ───────────────────────────────────────────────────────
-    sigs["mom_magnitude"] = momentum(prices)
-    sigs["meanrev_21"]    = mean_reversion(prices)
 
     return sigs
 
@@ -297,18 +284,13 @@ def run_comparison(
     include_power: bool = False,
 ) -> pd.DataFrame:
     """
-    Run all 14 signals through the full vol-scaling and book-scaling pipeline
-    and return a summary DataFrame.
+    Run the 4 production signals through the vol-scaling and book-scaling pipeline.
 
+    Signals: tsmom_252, xs_carry_f1f2, xs_carry_enh_f1f2, curvature.
     Columns: sharpe, ann_ret, ann_vol, max_dd, skew, calmar, n_days,
-             + one column per 3-year sub-period block.
+             avg_turnover_pa, + one column per 3-year sub-period block.
 
-    Parameters
-    ----------
-    start / end  : date strings for slicing returns.
-    rank         : front-month rank (1 = standard; 2 for robustness run).
-    params       : hyperparameter dict (defaults to PARAMS).
-    include_power: if True, add the 4 liquid power instruments to the universe.
+    For the full 18-signal research comparison use commodities.research.run_full_comparison.
     """
     p = params
 

@@ -86,6 +86,20 @@ def market_variance(rx_daily: pd.DataFrame) -> pd.Series:
     return rM.groupby(pd.Grouper(freq="ME")).apply(_mv)
 
 
+def market_variance_rolling(rx_daily: pd.DataFrame, window: int = 21) -> pd.Series:
+    """
+    Rolling FSS market variance with AR(1) correction, updated daily.
+
+    Replaces the monthly-groupby version for daily signal production.
+    window: rolling window in business days (default 21 ≈ 1 month).
+    Floored at 1e-8 (same as the monthly version).
+    """
+    rM   = rx_daily.mean(axis=1)
+    sq   = (rM ** 2).rolling(window, min_periods=10).mean()
+    xcov = (rM * rM.shift(1)).rolling(window, min_periods=10).mean()
+    return (sq + 2.0 * xcov).clip(lower=1e-8)
+
+
 # ── Signal ────────────────────────────────────────────────────────────────────
 
 def dupuy_signal(
@@ -93,17 +107,16 @@ def dupuy_signal(
     MV: pd.Series,
     mode: str = "E_over_V",
     min_periods: int = 36,
+    lag_days: int = 1,
 ) -> pd.Series:
     """
     Dupuy equation (4): normalised E/V overlay with the explicit extra lag.
 
     mode in {'E_over_V', 'E_only', 'V_only'}.
+    lag_days: periods to shift. 1 for monthly data (1 month); 21 for daily
+              data (21 business days ≈ 1 month). Do not set to 0.
 
     Normalisation: expanding mean so the average exposure equals 1.
-    Dupuy normalises on the full sample (requires lookahead); the expanding
-    version is the implementable approximation he acknowledges.
-
-    The .shift(1) is the extra month lag documented in §5.4. Do not remove.
     """
     raw_map = {
         "E_over_V": E / MV,
@@ -113,9 +126,8 @@ def dupuy_signal(
     if mode not in raw_map:
         raise ValueError(f"mode must be one of {list(raw_map)}")
 
-    # align E and MV to the same monthly index
+    # align E and MV to a common index
     e, mv = E.align(MV, join="inner")
-    raw = raw_map[mode].reindex(e.index) if mode != "V_only" else (1.0 / mv)
     if mode == "E_over_V":
         raw = e / mv
     elif mode == "E_only":
@@ -124,7 +136,7 @@ def dupuy_signal(
         raw = 1.0 / mv
 
     norm = raw / raw.expanding(min_periods=min_periods).mean()
-    return norm.shift(1)   # the extra month lag from the paper
+    return norm.shift(lag_days)
 
 
 # ── Full signal builder ───────────────────────────────────────────────────────
@@ -182,5 +194,56 @@ def build_signal_d(
     # ensure "E" key always present (no-cost baseline)
     if "E" not in results:
         results["E"] = expected_profit_mid(fd_me)
+
+    return results
+
+
+def build_signal_d_daily(
+    fd_d: pd.DataFrame,
+    rx_d: pd.DataFrame,
+    n: int = 4,
+    window: int = 21,
+    lag_days: int = 21,
+    modes: tuple = ("E_over_V", "E_only", "V_only"),
+    min_periods: int = 756,
+) -> dict:
+    """
+    Daily Signal D: carry weights scaled by E/V, updated every business day.
+
+    fd_d      Daily forward discount (fd_m forward-filled to business daily).
+    rx_d      Daily excess returns.
+    window    Rolling window for market variance in business days (default 21).
+    lag_days  Extra lag on the signal (default 21 ≈ 1 month in business days).
+    min_periods Expanding-mean warm-up in business days (756 ≈ 36 months).
+
+    Returns
+    -------
+    dict with keys:
+      'base_weights'   — unlevered carry weights (daily, date × pair)
+      'E'              — expected profit (daily series)
+      'MV'             — market variance (daily series)
+      'signal_{mode}'  — normalised overlay (daily series)
+      'weights_{mode}' — base_weights * signal (daily, date × pair)
+    Plus MV floor diagnostics.
+    """
+    w_base = carry_weights(fd_d, n=n)
+    MV     = market_variance_rolling(rx_d, window=window)
+    E      = expected_profit_mid(fd_d)
+
+    mv_floor_binds = (MV == 1e-8).sum()
+    mv_floor_pct   = float(mv_floor_binds / MV.notna().sum()) if MV.notna().sum() > 0 else 0.0
+
+    results: dict = {
+        "base_weights":   w_base,
+        "E":              E,
+        "MV":             MV,
+        "MV_floor_count": int(mv_floor_binds),
+        "MV_floor_pct":   mv_floor_pct,
+    }
+
+    for mode in modes:
+        sig = dupuy_signal(E, MV, mode=mode, min_periods=min_periods, lag_days=lag_days)
+        results[f"signal_{mode}"] = sig
+        results[f"weights_{mode}"] = w_base.mul(sig, axis=0)
 
     return results

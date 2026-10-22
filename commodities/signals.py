@@ -10,6 +10,25 @@ import numpy as np
 from typing import Optional
 
 
+# ── Sector map for sector-neutral carry ──────────────────────────────────────
+
+COMMODITY_SECTORS: dict[str, str] = {
+    # Energy
+    "CL": "energy", "HO": "energy", "XB": "energy", "RB": "energy",
+    "NG": "energy", "CO": "energy", "QS": "energy", "GO": "energy",
+    # Metals
+    "GC": "metals", "SI": "metals", "HG": "metals", "PL": "metals",
+    "PA": "metals", "LA": "metals", "LX": "metals", "LL": "metals",
+    # Grains
+    "C":  "grains", "W":  "grains", "S":  "grains", "SM": "grains",
+    "BO": "grains", "KW": "grains", "MW": "grains", "RR": "grains",
+    # Softs
+    "KC": "softs", "CC": "softs", "CT": "softs", "SB": "softs", "OJ": "softs",
+    # Livestock
+    "LC": "livestock", "LH": "livestock", "FC": "livestock",
+}
+
+
 def momentum(
     prices: pd.DataFrame,
     lookback: int = 252,
@@ -207,6 +226,96 @@ def curve_curvature(
     q_lo = curv.quantile(winsor_pct, axis=1)
     q_hi = curv.quantile(1 - winsor_pct, axis=1)
     return curv.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def _seasonal_adjust(df: pd.DataFrame, min_obs: int = 5) -> pd.DataFrame:
+    """
+    Subtract OOS expanding month-of-year mean from each column (strict lookahead-free).
+
+    For calendar month m, each row in month m has the expanding mean of all
+    prior rows in month m subtracted (shift(1) within the month group).
+    """
+    out = df.copy()
+    for m in range(1, 13):
+        mask = df.index.month == m
+        if mask.sum() < min_obs:
+            continue
+        monthly_slice = df.loc[mask]
+        adj = monthly_slice.expanding(min_periods=min_obs).mean().shift(1)
+        out.loc[mask] = df.loc[mask] - adj
+    return out
+
+
+def _near_roll_mask(tickers: pd.DataFrame, days: int = 5) -> pd.DataFrame:
+    """
+    True on the `days` trading days immediately before a front-contract roll.
+
+    Roll dates are derived from public exchange schedules (tickers[t] !=
+    tickers[t+1]), so this is not economic lookahead.
+    """
+    arr = tickers.to_numpy(dtype=object)
+    n, m = arr.shape
+    # is_roll[t] = True when arr[t] != arr[t+1] (last day of a contract)
+    is_roll = np.zeros((n, m), dtype=bool)
+    is_roll[:-1] = (arr[:-1] != arr[1:]) & (arr[:-1] != None) & (arr[1:] != None)  # noqa: E711
+
+    # mask[t] = True if any is_roll[t+k] for k in 1..days
+    mask = np.zeros((n, m), dtype=bool)
+    for k in range(1, days + 1):
+        mask[:n - k] |= is_roll[k:]
+    return pd.DataFrame(mask, index=tickers.index, columns=tickers.columns)
+
+
+def xs_carry_enhanced(
+    front: pd.DataFrame,
+    back: pd.DataFrame,
+    tenor: Optional[pd.DataFrame] = None,
+    tickers_front: Optional[pd.DataFrame] = None,
+    sector_map: Optional[dict] = None,
+    seasonal: bool = True,
+    roll_filter_days: int = 5,
+    annualize: int = 12,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Enhanced cross-sectional carry with four optional improvements.
+
+    1. Tenor normalisation  : log(F1/FN) / tenor_years  (pass tenor DataFrame)
+    2. Seasonal adjustment  : subtract OOS expanding month-of-year mean
+    3. Sector-neutral demean: demean within sector before cross-sectional demean
+    4. Roll-timing filter   : set carry to NaN in last roll_filter_days before roll
+    """
+    if tenor is not None:
+        t = tenor.reindex(index=front.index, columns=front.columns)
+        raw = np.log(front / back) / t.replace(0, np.nan)
+    else:
+        raw = np.log(front / back) * annualize
+
+    if seasonal:
+        raw = _seasonal_adjust(raw)
+
+    if sector_map is not None:
+        sec = pd.Series({c: sector_map.get(c, "other") for c in raw.columns})
+        demeaned = raw.copy()
+        for sector, grp in sec.groupby(sec):
+            cols = [c for c in grp.index if c in raw.columns]
+            if len(cols) < 2:
+                continue
+            demeaned[cols] = raw[cols].sub(raw[cols].mean(axis=1), axis=0)
+        xs = demeaned.sub(demeaned.mean(axis=1), axis=0)
+    else:
+        xs = raw.sub(raw.mean(axis=1), axis=0)
+
+    if tickers_front is not None and roll_filter_days > 0:
+        near_roll = _near_roll_mask(
+            tickers_front.reindex(index=xs.index, columns=xs.columns),
+            days=roll_filter_days,
+        )
+        xs = xs.where(~near_roll)
+
+    q_lo = xs.quantile(winsor_pct, axis=1)
+    q_hi = xs.quantile(1 - winsor_pct, axis=1)
+    return xs.clip(lower=q_lo, upper=q_hi, axis=0)
 
 
 def combined_signal(

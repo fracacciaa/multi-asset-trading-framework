@@ -90,6 +90,59 @@ def build_signal_a_grid(
             for f in fs for h in hs}
 
 
+# ── Daily signal (rolling sum score) ─────────────────────────────────────────
+
+def rolling_mom_score(
+    rx_d: pd.DataFrame,
+    window: int,
+    min_periods: int | None = None,
+) -> pd.DataFrame:
+    """
+    Rolling N-day sum of daily excess returns — the momentum formation score.
+
+    Equivalent to monthly rx_m.rolling(f).sum() but updated every business day
+    as the trailing window rolls forward. Preferred over EWMA: daily FX returns
+    mean-revert at short lags so an EWMA weights the wrong direction; multi-month
+    cumulative returns show positive autocorrelation and this captures that.
+
+    Pass the result to xs_weights() or ts_weights() in formations.py.
+    """
+    mp = min_periods if min_periods is not None else window // 2
+    return rx_d.rolling(window, min_periods=mp).sum()
+
+
+# ── Daily signal (EWMA score) — kept for reference ────────────────────────────
+
+def build_signal_a_daily(
+    rx_d: pd.DataFrame,
+    halflife_days: int = 63,
+    n_port: int = 6,
+    min_size: int = 2,
+) -> pd.DataFrame:
+    """
+    Daily cross-sectional momentum using an EWMA score on daily excess returns.
+
+    Halflife mapping from the monthly formation grid:
+      f=1m → 10 days, f=3m → 32, f=6m → 63, f=9m → 95, f=12m → 126.
+
+    The EWMA mean weights recent days more heavily and avoids the cliff-edge
+    of a hard rolling window. min_periods=halflife_days suppresses early NaNs
+    before the score is meaningful.
+    """
+    score = rx_d.ewm(halflife=halflife_days, min_periods=halflife_days).mean()
+    port = score.apply(_assign_portfolios, axis=1, n_port=n_port)
+    return menkhoff_weights(port, n_port=n_port, min_size=min_size)
+
+
+def build_signal_a_grid_daily(
+    rx_d: pd.DataFrame,
+    halflives: tuple = (10, 32, 63, 95, 126),
+    n_port: int = 6,
+) -> dict[int, pd.DataFrame]:
+    """All halflife combinations. Keys are halflife in business days."""
+    return {hl: build_signal_a_daily(rx_d, halflife_days=hl, n_port=n_port)
+            for hl in halflives}
+
 
 # ── Portfolio return diagnostics ──────────────────────────────────────────────
 

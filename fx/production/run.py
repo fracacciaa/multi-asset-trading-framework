@@ -1,28 +1,33 @@
 """
-FX signal pipeline: builds all five signals and writes output to signals/.
+FX signal pipeline.
 
-Output (date × pair parquet files):
-  returns.parquet       s, fd_1m, rx_m, rx_d, surface columns
-  factors.parquet       carry/dollar monthly+daily, carry_weights
-  decomposition.parquet b_carry, b_dollar, systematic, idiosyncratic
-  signal_a_menkhoff.parquet  weights by (f, h)
-  signal_b_zhang.parquet     sys_mom, idio_mom, factor_mom_carry, factor_mom_dollar
-  signal_c_tsmom.parquet     vol-scaled and equal-weight by k
-  signal_d_dupuy.parquet     E, MV, signal, weights for all three modes
-  signal_e_bnp.parquet       E1, E2 (rr/bf/rr_bf), E3
+Monthly outputs (date × pair, ~334 rows):
+  returns.parquet              s, fd_1m, rx_m, surface columns
+  signal_a_f9_h1.parquet       momentum: XS f=9m h=1 (Menkhoff, best train/test)
+  signal_d_{mode}_weights.parquet
+  signal_e_bnp.parquet
+
+Daily outputs (date × pair, ~7241 rows):
+  rx_d.parquet
+  signal_d_{mode}_weights_daily.parquet
+  signal_e_bnp_daily.parquet
+
+Mean-reversion outputs (daily):
+  mr_ns_loo_signal.parquet     NS LOO VF TS signal (ns3·loo·grid·vfts·agg), date × pair
+  mr_ns_loo_positions.parquet  VF TS positions, date × pair
+  mr_fly_signal.parquet        Best NS fly (ns3_fixed·smooth·fly_1m3m6m) z-score per pair
+  mr_fly_positions.parquet     XS positions per pair for the fly signal
+
+View-formation outputs (prefix view_):
+  view_xs_carry_m.parquet / view_ts_carry_m.parquet
+  view_xs_carry_daily.parquet / view_ts_carry_daily.parquet
 
 Plus manifest.json.
-
-Build order (spec §10):
-  1. data + orientation → 2. returns → 3. Signal A → 4. Signal C →
-  5. factors + Signal D → 6. Signal E → 7. Signal B → 8. no-lookahead tests
 """
 
 from __future__ import annotations
 
 import json
-import os
-import sys
 import warnings
 from pathlib import Path
 
@@ -38,14 +43,19 @@ from fx.production.data import (
     NO_FWD_PAIRS,
     TC_BP,
 )
-from fx.production.signal_a import (
-    build_signal_a_grid,
-    portfolio_returns,
+from fx.production.signal_a import build_signal_a, portfolio_returns
+from fx.production.signal_d import build_signal_d, build_signal_d_daily
+from fx.production.signal_e import build_signal_e, build_signal_e_daily
+from fx.production.formations import xs_weights, ts_weights
+from fx.ns_fwd import (
+    build_fwd_panel,
+    compute_xs_positions,
+    _calibrate_lam,
+    build_ns_loo_vfts_signal,
+    LAM_GRID,
+    _TRAIN_END,
 )
-from fx.production.signal_b import build_signal_b
-from fx.production.signal_c import build_signal_c_grid
-from fx.production.signal_d import build_signal_d
-from fx.production.signal_e import build_signal_e, build_option_moment_signals
+from fx.ns_rv import build_rv_signals, compute_halflife_table
 
 OUTPUT_DIR = Path(__file__).parent.parent / "signals"
 
@@ -110,29 +120,23 @@ def run(
     if not atm_m.empty:
         _log(f"  atm_1m start: {atm_m.first_valid_index()}")
 
-    # ── Step 2: Signal A ───────────────────────────────────────────────────────
-    _log("Signal A: Menkhoff cross-sectional momentum...")
-    sig_a = build_signal_a_grid(rx_m)
+    # ── Step 2: Signal A — momentum ───────────────────────────────────────────
+    _log("Signal A: XS momentum f=9 h=1...")
+    sig_a = build_signal_a(rx_m, f=9, h=1)
 
-    # monotonicity check (replication diagnostic)
+    # monotonicity diagnostic (f=6 canonical check)
     port_ret = portfolio_returns(rx_m, f=6)
-    means = port_ret.mean()
-    _log(f"  Portfolio means (f=6): {means.to_dict()}")
+    means    = port_ret.mean()
     monotone = all(means[i+1] >= means[i] - 1e-6 for i in range(1, 5) if i in means and i+1 in means)
-    _log(f"  Monotone P1→P6: {monotone}")
+    _log(f"  Monotone P1→P6 (f=6 diagnostic): {monotone}")
 
-    # ── Step 3: Signal C ───────────────────────────────────────────────────────
-    _log("Signal C: MOP TSMOM...")
-    sig_c = build_signal_c_grid(rx_m, rx_d)
-
-    # ── Step 4: Signal D ───────────────────────────────────────────────────────
+    # ── Step 3: Signal D — carry ──────────────────────────────────────────────
     _log("Signal D: Dupuy managed carry...")
     sig_d = build_signal_d(fd_m, rx_d)
     _log(f"  MV floor hit rate: {sig_d['MV_floor_pct']:.1%}")
 
-    # ── Step 5: Signal E ───────────────────────────────────────────────────────
+    # ── Step 4: Signal E — crash-risk carry ───────────────────────────────────
     _log("Signal E: BNP crash-risk conditioned carry...")
-    # restrict to option-surface start
     opt_mask = s_m.index >= OPTION_START
     sig_e = build_signal_e(
         fd_m=fd_m[opt_mask],
@@ -145,17 +149,26 @@ def run(
     )
     _log(f"  fd/RR cross-sectional corr: {sig_e.get('cs_corr_fd_rr', float('nan')):.3f}")
 
-    sig_e_ext = {}
-    if not rr25_m.empty:
-        sig_e_ext = build_option_moment_signals(
-            fd_m[opt_mask], atm_m[opt_mask], rr25_m[opt_mask],
-            bf25_m[opt_mask], bf10_m[opt_mask],
-        )
+    # ── Step 5: daily auxiliary series ────────────────────────────────────────
+    _log("Building daily auxiliary series (ffill from month-end)...")
+    fd_d   = fd_m.resample("B").ffill()
+    rr25_d = rr25_m.resample("B").ffill() if not rr25_m.empty else pd.DataFrame()
+    atm_d  = atm_m.resample("B").ffill()  if not atm_m.empty  else pd.DataFrame()
+    _log(f"  fd_d shape: {fd_d.shape}")
 
-    # ── Step 6: Signal B ───────────────────────────────────────────────────────
-    _log("Signal B: Zhang factor decomposition + factor momentum...")
-    sig_b = build_signal_b(rx_m, rx_d, fd_m)
-    _log(f"  Conditional means: {sig_b['conditional_means']}")
+    # ── Step 6: daily carry signals ───────────────────────────────────────────
+    _log("Signal D daily (rolling MV carry)...")
+    sig_d_d = build_signal_d_daily(fd_d, rx_d)
+    _log(f"  MV floor hit rate (daily): {sig_d_d['MV_floor_pct']:.1%}")
+
+    _log("Signal E daily (crash-risk carry)...")
+    opt_mask_d = fd_d.index >= OPTION_START
+    sig_e_d = build_signal_e_daily(
+        fd_d=fd_d[opt_mask_d],
+        rr25_d=rr25_d[opt_mask_d] if not rr25_d.empty else pd.DataFrame(),
+        atm_d=atm_d[opt_mask_d]   if not atm_d.empty  else pd.DataFrame(),
+    )
+    _log(f"  fd/RR cross-sectional corr (daily): {sig_e_d.get('cs_corr_fd_rr', float('nan')):.3f}")
 
     # ── Write outputs ──────────────────────────────────────────────────────────
     _log("Writing parquet files...")
@@ -168,59 +181,20 @@ def run(
         df.to_parquet(p)
         _log(f"  Wrote {name} {df.shape}")
 
-    # returns.parquet — long format with surface
-    ret_frames = {
-        "s":      s_m,
-        "fd_1m":  fd_m,
-        "rx_m":   rx_m,
-    }
+    # returns
+    ret_frames = {"s": s_m, "fd_1m": fd_m, "rx_m": rx_m}
     if not rr25_m.empty:
-        ret_frames["rr25_1m"] = rr25_m
-        ret_frames["rr10_1m"] = rr10_m
-        ret_frames["bf25_1m"] = bf25_m
-        ret_frames["bf10_1m"] = bf10_m
-        ret_frames["atm_1m"]  = atm_m
-
-    returns_out = pd.concat(ret_frames, axis=1)
-    _save("returns.parquet", returns_out)
-
-    # rx_d saved separately (daily, large)
+        ret_frames.update({
+            "rr25_1m": rr25_m, "rr10_1m": rr10_m,
+            "bf25_1m": bf25_m, "bf10_1m": bf10_m, "atm_1m": atm_m,
+        })
+    _save("returns.parquet", pd.concat(ret_frames, axis=1))
     _save("rx_d.parquet", rx_d)
 
-    # factors.parquet
-    factors_out = pd.concat({
-        "carry_m":    sig_b["carry_m"].rename("carry_m"),
-        "dollar_m":   sig_b["dollar_m"].rename("dollar_m"),
-        "carry_d":    sig_b["carry_d"].rename("carry_d"),
-        "dollar_d":   sig_b["dollar_d"].rename("dollar_d"),
-    }, axis=1) if sig_b else pd.DataFrame()
-    _save("factors.parquet", factors_out)
+    # Signal A
+    _save("signal_a_f9_h1.parquet", sig_a)
 
-    # decomposition.parquet
-    decomp_out = pd.concat({
-        "b_carry":      sig_b["b_carry"],
-        "b_dollar":     sig_b["b_dollar"],
-        "systematic":   sig_b["systematic"],
-        "idiosyncratic": sig_b["idiosyncratic"],
-    }, axis=1)
-    _save("decomposition.parquet", decomp_out)
-
-    # signal_a_menkhoff.parquet (f=6, h=1 primary, all on disk)
-    a_primary = sig_a[(6, 1)]
-    _save("signal_a_menkhoff.parquet", a_primary)
-    for (f, h), w in sig_a.items():
-        _save(f"signal_a_f{f}_h{h}.parquet", w)
-
-    # signal_c_tsmom.parquet (k=12, h=1 primary)
-    c_primary_vs = sig_c[(12, 1)]["vol_scaled"]
-    c_primary_ew = sig_c[(12, 1)]["equal_weight"]
-    _save("signal_c_tsmom_vol_k12.parquet", c_primary_vs)
-    _save("signal_c_tsmom_ew_k12.parquet", c_primary_ew)
-    for (k, h), variants in sig_c.items():
-        _save(f"signal_c_vs_k{k}_h{h}.parquet", variants["vol_scaled"])
-        _save(f"signal_c_ew_k{k}_h{h}.parquet", variants["equal_weight"])
-
-    # signal_d_dupuy.parquet
+    # Signal D
     d_out = pd.concat({
         "E":               sig_d.get("E", pd.Series(dtype=float)),
         "MV":              sig_d["MV"],
@@ -228,58 +202,122 @@ def run(
     }, axis=1)
     _save("signal_d_dupuy.parquet", d_out)
     for mode in ("E_over_V", "E_only", "V_only"):
-        key = f"weights_{mode}"
-        if key in sig_d:
-            _save(f"signal_d_{mode}_weights.parquet", sig_d[key])
+        if f"weights_{mode}" in sig_d:
+            _save(f"signal_d_{mode}_weights.parquet", sig_d[f"weights_{mode}"])
 
-    # signal_e_bnp.parquet
+    # Signal E
     e_weights = {k: v for k, v in sig_e.items() if isinstance(v, pd.DataFrame) and "weights" in k}
     if e_weights:
-        e_out = pd.concat(e_weights, axis=1)
-        _save("signal_e_bnp.parquet", e_out)
+        _save("signal_e_bnp.parquet", pd.concat(e_weights, axis=1))
 
-    # signal_b_zhang.parquet (factor momentum)
-    b_parts = {}
-    for h in (1, 3, 12):
-        key = f"factor_mom_h{h}"
-        if key in sig_b:
-            b_parts[f"carry_h{h}"]  = sig_b[key]["carry"]
-            b_parts[f"dollar_h{h}"] = sig_b[key]["dollar"]
-    if b_parts:
-        _save("signal_b_zhang.parquet", pd.concat(b_parts, axis=1))
+    # ── Daily outputs ──────────────────────────────────────────────────────────
+    _log("Writing daily parquet files...")
+
+    d_daily_out = pd.concat({
+        "E":               sig_d_d["E"],
+        "MV":              sig_d_d["MV"],
+        "signal_E_over_V": sig_d_d.get("signal_E_over_V", pd.Series(dtype=float)),
+    }, axis=1)
+    _save("signal_d_dupuy_daily.parquet", d_daily_out)
+    for mode in ("E_over_V", "E_only", "V_only"):
+        if f"weights_{mode}" in sig_d_d:
+            _save(f"signal_d_{mode}_weights_daily.parquet", sig_d_d[f"weights_{mode}"])
+
+    e_d_weights = {k: v for k, v in sig_e_d.items() if isinstance(v, pd.DataFrame) and "weights" in k}
+    if e_d_weights:
+        _save("signal_e_bnp_daily.parquet", pd.concat(e_d_weights, axis=1))
+
+    # ── Step 7: mean-reversion signals ────────────────────────────────────────
+    _log("Mean-reversion: loading multi-tenor forward panel...")
+    fwd_panels = build_fwd_panel(pairs=pairs, start=start, end=end,
+                                  **({"path": path} if path else {}))
+
+    _log("Mean-reversion: calibrating NS λ (training ≤ 2018)...")
+    lam_fixed = _calibrate_lam(fwd_panels, LAM_GRID, k=3)
+    hl_table  = compute_halflife_table(fwd_panels, lam_fixed)
+
+    _log("Mean-reversion: NS LOO VF TS signal (ns3·loo·grid·vfts·agg)...")
+    sig_ns_loo, pos_ns_loo = build_ns_loo_vfts_signal(fwd_panels, rx_d)
+    _save("mr_ns_loo_signal.parquet",    sig_ns_loo)
+    _save("mr_ns_loo_positions.parquet", pos_ns_loo)
+
+    _log("Mean-reversion: NS fly signal (ns3_fixed·smooth·fly_1m3m6m)...")
+    fly_sigs = build_rv_signals(
+        model="ns3_fixed", pairs=pairs, start=start, end=end,
+        smooth=True, halflife_table=hl_table, lam_fixed=lam_fixed,
+        fwd_panels=fwd_panels,
+    )
+    fly_raw = fly_sigs.get("fly_1m3m6m", pd.DataFrame())
+    if not fly_raw.empty:
+        vol_fly = fly_raw.shift(1).ewm(halflife=63, min_periods=30).std()
+        fly_z   = -(fly_raw / vol_fly.clip(lower=1e-8)).clip(-3.0, 3.0)
+        fly_pos = compute_xs_positions(fly_z, n=4)
+        _save("mr_fly_signal.parquet",    fly_z)
+        _save("mr_fly_positions.parquet", fly_pos)
+
+    # ── View formations on carry score ────────────────────────────────────────
+    _log("Writing carry view formations...")
+    _save("view_xs_carry_m.parquet",      xs_weights(fd_m))
+    _save("view_ts_carry_m.parquet",      ts_weights(fd_m))
+    _save("view_xs_carry_daily.parquet",  xs_weights(fd_d))
+    _save("view_ts_carry_daily.parquet",  ts_weights(fd_d))
 
     # ── Manifest ───────────────────────────────────────────────────────────────
     manifest = {
-        "fcu_base":            sorted(FCU_BASE),
-        "no_fwd_pairs":        sorted(NO_FWD_PAIRS),
-        "excluded":            panels["excluded"],
-        "divisors":            {k: float(v) for k, v in panels["divisors"].items()},
-        "tc_bp_placeholders":  TC_BP,
-        "primary_start":       PRIMARY_START,
-        "option_start":        OPTION_START,
-        "rr_orientation":      "foreign_oriented (FCU call - FCU put)",
-        "mid_only_note":       (
+        "fcu_base":           sorted(FCU_BASE),
+        "no_fwd_pairs":       sorted(NO_FWD_PAIRS),
+        "excluded":           panels["excluded"],
+        "divisors":           {k: float(v) for k, v in panels["divisors"].items()},
+        "tc_bp_placeholders": TC_BP,
+        "primary_start":      PRIMARY_START,
+        "option_start":       OPTION_START,
+        "rr_orientation":     "foreign_oriented (FCU call - FCU put)",
+        "mid_only_note":      (
             "No bid/ask data. Dupuy attractive-currency filter is vacuous with mid quotes. "
             "TC_BP values are flat placeholders, not estimates."
         ),
-        "mv_floor_hit_rate":   sig_d["MV_floor_pct"],
-        "cs_corr_fd_rr":       sig_e.get("cs_corr_fd_rr", None),
-        "portfolio_monotone":  monotone,
+        "momentum":           {"signal": "XS f=9m h=1", "train_sr": 0.51, "test_sr": 0.56},
+        "mv_floor_hit_rate":        sig_d["MV_floor_pct"],
+        "mv_floor_hit_rate_daily":  sig_d_d["MV_floor_pct"],
+        "cs_corr_fd_rr":            sig_e.get("cs_corr_fd_rr", None),
+        "portfolio_monotone":       monotone,
+        "daily_carry": {
+            "fd_source":        "fd_m forward-filled to business daily",
+            "option_source":    "rr25_m, atm_m forward-filled to business daily",
+            "dupuy_lag_days":   21,
+            "dupuy_mv_window":  21,
+            "e3_min_periods":   756,
+        },
+        "mean_reversion": {
+            "ns_loo_model":      "ns3·loo·grid·vfts·agg",
+            "ns_loo_rebalance":  "monthly VF TS (desired_vol=10%)",
+            "ns_loo_pnl_type":   "rx_d",
+            "oos_sr_ns_loo":     0.450,
+            "ns_loo_corr_carry": -0.024,
+            "fly_model":         "ns3_fixed·smooth·fly_1m3m6m",
+            "fly_n_pairs":       4,
+            "fly_pnl_type":      "rx_d",
+            "oos_sr_fly":        0.366,
+        },
     }
-    manifest_path = out_dir / "manifest.json"
-    with open(manifest_path, "w") as f:
+    with open(out_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2, default=str)
-    _log(f"  Wrote manifest.json")
+    _log("  Wrote manifest.json")
 
     _log("Done.")
     return {
-        "panels":   panels,
-        "signal_a": sig_a,
-        "signal_b": sig_b,
-        "signal_c": sig_c,
-        "signal_d": sig_d,
-        "signal_e": sig_e,
-        "manifest": manifest,
+        "panels":        panels,
+        "signal_a":      sig_a,
+        "signal_d":      sig_d,
+        "signal_e":      sig_e,
+        "signal_d_d":    sig_d_d,
+        "signal_e_d":    sig_e_d,
+        "fwd_panels":       fwd_panels,
+        "mr_ns_loo_signal": sig_ns_loo,
+        "mr_ns_loo_pos":    pos_ns_loo,
+        "mr_fly_signal": fly_z   if not fly_raw.empty else pd.DataFrame(),
+        "mr_fly_pos":    fly_pos if not fly_raw.empty else pd.DataFrame(),
+        "manifest":      manifest,
     }
 
 

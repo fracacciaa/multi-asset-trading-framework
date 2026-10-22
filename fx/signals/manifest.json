@@ -1,0 +1,80 @@
+{
+  "fcu_base": [
+    "AUDUSD",
+    "EURUSD",
+    "GBPUSD",
+    "NZDUSD"
+  ],
+  "no_fwd_pairs": [
+    "USDBRL",
+    "USDIDR",
+    "USDINR",
+    "USDTWD"
+  ],
+  "excluded": [],
+  "divisors": {
+    "AUDUSD": 10000.0,
+    "EURUSD": 10000.0,
+    "GBPUSD": 1000.0,
+    "NZDUSD": 10000.0,
+    "USDCAD": 10000.0,
+    "USDCHF": 10000.0,
+    "USDDKK": 10000.0,
+    "USDJPY": 100.0,
+    "USDNOK": 10000.0,
+    "USDSEK": 10000.0,
+    "USDKRW": 1.0,
+    "USDMXN": 10000.0,
+    "USDSGD": 10000.0,
+    "USDZAR": 10000.0,
+    "USDCZK": 1000.0,
+    "USDCNY": 10000.0,
+    "USDTHB": 100.0,
+    "USDPLN": 10000.0,
+    "USDHUF": 100.0,
+    "USDTRY": 10000.0
+  },
+  "tc_bp_placeholders": {
+    "AUDUSD": 2.0,
+    "EURUSD": 2.0,
+    "GBPUSD": 2.0,
+    "NZDUSD": 2.0,
+    "USDCAD": 2.0,
+    "USDCHF": 2.0,
+    "USDDKK": 2.0,
+    "USDJPY": 2.0,
+    "USDNOK": 2.0,
+    "USDSEK": 2.0,
+    "USDKRW": 5.0,
+    "USDSGD": 5.0,
+    "USDCZK": 5.0,
+    "USDCNY": 5.0,
+    "USDTHB": 5.0,
+    "USDPLN": 5.0,
+    "USDHUF": 5.0,
+    "USDMXN": 10.0,
+    "USDZAR": 10.0,
+    "USDBRL": 10.0,
+    "USDTRY": 10.0
+  },
+  "primary_start": "1999-01-01",
+  "option_start": "2003-10-01",
+  "rr_orientation": "foreign_oriented (FCU call - FCU put)",
+  "mid_only_note": "No bid/ask data. Dupuy attractive-currency filter is vacuous with mid quotes. TC_BP values are flat placeholders, not estimates.",
+  "momentum": {
+    "signal": "XS f=9m h=1",
+    "train_sr": 0.51,
+    "test_sr": 0.56
+  },
+  "mv_floor_hit_rate": 0.015015015015015015,
+  "mv_floor_hit_rate_daily": 0.00778318276580959,
+  "cs_corr_fd_rr": -0.9105626402849071,
+  "portfolio_monotone": true,
+  "daily_carry": {
+    "fd_source": "fd_m forward-filled to business daily",
+    "option_source": "rr25_m, atm_m forward-filled to business daily",
+    "dupuy_lag_days": 21,
+    "dupuy_mv_window": 21,
+    "e3_min_periods": 756
+  }
+}

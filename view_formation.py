@@ -28,6 +28,7 @@ from typing import Optional
 
 _DEFAULT_TS_PARAMS = {
     "desired_vol": 0.10,
+    "use_ortho":   True,
 }
 
 _DEFAULT_PARAMS = {
@@ -228,6 +229,7 @@ class ViewFormationTS:
     ):
         p = {**_DEFAULT_TS_PARAMS, **(params or {})}
         self.desired_vol = p["desired_vol"]
+        self.use_ortho   = p["use_ortho"]
         common = signal.dropna().index.intersection(cov.index)
         self.signal = signal.loc[common].astype(float)
         self.cov    = cov.loc[common, common]
@@ -241,9 +243,10 @@ class ViewFormationTS:
         ).replace(0, np.nan)
         s = (self.signal / total_vols).dropna()
 
-        # Step 2: orthogonalize to market beta (removes directional market exposure)
-        betas, _ = self._risk_decomposition()
-        s = self._orthogonalize(s, betas.reindex(s.index))
+        # Step 2: orthogonalize to market beta (optional)
+        if self.use_ortho:
+            betas, _ = self._risk_decomposition()
+            s = self._orthogonalize(s, betas.reindex(s.index))
 
         # Step 3: portfolio vol scale
         return self._scale_to_vol(s)

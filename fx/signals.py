@@ -1,5 +1,5 @@
 """
-FX signals: momentum, mean reversion, carry.
+FX signals: momentum and carry.
 """
 
 import pandas as pd
@@ -8,12 +8,6 @@ import pandas as pd
 def momentum(spot: pd.DataFrame, lookback: int = 252) -> pd.DataFrame:
     """
     Time-series or cross-sectional momentum on FX spot returns.
-    """
-    raise NotImplementedError
-
-def mean_reversion(spot: pd.DataFrame, lookback: int = 63) -> pd.DataFrame:
-    """
-    PPP or short-term mean reversion signal.
     """
     raise NotImplementedError
 
@@ -30,11 +24,10 @@ def combined_signal(
     weights: dict | None = None,
 ) -> pd.DataFrame:
     if weights is None:
-        weights = {"momentum": 1 / 3, "mean_reversion": 1 / 3, "carry": 1 / 3}
+        weights = {"momentum": 0.5, "carry": 0.5}
 
     sig = (
         weights["momentum"] * momentum(spot)
-        + weights["mean_reversion"] * mean_reversion(spot)
         + weights["carry"] * carry(forwards, spot)
     )
     return sig

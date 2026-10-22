@@ -117,3 +117,48 @@ def build_signal_c_grid(
                 ew = ew.rolling(h).mean()
             results[(k, h)] = {"vol_scaled": vs, "equal_weight": ew}
     return results
+
+
+# ── Daily signal (EWMA score) ─────────────────────────────────────────────────
+
+def build_signal_c_daily(
+    rx_d: pd.DataFrame,
+    halflife_days: int = 126,
+    target: float = 0.40,
+) -> dict[str, pd.DataFrame]:
+    """
+    Daily TSMOM using an EWMA score on daily excess returns.
+
+    Halflife mapping from the monthly formation grid:
+      k=1m → 10 days, k=3m → 32, k=6m → 63, k=9m → 95, k=12m → 126.
+
+    Vol estimate: daily ex_ante_vol (not resampled to month-end).
+    Returns dict with 'vol_scaled' and 'equal_weight'.
+    """
+    score   = rx_d.ewm(halflife=halflife_days, min_periods=halflife_days).mean()
+    sigma_d = ex_ante_vol(rx_d)
+    sgn     = np.sign(score)
+
+    vs    = sgn * (target / sigma_d.replace(0, np.nan))
+    denom = sgn.abs().sum(axis=1).replace(0, np.nan)
+    ew    = sgn.div(denom, axis=0)
+
+    return {"vol_scaled": vs, "equal_weight": ew}
+
+
+def build_signal_c_grid_daily(
+    rx_d: pd.DataFrame,
+    halflives: tuple = (10, 32, 63, 95, 126),
+    target: float = 0.40,
+) -> dict[int, dict[str, pd.DataFrame]]:
+    """All halflife combinations. Keys are halflife in business days."""
+    sigma_d = ex_ante_vol(rx_d)
+    results: dict[int, dict[str, pd.DataFrame]] = {}
+    for hl in halflives:
+        score = rx_d.ewm(halflife=hl, min_periods=hl).mean()
+        sgn   = np.sign(score)
+        vs    = sgn * (target / sigma_d.replace(0, np.nan))
+        denom = sgn.abs().sum(axis=1).replace(0, np.nan)
+        ew    = sgn.div(denom, axis=0)
+        results[hl] = {"vol_scaled": vs, "equal_weight": ew}
+    return results
