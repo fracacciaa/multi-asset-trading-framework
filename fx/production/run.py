@@ -9,12 +9,14 @@ Monthly outputs (date × pair, ~334 rows):
 
 Daily outputs (date × pair, ~7241 rows):
   rx_d.parquet
+  signal_a_hl95_daily.parquet      momentum: EWMA hl=95d (≈ f=9m), XS P6–P1
   signal_d_{mode}_weights_daily.parquet
   signal_e_bnp_daily.parquet
 
 Mean-reversion outputs (daily):
-  mr_ns_loo_signal.parquet     NS LOO VF TS signal (ns3·loo·grid·vfts·agg), date × pair
-  mr_ns_loo_positions.parquet  VF TS positions, date × pair
+  mr_ns_loo_signal.parquet          NS LOO VF TS signal (ns3·loo·grid·vfts·agg), date × pair
+  mr_ns_loo_positions.parquet       VF TS positions, date × pair (monthly rebalance)
+  mr_ns_loo_positions_daily.parquet XS positions, date × pair (daily rebalance, n=4)
   mr_fly_signal.parquet        Best NS fly (ns3_fixed·smooth·fly_1m3m6m) z-score per pair
   mr_fly_positions.parquet     XS positions per pair for the fly signal
 
@@ -43,7 +45,7 @@ from fx.production.data import (
     NO_FWD_PAIRS,
     TC_BP,
 )
-from fx.production.signal_a import build_signal_a, portfolio_returns
+from fx.production.signal_a import build_signal_a, build_signal_a_daily, portfolio_returns
 from fx.production.signal_d import build_signal_d, build_signal_d_daily
 from fx.production.signal_e import build_signal_e, build_signal_e_daily
 from fx.production.formations import xs_weights, ts_weights
@@ -157,6 +159,9 @@ def run(
     _log(f"  fd_d shape: {fd_d.shape}")
 
     # ── Step 6: daily carry signals ───────────────────────────────────────────
+    _log("Signal A daily (EWMA momentum hl=95d ≈ f=9m)...")
+    sig_a_d = build_signal_a_daily(rx_d, halflife_days=95)
+
     _log("Signal D daily (rolling MV carry)...")
     sig_d_d = build_signal_d_daily(fd_d, rx_d)
     _log(f"  MV floor hit rate (daily): {sig_d_d['MV_floor_pct']:.1%}")
@@ -213,6 +218,9 @@ def run(
     # ── Daily outputs ──────────────────────────────────────────────────────────
     _log("Writing daily parquet files...")
 
+    # Signal A daily
+    _save("signal_a_hl95_daily.parquet", sig_a_d)
+
     d_daily_out = pd.concat({
         "E":               sig_d_d["E"],
         "MV":              sig_d_d["MV"],
@@ -240,6 +248,8 @@ def run(
     sig_ns_loo, pos_ns_loo = build_ns_loo_vfts_signal(fwd_panels, rx_d)
     _save("mr_ns_loo_signal.parquet",    sig_ns_loo)
     _save("mr_ns_loo_positions.parquet", pos_ns_loo)
+    pos_ns_loo_daily = compute_xs_positions(sig_ns_loo, n=4)
+    _save("mr_ns_loo_positions_daily.parquet", pos_ns_loo_daily)
 
     _log("Mean-reversion: NS fly signal (ns3_fixed·smooth·fly_1m3m6m)...")
     fly_sigs = build_rv_signals(
@@ -313,8 +323,10 @@ def run(
         "signal_d_d":    sig_d_d,
         "signal_e_d":    sig_e_d,
         "fwd_panels":       fwd_panels,
-        "mr_ns_loo_signal": sig_ns_loo,
-        "mr_ns_loo_pos":    pos_ns_loo,
+        "signal_a_d":           sig_a_d,
+        "mr_ns_loo_signal":     sig_ns_loo,
+        "mr_ns_loo_pos":        pos_ns_loo,
+        "mr_ns_loo_pos_daily":  pos_ns_loo_daily,
         "mr_fly_signal": fly_z   if not fly_raw.empty else pd.DataFrame(),
         "mr_fly_pos":    fly_pos if not fly_raw.empty else pd.DataFrame(),
         "manifest":      manifest,
