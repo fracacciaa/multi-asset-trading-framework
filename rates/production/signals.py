@@ -5,8 +5,8 @@ All signals are cross-market (date × market DataFrames), each market treated
 independently (ViewFormationTS). Positive signal → long duration (receive rates).
 
 Four signals:
-  1. Momentum  — MOP Signal A — sign(12m log excess return) on {2,5,10}Y OIS tenors,
-                 equal-weight average across tenors, monthly frequency
+  1. Momentum  — Signal A daily — per-(market,tenor) TSMOM, 252-day window,
+                 inverse-vol sized; independent bet per tenor, all OIS markets
   2. Carry     — NS_fixed  — −β₂ (slope factor)
   3. MeanRev   — ex_raw RV — factor-neutral NS residuals, per-tenor EWMA z-score
   4. Carry CC  — cross-country DV01-neutral carry (DM only)
@@ -17,9 +17,9 @@ then EWMA z-scored. The per-market scalar is the mean of per-tenor z-scores,
 representing aggregate factor-neutral cheapness of the curve.
 Lambda is calibrated once on the training window (≤ RV_TRAIN_END).
 
-The momentum signal (MOP) uses bootstrapped zero-coupon log excess returns
-(Sihvonen eq 1) rather than NS level-factor changes.  OOS Sharpe at 2Y: 0.55–0.90
-across US/EUR/UK/Japan/CA/AU/NZ.  Spec: rates/docs/ois_momentum_signals_spec.md.
+The momentum signal uses daily CM returns (ret_d) for both the formation window
+and vol estimation; positions are inverse-vol sized (MOP spec). Each (market,tenor)
+pair is a fully independent bet; no cross-tenor averaging.
 """
 
 import numpy as np
@@ -73,54 +73,46 @@ def carry(factors: pd.DataFrame) -> pd.DataFrame:
     return (-slope).rename_axis("date")
 
 
-def momentum_mop(
+def momentum_a_daily(
     markets: Optional[list[str]] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
     tenors: Optional[list[float]] = None,
-    k: int = 12,
+    k: int = 252,
 ) -> pd.DataFrame:
     """
-    MOP time-series momentum on log excess swap returns (Signal A).
+    Signal A daily — MOP TSMOM, independent inverse-vol-sized bet per (market, tenor).
 
-    signal[t] = mean_tenors( sign( Σ_{i=1}^{k} rx_m[t-i] ) )
+    pos[(market, tenor), t] = sign( Σ_{i=1}^{k} ret_d[t-i] ) × (TARGET_VOL / σ_t)
 
-    rx_m is the monthly Sihvonen log excess return (exact OIS bootstrap, eq 1).
-    Positive signal → positive momentum → long duration (receive fixed).
+    Uses daily CM returns (ret_d) for both formation window and vol estimation.
+    Vol floor at 10% of TARGET_VOL to guard against sparse-data periods.
+    Defaults to all OIS markets and primary tenors {2, 5, 10}Y.
 
-    Markets default to DM-8 (same as cross-country carry).
-    Tenors default to {2, 5, 10}Y — primary set mirroring MOP bond futures.
-    Signal is monthly (month-end); forward-fills between rebalances.
-
-    OOS Sharpe (2019–today): US 0.49, EUR 0.41, AU 0.52, Japan 0.59, NZ 0.37.
+    Returns a date × (market, tenor) MultiIndex DataFrame of daily position sizes.
     """
-    from rates.production.momentum.returns import build_rx_monthly
-    from rates.production.carry.cross_country import DM_MARKETS
+    from rates.production.momentum.returns import build_return_panels
+    from rates.production.momentum.signal_a import build_signal_a_daily, TARGET_VOL_BP
 
     if markets is None:
-        markets = DM_MARKETS
+        markets = OIS_MARKETS
     if tenors is None:
         tenors = [2.0, 5.0, 10.0]
 
-    mkt_series: dict[str, pd.Series] = {}
+    panels_by_market: dict = {}
     for market in markets:
         try:
-            panels = build_rx_monthly(market, start=start, end=end)
-            rx_m   = panels["rx_m"]
-            cols   = [t for t in tenors if t in rx_m.columns]
-            if not cols:
-                continue
-            sig = np.sign(rx_m[cols].shift(1).rolling(k).sum())
-            mkt_series[market] = sig.mean(axis=1)
+            panels_by_market[market] = build_return_panels(
+                market, start=start, end=end, tenors=tenors,
+            )
         except Exception:
             continue
 
-    if not mkt_series:
-        return pd.DataFrame()
+    sig = build_signal_a_daily(panels_by_market, tenors=tenors, k=k)
 
-    df = pd.DataFrame(mkt_series)
-    df.index.name = "date"
-    return df
+    # Cap positions at 10× (equivalent to a 10% TARGET_VOL floor on sigma)
+    max_pos = TARGET_VOL_BP / (TARGET_VOL_BP * 0.1)   # = 10.0
+    return sig.clip(lower=-max_pos, upper=max_pos)
 
 
 def carry_cross_country(
@@ -236,12 +228,11 @@ def build_signals(
     start: Optional[str] = None,
     end: Optional[str] = None,
     mom_tenors: Optional[list[float]] = None,
-    mom_k: int = 12,
 ) -> dict[str, pd.DataFrame]:
     """
     Run the full rates signal pipeline.
 
-    Momentum uses MOP Signal A (log excess returns on {2,5,10}Y OIS tenors).
+    Momentum uses Signal A daily (daily TSMOM, inverse-vol sized, per tenor).
     Carry uses ns_calibrated (fast, OLS).
     Mean reversion uses the ex_raw factor-neutral NS residual signal.
     Cross-country carry uses carry_reprice on NS-fitted 10Y curves with DV01
@@ -250,7 +241,7 @@ def build_signals(
     Returns
     -------
     dict with keys:
-      'momentum'            — date × market monthly signal (month-end indexed)
+      'momentum'            — date × (market, tenor) daily position sizes
       'carry'               — date × market raw signal (unnormalised)
       'mean_reversion'      — date × market raw signal (unnormalised)
       'carry_cross_country' — date × market position weights (ready-to-trade)
@@ -261,8 +252,8 @@ def build_signals(
     )
 
     return {
-        "momentum":            momentum_mop(markets=markets, start=start, end=end,
-                                            tenors=mom_tenors, k=mom_k),
+        "momentum":            momentum_a_daily(markets=markets, start=start, end=end,
+                                                tenors=mom_tenors),
         "carry":               carry(ns_factors),
         "mean_reversion":      mean_reversion_rv(markets=markets, start=start, end=end),
         "carry_cross_country": carry_cross_country(markets=markets, start=start, end=end),
