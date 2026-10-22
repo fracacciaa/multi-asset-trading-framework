@@ -33,7 +33,7 @@ import pandas as pd
 
 from rates.production.nelson_siegel import extract_factors_all_markets
 from rates.production.signals import carry, carry_cross_country
-from rates.production.mean_reversion.signal import mean_reversion_rv
+from rates.production.mean_reversion.signal import mean_reversion_rv, mean_reversion_pnl
 from rates.production.momentum.returns import build_all_return_panels
 from rates.production.momentum.signal_a import build_signal_a
 from rates.production.momentum.signal_a import DM_MARKETS as MOM_MARKETS
@@ -145,6 +145,11 @@ def run(
                                zero_curves=zero_curves)
     _save("mean_reversion.parquet", mr_sig)
 
+    _log("Mean reversion PnL: per-tenor pos(t-1) × −Δresid(t)...")
+    mr_pnl = mean_reversion_pnl(markets=markets, start=start, end=end,
+                                zero_curves=zero_curves)
+    _save("mean_reversion_pnl.parquet", mr_pnl)
+
     # ── Step 6: Cross-country carry ────────────────────────────────────────────
     _log("Cross-country carry: DV01-neutral positions (DM only)...")
     cc_mkts = [m for m in CC_DM_MARKETS if m in markets]
@@ -178,18 +183,21 @@ def run(
             "momentum_a",
         ],
         "files": {
-            "ns_factors":     "date × (market,factor) MultiIndex cols; level/slope/curvature",
-            "carry":          "date × market; within-curve carry (−β₂)",
-            "mean_reversion": "date × market; factor-neutral NS residual z-score",
-            "carry_cc":       "date × market; cross-country carry positions (ready-to-trade)",
-            "momentum_a":     "date × (market,tenor) MultiIndex cols; MOP position sizes",
-            "rx_m":           "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
-            "ret_d":          "date × (market,tenor); daily CM constant-maturity returns (bp)",
-            "ois_carry":      "long format (market,date,tenor,horizon); static carry (bp)",
+            "ns_factors":          "date × (market,factor) MultiIndex cols; level/slope/curvature",
+            "carry":               "date × market; within-curve carry (−β₂)",
+            "mean_reversion":      "date × market; factor-neutral NS residual z-score (scalar signal)",
+            "mean_reversion_pnl":  "date × market; per-tenor pos(t-1)×(−Δresid(t)) summed — use for Sharpe",
+            "carry_cc":            "date × market; cross-country carry positions (ready-to-trade)",
+            "momentum_a":          "date × (market,tenor) MultiIndex cols; MOP position sizes",
+            "rx_m":                "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
+            "ret_d":               "date × (market,tenor); daily CM constant-maturity returns (bp)",
+            "ois_carry":           "long format (market,date,tenor,horizon); static carry (bp)",
         },
         "sharpe_recipe": (
-            "pnl = signal.shift(1) * return; "
-            "sr = pnl.dropna().mean() / pnl.dropna().std() * sqrt(freq)"
+            "mean_reversion: pnl = mean_reversion_pnl[market]; "
+            "sr = pnl.dropna().mean() / pnl.dropna().std() * sqrt(252). "
+            "Do NOT use mean_reversion signal × yield return — that averages across tenors "
+            "and uses the wrong return series."
         ),
     }
     with open(out_dir / "manifest.json", "w") as f:
@@ -198,16 +206,17 @@ def run(
 
     _log("Done.")
     return {
-        "ns_factors":     ns_factors,
-        "carry":          carry_sig,
-        "mean_reversion": mr_sig,
-        "carry_cc":       cc_sig,
-        "momentum_a":     mom_a,
-        "rx_m":           rx_m_all,
-        "ret_d":          ret_d_all,
-        "ois_carry":      ois_carry,
-        "all_panels":     all_panels,
-        "manifest":       manifest,
+        "ns_factors":         ns_factors,
+        "carry":              carry_sig,
+        "mean_reversion":     mr_sig,
+        "mean_reversion_pnl": mr_pnl,
+        "carry_cc":           cc_sig,
+        "momentum_a":         mom_a,
+        "rx_m":               rx_m_all,
+        "ret_d":              ret_d_all,
+        "ois_carry":          ois_carry,
+        "all_panels":         all_panels,
+        "manifest":           manifest,
     }
 
 
