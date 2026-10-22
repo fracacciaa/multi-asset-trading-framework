@@ -4,14 +4,12 @@ FX signal pipeline.
 Monthly outputs (date × pair, ~334 rows):
   returns.parquet              s, fd_1m, rx_m, surface columns
   signal_a_f9_h1.parquet       momentum: XS f=9m h=1 (Menkhoff, best train/test)
-  signal_d_{mode}_weights.parquet
-  signal_e_bnp.parquet
 
 Daily outputs (date × pair, ~7241 rows):
   rx_d.parquet
-  signal_a_hl95_daily.parquet      momentum: EWMA hl=95d (≈ f=9m), XS P6–P1
-  signal_d_{mode}_weights_daily.parquet
-  signal_e_bnp_daily.parquet
+  signal_a_hl95_daily.parquet           momentum: EWMA hl=95d (≈ f=9m), XS P6–P1
+  signal_d_E_only_weights_daily.parquet carry: Dupuy E-only leverage
+  signal_e_carry_daily.parquet          carry: base XS + E3 aggregate de-risk (columns: base_weights, e3_weights)
 
 Mean-reversion outputs (daily):
   mr_ns_loo_signal.parquet          NS LOO VF TS signal (ns3·loo·grid·vfts·agg), date × pair
@@ -46,8 +44,8 @@ from fx.production.data import (
     TC_BP,
 )
 from fx.production.signal_a import build_signal_a, build_signal_a_daily, portfolio_returns
-from fx.production.signal_d import build_signal_d, build_signal_d_daily
-from fx.production.signal_e import build_signal_e, build_signal_e_daily
+from fx.production.signal_d import build_signal_d_daily
+from fx.production.signal_e import build_signal_e_daily
 from fx.production.formations import xs_weights, ts_weights
 from fx.ns_fwd import (
     build_fwd_panel,
@@ -132,26 +130,7 @@ def run(
     monotone = all(means[i+1] >= means[i] - 1e-6 for i in range(1, 5) if i in means and i+1 in means)
     _log(f"  Monotone P1→P6 (f=6 diagnostic): {monotone}")
 
-    # ── Step 3: Signal D — carry ──────────────────────────────────────────────
-    _log("Signal D: Dupuy managed carry...")
-    sig_d = build_signal_d(fd_m, rx_d)
-    _log(f"  MV floor hit rate: {sig_d['MV_floor_pct']:.1%}")
-
-    # ── Step 4: Signal E — crash-risk carry ───────────────────────────────────
-    _log("Signal E: BNP crash-risk conditioned carry...")
-    opt_mask = s_m.index >= OPTION_START
-    sig_e = build_signal_e(
-        fd_m=fd_m[opt_mask],
-        rr25_m=rr25_m[opt_mask] if not rr25_m.empty else rr25_m,
-        rr10_m=rr10_m[opt_mask] if not rr10_m.empty else rr10_m,
-        bf25_m=bf25_m[opt_mask] if not bf25_m.empty else bf25_m,
-        bf10_m=bf10_m[opt_mask] if not bf10_m.empty else bf10_m,
-        atm_m=atm_m[opt_mask] if not atm_m.empty else atm_m,
-        s_m=s_m[opt_mask],
-    )
-    _log(f"  fd/RR cross-sectional corr: {sig_e.get('cs_corr_fd_rr', float('nan')):.3f}")
-
-    # ── Step 5: daily auxiliary series ────────────────────────────────────────
+    # ── Step 3: daily auxiliary series ────────────────────────────────────────
     _log("Building daily auxiliary series (ffill from month-end)...")
     fd_d   = fd_m.resample("B").ffill()
     rr25_d = rr25_m.resample("B").ffill() if not rr25_m.empty else pd.DataFrame()
@@ -196,24 +175,8 @@ def run(
     _save("returns.parquet", pd.concat(ret_frames, axis=1))
     _save("rx_d.parquet", rx_d)
 
-    # Signal A
+    # Signal A monthly
     _save("signal_a_f9_h1.parquet", sig_a)
-
-    # Signal D
-    d_out = pd.concat({
-        "E":               sig_d.get("E", pd.Series(dtype=float)),
-        "MV":              sig_d["MV"],
-        "signal_E_over_V": sig_d.get("signal_E_over_V", pd.Series(dtype=float)),
-    }, axis=1)
-    _save("signal_d_dupuy.parquet", d_out)
-    for mode in ("E_over_V", "E_only", "V_only"):
-        if f"weights_{mode}" in sig_d:
-            _save(f"signal_d_{mode}_weights.parquet", sig_d[f"weights_{mode}"])
-
-    # Signal E
-    e_weights = {k: v for k, v in sig_e.items() if isinstance(v, pd.DataFrame) and "weights" in k}
-    if e_weights:
-        _save("signal_e_bnp.parquet", pd.concat(e_weights, axis=1))
 
     # ── Daily outputs ──────────────────────────────────────────────────────────
     _log("Writing daily parquet files...")
@@ -221,19 +184,15 @@ def run(
     # Signal A daily
     _save("signal_a_hl95_daily.parquet", sig_a_d)
 
-    d_daily_out = pd.concat({
-        "E":               sig_d_d["E"],
-        "MV":              sig_d_d["MV"],
-        "signal_E_over_V": sig_d_d.get("signal_E_over_V", pd.Series(dtype=float)),
-    }, axis=1)
-    _save("signal_d_dupuy_daily.parquet", d_daily_out)
-    for mode in ("E_over_V", "E_only", "V_only"):
-        if f"weights_{mode}" in sig_d_d:
-            _save(f"signal_d_{mode}_weights_daily.parquet", sig_d_d[f"weights_{mode}"])
+    # Signal D daily — E-only only
+    if "weights_E_only" in sig_d_d:
+        _save("signal_d_E_only_weights_daily.parquet", sig_d_d["weights_E_only"])
 
-    e_d_weights = {k: v for k, v in sig_e_d.items() if isinstance(v, pd.DataFrame) and "weights" in k}
-    if e_d_weights:
-        _save("signal_e_bnp_daily.parquet", pd.concat(e_d_weights, axis=1))
+    # Signal E daily — base and E3 only
+    e_keep = {k: v for k, v in sig_e_d.items()
+              if isinstance(v, pd.DataFrame) and k in ("base_weights", "e3_weights")}
+    if e_keep:
+        _save("signal_e_carry_daily.parquet", pd.concat(e_keep, axis=1))
 
     # ── Step 7: mean-reversion signals ────────────────────────────────────────
     _log("Mean-reversion: loading multi-tenor forward panel...")
@@ -286,10 +245,9 @@ def run(
             "No bid/ask data. Dupuy attractive-currency filter is vacuous with mid quotes. "
             "TC_BP values are flat placeholders, not estimates."
         ),
-        "momentum":           {"signal": "XS f=9m h=1", "train_sr": 0.51, "test_sr": 0.56},
-        "mv_floor_hit_rate":        sig_d["MV_floor_pct"],
+        "momentum":                 {"signal": "XS f=9m h=1", "train_sr": 0.51, "test_sr": 0.56},
         "mv_floor_hit_rate_daily":  sig_d_d["MV_floor_pct"],
-        "cs_corr_fd_rr":            sig_e.get("cs_corr_fd_rr", None),
+        "cs_corr_fd_rr":            sig_e_d.get("cs_corr_fd_rr", None),
         "portfolio_monotone":       monotone,
         "daily_carry": {
             "fd_source":        "fd_m forward-filled to business daily",
@@ -318,8 +276,6 @@ def run(
     return {
         "panels":        panels,
         "signal_a":      sig_a,
-        "signal_d":      sig_d,
-        "signal_e":      sig_e,
         "signal_d_d":    sig_d_d,
         "signal_e_d":    sig_e_d,
         "fwd_panels":       fwd_panels,
