@@ -42,7 +42,7 @@ from rates.production.carry.carry_bonds import _dmod_par_vec, _interp_at_tenor_v
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
 OIS_PAR_MARKETS: list[str] = [
-    "US", "EUR", "UK", "Japan", "Canada", "Australia", "New Zealand", "Sweden",
+    "US", "EUR", "UK", "Japan", "Canada", "Australia", "New Zealand", "Sweden", "Switzerland",
 ]
 
 BENCHMARK_TENORS: list[float] = [5.0, 10.0]
