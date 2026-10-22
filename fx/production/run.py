@@ -7,7 +7,7 @@ Monthly outputs (date × pair, ~334 rows):
 
 Daily outputs (date × pair, ~7241 rows):
   rx_d.parquet
-  signal_a_hl95_daily.parquet           momentum: EWMA hl=95d (≈ f=9m), XS P6–P1
+  signal_a_daily.parquet                momentum: EWMA hl selected by IS Sharpe (see manifest), XS P6–P1
   signal_d_E_only_weights_daily.parquet carry: Dupuy E-only leverage
   signal_e_carry_daily.parquet          carry: base XS + E3 aggregate de-risk (columns: base_weights, e3_weights)
 
@@ -43,7 +43,9 @@ from fx.production.data import (
     NO_FWD_PAIRS,
     TC_BP,
 )
-from fx.production.signal_a import build_signal_a, build_signal_a_daily, portfolio_returns
+from fx.production.signal_a import (
+    build_signal_a, build_signal_a_daily, build_signal_a_grid_daily, portfolio_returns,
+)
 from fx.production.signal_d import build_signal_d_daily
 from fx.production.signal_e import build_signal_e_daily
 from fx.production.formations import xs_weights, ts_weights
@@ -138,8 +140,16 @@ def run(
     _log(f"  fd_d shape: {fd_d.shape}")
 
     # ── Step 6: daily carry signals ───────────────────────────────────────────
-    _log("Signal A daily (EWMA momentum hl=95d ≈ f=9m)...")
-    sig_a_d = build_signal_a_daily(rx_d, halflife_days=95)
+    _log("Signal A daily: selecting halflife by IS Sharpe...")
+    _hl_grid = build_signal_a_grid_daily(rx_d)
+    _hl_is_srs = {}
+    for _hl, _w in _hl_grid.items():
+        _is = (_w.shift(1) * rx_d).sum(axis=1).loc[:_TRAIN_END].dropna()
+        if len(_is) > 60:
+            _hl_is_srs[_hl] = float(_is.mean() / _is.std() * np.sqrt(252))
+    _best_hl = max(_hl_is_srs, key=_hl_is_srs.get)
+    _log(f"  Selected hl={_best_hl}d (IS SR={_hl_is_srs[_best_hl]:.3f})")
+    sig_a_d = build_signal_a_daily(rx_d, halflife_days=_best_hl)
 
     _log("Signal D daily (rolling MV carry)...")
     sig_d_d = build_signal_d_daily(fd_d, rx_d)
@@ -182,7 +192,7 @@ def run(
     _log("Writing daily parquet files...")
 
     # Signal A daily
-    _save("signal_a_hl95_daily.parquet", sig_a_d)
+    _save("signal_a_daily.parquet", sig_a_d)
 
     # Signal D daily — E-only only
     if "weights_E_only" in sig_d_d:
@@ -245,7 +255,12 @@ def run(
             "No bid/ask data. Dupuy attractive-currency filter is vacuous with mid quotes. "
             "TC_BP values are flat placeholders, not estimates."
         ),
-        "momentum":                 {"signal": "XS f=9m h=1", "train_sr": 0.51, "test_sr": 0.56},
+        "momentum": {
+            "monthly": {"signal": "XS f=9m h=1", "train_sr": 0.51, "test_sr": 0.56},
+            "daily":   {"halflife_days": _best_hl,
+                        "is_sr": round(_hl_is_srs[_best_hl], 3),
+                        "is_sr_by_hl": {k: round(v, 3) for k, v in sorted(_hl_is_srs.items())}},
+        },
         "mv_floor_hit_rate_daily":  sig_d_d["MV_floor_pct"],
         "cs_corr_fd_rr":            sig_e_d.get("cs_corr_fd_rr", None),
         "portfolio_monotone":       monotone,
