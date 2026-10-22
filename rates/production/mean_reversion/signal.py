@@ -54,6 +54,7 @@ def mean_reversion_rv(
     start: Optional[str] = None,
     end: Optional[str] = None,
     lambdas: Optional[dict] = None,
+    zero_curves: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Factor-neutral NS residual mean-reversion signal (ex_raw).
@@ -72,8 +73,11 @@ def mean_reversion_rv(
 
     mkt_series: dict[str, pd.Series] = {}
     for market in markets:
-        raw = fetch_ois_curves(market, start=start, end=end)
-        zc  = build_zero_curve(raw)
+        if zero_curves is not None and market in zero_curves:
+            zc = zero_curves[market]
+        else:
+            raw = fetch_ois_curves(market, start=start, end=end)
+            zc  = build_zero_curve(raw)
 
         raw_cols = fetch_ois_curves(market).columns.values.astype(float)
         avail = np.array([t for t in np.sort(raw_cols[raw_cols >= 1.0])

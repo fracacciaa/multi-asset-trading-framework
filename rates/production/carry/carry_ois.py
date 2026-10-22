@@ -178,6 +178,7 @@ def ois_carry_panel(
     end: Optional[str] = None,
     zero_method: str = "monotone_preserving",
     zscore_lookback: int = ZSCORE_LOOKBACK,
+    zero_curve: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Compute OIS carry signal panel for one market.
@@ -209,9 +210,12 @@ def ois_carry_panel(
 
     par = fetch_ois_curves(market, start=start, end=end)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        zero = build_zero_curve(par, method=zero_method)
+    if zero_curve is not None:
+        zero = zero_curve
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            zero = build_zero_curve(par, method=zero_method)
 
     # Funding rate: 3M (tenor 0.25) from par curve; fall back to nearest short-end zero
     funding_tenor = 0.25
@@ -224,28 +228,111 @@ def ois_carry_panel(
             f"{market}: 3M OIS not found; using tenor {nearest:.3f}Y as funding proxy"
         )
 
-    rows: list[dict] = []
-    for date in zero.index:
-        z_row = zero.loc[date].dropna()
-        if len(z_row) < 6:
+    # ── Batch discount-factor matrix (vectorised across all dates) ───────────
+    z_np   = zero.to_numpy(float)               # (D, 70)
+    z_cols = zero.columns.to_numpy(float)       # TARGET_TENORS
+    D      = len(zero)
+
+    def _cpn_dates(tenor: float) -> list:
+        """Coupon dates for a swap of given tenor (freq=OIS_COUPON_FREQ, last snapped)."""
+        n = max(1, round(tenor * OIS_COUPON_FREQ))
+        cd = [j / OIS_COUPON_FREQ for j in range(1, n + 1)]
+        cd[-1] = tenor
+        return cd
+
+    # Collect every unique time-point needed across all (T, h) combinations
+    _tpts_set: set = set()
+    for T in tenors:
+        for cd in _cpn_dates(T):
+            _tpts_set.add(round(cd, 9))
+        for h in horizons.values():
+            if T - h < 1.0 / OIS_COUPON_FREQ:
+                continue
+            for cd in _cpn_dates(T - h):           # for K_Tmh annuity
+                _tpts_set.add(round(cd, 9))
+            for cd in _cpn_dates(T):               # for aged annuity
+                if cd - h > 1e-6:
+                    _tpts_set.add(round(cd - h, 9))
+    _tpts    = np.array(sorted(_tpts_set))
+    _tpt_idx = {v: i for i, v in enumerate(_tpts)}
+
+    def _key(x: float) -> float:
+        return round(x, 9)
+
+    # (D, K) discount factor matrix via vectorised linear interp on zero curve
+    batch_df = np.ones((D, len(_tpts)))
+    for k, tp in enumerate(_tpts):
+        if tp <= 0:
             continue
-        z_t = z_row.index.to_numpy(float)
-        z_r = z_row.to_numpy(float)
+        ir = int(np.clip(np.searchsorted(z_cols, tp), 1, len(z_cols) - 1))
+        il = ir - 1
+        w  = ((tp - z_cols[il]) / (z_cols[ir] - z_cols[il])
+              if z_cols[ir] != z_cols[il] else 0.0)
+        z_i = (1 - w) * z_np[:, il] + w * z_np[:, ir]     # (D,)
+        batch_df[:, k] = np.exp(-z_i / 100.0 * tp)
 
-        # Funding: par 3M on same date
-        if date not in rf_series.index or pd.isna(rf_series.loc[date]):
+    # Align rf to zero.index
+    rf_vec     = rf_series.reindex(zero.index).to_numpy(float)  # (D,)
+    valid_mask = (np.sum(np.isfinite(z_np), axis=1) >= 6) & np.isfinite(rf_vec)
+
+    all_frames = []
+    max_z = float(z_cols[-1])
+
+    def _ann(dates_list: list) -> np.ndarray:
+        """Sum of DFs for dates_list, divided by freq. Returns (D,) array."""
+        return sum(batch_df[:, _tpt_idx[_key(cd)]] for cd in dates_list) / OIS_COUPON_FREQ
+
+    for T in tenors:
+        if T > max_z:
             continue
-        rf = float(rf_series.loc[date])
+        cpn_T = _cpn_dates(T)
+        ann_T = _ann(cpn_T)
+        df_T  = batch_df[:, _tpt_idx[_key(T)]]
+        K_T   = np.where(ann_T > 1e-10, (1.0 - df_T) / ann_T * 100.0, np.nan)
+        dv01  = ann_T * 1e-4
 
-        date_rows = _ois_carry_one_date(z_t, z_r, rf, tenors, horizons)
-        for r in date_rows:
-            r["date"] = date
-        rows.extend(date_rows)
+        for h_label, h in horizons.items():
+            T_mh = T - h
+            if T_mh < 1.0 / OIS_COUPON_FREQ:
+                continue
+            cpn_Tmh  = _cpn_dates(T_mh)
+            aged_cpn = [cd - h for cd in cpn_T if cd - h > 1e-6]
+            if not aged_cpn:
+                continue
 
-    if not rows:
+            ann_Tmh  = _ann(cpn_Tmh)
+            df_Tmh   = batch_df[:, _tpt_idx[_key(T_mh)]]
+            K_Tmh    = np.where(ann_Tmh > 1e-10, (1.0 - df_Tmh) / ann_Tmh * 100.0, np.nan)
+
+            ann_aged = _ann(aged_cpn)
+
+            roll_bp    = ann_aged * (K_T - K_Tmh) * 100.0
+            funding_bp = rf_vec * h * 100.0
+            static_bp  = roll_bp - funding_bp
+
+            frame = pd.DataFrame({
+                "tenor":           T,
+                "horizon":         h_label,
+                "par_rate_pct":    K_T,
+                "rf_pct":          rf_vec,
+                "annuity":         ann_T,
+                "aged_annuity":    ann_aged,
+                "dv01":            dv01,
+                "roll_proxy_bp":   roll_bp,
+                "static_carry_bp": static_bp,
+                "carry_dv01_bp":   np.where(dv01 * 1e4 > 1e-12,
+                                            static_bp / (dv01 * 1e4), np.nan),
+            }, index=zero.index)
+            all_frames.append(frame.loc[valid_mask])
+
+    if not all_frames:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows).set_index(["date", "tenor", "horizon"]).sort_index()
+    df = (pd.concat(all_frames)
+            .reset_index()
+            .rename(columns={"index": "date"})
+            .set_index(["date", "tenor", "horizon"])
+            .sort_index())
 
     # OIS-5: trailing z-score of static_carry_bp per (tenor, horizon) group
     def _zscore(s: pd.Series) -> pd.Series:
@@ -273,6 +360,7 @@ def ois_carry_all_markets(
     start: Optional[str] = None,
     end: Optional[str] = None,
     zero_method: str = "monotone_preserving",
+    zero_curves: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Compute OIS carry for all (or selected) markets.
@@ -288,6 +376,7 @@ def ois_carry_all_markets(
             panel = ois_carry_panel(
                 mkt, tenors=tenors, horizons=horizons,
                 start=start, end=end, zero_method=zero_method,
+                zero_curve=zero_curves.get(mkt) if zero_curves else None,
             )
             if panel.empty:
                 continue

@@ -142,7 +142,7 @@ def carry_cross_country(
     normalised to gross = 1.0, lagged by 1 day.  Positive = receive fixed
     (long duration); negative = pay fixed (short duration).
     """
-    from rates.production.ns_core import fit_ns
+    from rates.production.ns_core import fit_ns, fit_ns_batch
     from rates.production.carry.cross_country import (
         country_carry_at_target, build_cross_country_positions, DM_MARKETS,
     )
@@ -161,19 +161,36 @@ def carry_cross_country(
             col = 0.25 if 0.25 in c.columns else min(c.columns, key=lambda x: abs(x - 0.25))
             curves_dict[mkt]  = c
             funding_dict[mkt] = c[col]
+
+            tau_all = c.columns.to_numpy(float)
+            Y_all   = c.values * 100.0               # % → bp, shape (T, N)
+            full_rows   = np.all(np.isfinite(Y_all), axis=1)
+            enough_rows = np.sum(np.isfinite(Y_all), axis=1) >= 4
+
             fits: dict = {}
-            for date in c.index:
-                row = c.loc[date].dropna()
+
+            # Batch the dates where all tenors are valid (vast majority)
+            if full_rows.any():
+                for date, fit in zip(
+                    c.index[full_rows],
+                    fit_ns_batch(tau_all, Y_all[full_rows], lam=CC_LAM, basis=CC_BASIS),
+                ):
+                    fits[date] = fit
+
+            # Per-row fallback for partial dates (some tenors NaN)
+            for i in np.where(enough_rows & ~full_rows)[0]:
+                row = c.iloc[i].dropna()
                 if len(row) < 4:
                     continue
                 try:
-                    fits[date] = fit_ns(
+                    fits[c.index[i]] = fit_ns(
                         row.index.to_numpy(float),
                         row.to_numpy(float) * 100.0,
                         lam=CC_LAM, basis=CC_BASIS,
                     )
                 except Exception:
                     pass
+
             if len(fits) >= CC_MIN_OBS:
                 fits_dict[mkt] = fits
         except Exception:

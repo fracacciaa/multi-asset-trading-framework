@@ -264,6 +264,44 @@ def _factor_columns(model: str) -> list[str]:
             else ["level", "slope", "curvature"])
 
 
+def _extract_factors_ns_batch(
+    zero_curve: pd.DataFrame,
+    tenors: np.ndarray,
+    lam: float,
+    factor_cols: list,
+) -> pd.DataFrame:
+    """
+    Vectorized NS factor extraction for ns_calibrated (fixed λ).
+
+    The design matrix X = _ns_loadings(tenors, lam) is constant across all
+    dates, so OLS reduces to a single matrix multiply: β = pinv(X) @ Y.T.
+    Falls back per-row only for dates with missing tenors.
+    """
+    Y = zero_curve.values.astype(float)   # (T, N)
+    T = len(Y)
+    X = _ns_loadings(tenors, lam)          # (N, 3)
+
+    full   = np.all(np.isfinite(Y), axis=1)                      # all tenors valid
+    enough = np.sum(np.isfinite(Y), axis=1) >= MIN_GRID_PTS      # enough tenors
+
+    betas = np.full((T, len(factor_cols)), np.nan)
+
+    if full.any():
+        X_pinv = np.linalg.pinv(X)                               # (3, N) — once
+        betas[full] = (X_pinv @ Y[full].T).T                     # batched OLS
+
+    for i in np.where(enough & ~full)[0]:
+        mask = np.isfinite(Y[i])
+        b, _, _, _ = np.linalg.lstsq(
+            _ns_loadings(tenors[mask], lam), Y[i, mask], rcond=None
+        )
+        betas[i] = b
+
+    df = pd.DataFrame(betas, index=zero_curve.index, columns=factor_cols)
+    df.index.name = "date"
+    return df
+
+
 def extract_factors(
     zero_curve: pd.DataFrame,
     model: ModelType = "ns_calibrated",
@@ -293,17 +331,22 @@ def extract_factors(
     if model == "nss_calibrated" and (lam1 is None or lam2 is None):
         raise ValueError("nss_calibrated requires lam1= and lam2=; call calibrate_lambda() first")
 
-    factor_cols  = _factor_columns(model)
+    factor_cols = _factor_columns(model)
+    tenors = zero_curve.columns.values.astype(float)
+
+    # ns_calibrated: fixed λ → constant design matrix → one batched matrix multiply
+    if model == "ns_calibrated":
+        return _extract_factors_ns_batch(zero_curve, tenors, lam, factor_cols)
+
     prev_lam     = lam  if lam  is not None else _LAM_INIT_NS
     prev_lam1    = lam1 if lam1 is not None else _LAM1_INIT_NSS
     prev_lam2    = lam2 if lam2 is not None else _LAM2_INIT_NSS
 
-    tenors = zero_curve.columns.values.astype(float)
     rows = []
     for date, row in zero_curve.iterrows():
         y = row.values.astype(float)
 
-        if model == "ns_calibrated":
+        if model == "ns_calibrated":  # unreachable — kept for completeness
             result = fit_ns_fixed(tenors, y, lam=lam)
         elif model == "ns_free":
             result = fit_ns_free(tenors, y, lam_init=prev_lam)
@@ -343,6 +386,7 @@ def extract_factors_all_markets(
     end: Optional[str] = None,
     model: ModelType = "ns_calibrated",
     lambdas: Optional[dict] = None,
+    zero_curves: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Build zero curves and extract NS/NSS factors for all markets in one call.
@@ -352,7 +396,9 @@ def extract_factors_all_markets(
 
     Parameters
     ----------
-    lambdas : output of calibrate_lambda(). Reuse to avoid repeated calibration.
+    lambdas     : output of calibrate_lambda(). Reuse to avoid repeated calibration.
+    zero_curves : pre-built {market: DataFrame} from build_zero_curve(). Avoids
+                  rebuilding when run.py already has the curves in memory.
 
     Returns
     -------
@@ -366,8 +412,11 @@ def extract_factors_all_markets(
 
     frames = {}
     for market in markets:
-        raw = fetch_ois_curves(market, start=start, end=end)
-        zc  = build_zero_curve(raw)
+        if zero_curves is not None and market in zero_curves:
+            zc = zero_curves[market]
+        else:
+            raw = fetch_ois_curves(market, start=start, end=end)
+            zc  = build_zero_curve(raw)
 
         if model == "ns_calibrated":
             df = extract_factors(zc, model=model, lam=lambdas["ns"][market])

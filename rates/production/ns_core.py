@@ -139,6 +139,61 @@ def fit_ns(
     )
 
 
+# ── Batch fit (fixed τ and λ, no ridge, no weights) ──────────────────────────
+
+def fit_ns_batch(
+    tau: np.ndarray,
+    Y: np.ndarray,
+    lam: float,
+    *,
+    basis: str = "ns",
+) -> list[NSFit]:
+    """
+    Vectorized NS OLS fit for T dates simultaneously.
+
+    All rows in Y must be fully finite (no NaN).  Designed for the common
+    case where the same tenor grid is observed on every date (e.g. CC carry
+    where the OIS curve is stable).  Replaces T separate fit_ns calls with
+    one batched matrix multiply — the (k, k) inverse and hat diagonal are
+    identical across dates when τ and λ are fixed.
+
+    Parameters
+    ----------
+    tau   : (N,) tenor array in years, same for every date
+    Y     : (T, N) yield matrix in bp; every entry must be finite
+    lam   : fixed λ (1/years)
+    basis : LOADINGS key; default "ns"
+
+    Returns
+    -------
+    list of T NSFit objects
+    """
+    tau = np.asarray(tau, float)
+    Y   = np.asarray(Y,   float)
+    T, N = Y.shape
+    k = NFACTORS[basis]
+
+    X    = LOADINGS[basis](tau, lam)            # (N, k)
+    G    = np.linalg.inv(X.T @ X)              # (k, k) — same for every date
+    beta = (G @ (X.T @ Y.T)).T                  # (T, k)
+    yhat  = (X @ beta.T).T                      # (T, N)
+    resid = Y - yhat                            # (T, N)
+    h     = np.einsum("ij,jk,ik->i", X, G, X)  # (N,) hat diagonal — same for every date
+    resid_loo = resid / np.clip(1.0 - h[None, :], 1e-6, None)  # (T, N)
+
+    return [
+        NSFit(
+            beta=beta[t], lam=lam, basis=basis,
+            tau=tau, y=Y[t], yhat=yhat[t],
+            resid=resid[t], resid_loo=resid_loo[t],
+            leverage=h,
+            sse=float(resid[t] @ resid[t]),
+            n_obs=N,
+        )
+        for t in range(T)
+    ]
+
+
 # ── Utility ────────────────────────────────────────────────────────────────────
 
 def shrink_to_prior_w(shrink: float, n_obs: int, k: int) -> np.ndarray:

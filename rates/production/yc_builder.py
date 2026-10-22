@@ -166,14 +166,11 @@ def _monotone_preserving(
     elif n == 2:
         f[0] = f[1] = (A[1] - A[0]) / (t[1] - t[0])
     else:
-        for i in range(1, n - 1):
-            h_l = t[i] - t[i - 1]
-            h_r = t[i + 1] - t[i]
-            s_l = (A[i] - A[i - 1]) / h_l
-            s_r = (A[i + 1] - A[i]) / h_r
-            f[i] = (h_r * s_l + h_l * s_r) / (h_l + h_r)
-        f[0]     = (A[1] - A[0]) / (t[1] - t[0])
-        f[n - 1] = (A[n - 1] - A[n - 2]) / (t[n - 1] - t[n - 2])
+        h = np.diff(t)           # (n-1,) interval widths
+        s = np.diff(A) / h       # (n-1,) interval slopes
+        f[1:-1] = (h[1:] * s[:-1] + h[:-1] * s[1:]) / (h[:-1] + h[1:])
+        f[0]    = s[0]
+        f[-1]   = s[-1]
 
     # Fritsch-Carlson monotonicity clamping (ensures f(t) ≥ 0)
     for i in range(n - 1):
@@ -196,27 +193,29 @@ def _monotone_preserving(
             f[i]         = tau * alpha * delta
             f[i + 1]     = tau * beta  * delta
 
-    def _A(t_star: float) -> float:
-        if t_star <= t[0]:
-            return A[0] + f[0] * (t_star - t[0])
-        if t_star >= t[-1]:
-            return A[-1] + f[-1] * (t_star - t[-1])
-        idx = min(np.searchsorted(t, t_star, side="right") - 1, n - 2)
-        h   = t[idx + 1] - t[idx]
-        s   = (t_star - t[idx]) / h
-        h00 = (1 - s) ** 2 * (1 + 2 * s)
-        h10 = s * (1 - s) ** 2
-        h01 = s ** 2 * (3 - 2 * s)
-        h11 = s ** 2 * (s - 1)
-        return A[idx] * h00 + f[idx] * h * h10 + A[idx + 1] * h01 + f[idx + 1] * h * h11
+    tgt   = np.asarray(target, dtype=float)
+    A_out = np.empty(len(tgt))
+    le0   = tgt <= 0
+    ll    = ~le0 & (tgt <= t[0])
+    rr    = ~le0 & (tgt >= t[-1])
+    mid   = ~le0 & ~ll & ~rr
 
-    out = np.empty(len(target))
-    for k, t_star in enumerate(target):
-        if t_star <= 0:
-            out[k] = y[0]
-        else:
-            out[k] = -_A(t_star) / t_star * 100.0
-    return out
+    if ll.any():
+        A_out[ll] = A[0] + f[0] * (tgt[ll] - t[0])
+    if rr.any():
+        A_out[rr] = A[-1] + f[-1] * (tgt[rr] - t[-1])
+    if mid.any():
+        tv  = tgt[mid]
+        idx = np.clip(np.searchsorted(t, tv, side="right") - 1, 0, n - 2)
+        h_v = t[idx + 1] - t[idx]
+        sv  = (tv - t[idx]) / h_v
+        A_out[mid] = (A[idx]     * (1 - sv) ** 2 * (1 + 2 * sv)
+                    + f[idx]     * h_v * sv * (1 - sv) ** 2
+                    + A[idx + 1] * sv ** 2 * (3 - 2 * sv)
+                    + f[idx + 1] * h_v * sv ** 2 * (sv - 1))
+
+    safe_tgt = np.where(le0 | (tgt == 0), 1.0, tgt)
+    return np.where(le0, y[0], -A_out / safe_tgt * 100.0)
 
 
 def _monotone_convex(
@@ -340,13 +339,10 @@ def _natural_cubic_spline(
 
     cs = CubicSpline(t_ext, A_ext, bc_type="natural")
 
-    out = np.empty(len(target))
-    for k, t_star in enumerate(target):
-        if t_star <= 0:
-            out[k] = y[0]
-        else:
-            out[k] = -float(cs(t_star)) / t_star * 100.0
-    return out
+    tgt    = np.asarray(target, dtype=float)
+    A_tgt  = cs(tgt)
+    safe   = np.where(tgt <= 0, 1.0, tgt)
+    return np.where(tgt <= 0, y[0], -A_tgt / safe * 100.0)
 
 
 # ── Interpolation dispatcher ──────────────────────────────────────────────────

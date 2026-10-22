@@ -173,6 +173,7 @@ def build_return_panels(
     start: Optional[str] = None,
     end: Optional[str] = None,
     tenors: Optional[list[float]] = None,
+    zero_curve: Optional[pd.DataFrame] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Build all return panels for one OIS market.
@@ -196,7 +197,7 @@ def build_return_panels(
     par = fetch_ois_curves(market, start=start, end=end)    # %, date × tenor
     par_bp = par * 100.0                                     # % → bp
 
-    zero = build_zero_curve(par)                             # %, date × 70 tenors
+    zero = zero_curve if zero_curve is not None else build_zero_curve(par)
 
     # ── Tenor selection ───────────────────────────────────────────────────────
     if tenors is None:
@@ -207,40 +208,50 @@ def build_return_panels(
     # Funding rate: shortest available OIS tenor
     rf_col = float(min(par.columns))
 
-    # ── Daily CM returns ──────────────────────────────────────────────────────
-    dates = par.index
-    dt_d  = 1.0 / 252
-    ret_d_rows: dict = {}
+    # ── Daily CM returns (vectorised across dates) ───────────────────────────
+    dates     = par.index
+    dt_d      = 1.0 / 252
+    par_np    = par_bp.to_numpy(float)          # (D, n_par_cols)
+    par_tcols = par_bp.columns.to_numpy(float)
+    zero_np   = zero.to_numpy(float)            # (D, 70)
+    zero_tcols = zero.columns.to_numpy(float)
 
-    for i in range(len(dates) - 1):
-        t, t1 = dates[i], dates[i + 1]
-        par_row  = par_bp.loc[t].dropna()
-        par_row1 = par_bp.loc[t1].dropna()
-        zero_row = zero.loc[t].dropna() if t in zero.index else None
+    # Pre-compute discount factors at integer years 1..30 for all dates
+    int_yrs = np.arange(1.0, 31.0)
+    int_idx = np.array([int(np.argmin(np.abs(zero_tcols - u))) for u in int_yrs])
+    int_df_mat = np.exp(-zero_np[:, int_idx] / 100.0 * int_yrs[None, :])  # (D, 30)
 
-        if zero_row is None or len(zero_row) < 3:
-            continue
+    rf_col_idx = int(np.argmin(np.abs(par_tcols - rf_col)))
+    rf_vec     = par_np[:, rf_col_idx]           # (D,)
 
-        dfs_t  = _dfs_from_zero_row(zero_row)
-        rf     = float(par_row.get(rf_col, par_row.iloc[0]))
-        raw_t  = par_row.index.to_numpy(float)
-        raw_v  = par_row.to_numpy(float)
+    D = len(dates)
+    ret_d_mat = np.full((D - 1, len(avail)), np.nan)
 
-        row: dict = {}
-        for tau in avail:
-            if tau not in par_row.index or tau not in par_row1.index:
-                row[tau] = np.nan
-                continue
-            s_now  = float(par_row[tau])
-            s_next = float(par_row1[tau])
-            tau_aged = max(tau - dt_d, raw_t[0])
-            s_aged = float(np.interp(tau_aged, raw_t, raw_v))
-            dur    = swap_duration(dfs_t, tau)
-            row[tau] = cm_return_bp(s_now, s_aged, s_next, dur, rf, dt_d)
+    for j, tau in enumerate(avail):
+        tau_cidx = int(np.argmin(np.abs(par_tcols - tau)))
+        s_now  = par_np[:-1, tau_cidx]
+        s_next = par_np[1:,  tau_cidx]
 
-        ret_d_rows[t] = row
+        tau_aged = max(tau - dt_d, par_tcols[0])
+        ir = int(np.clip(np.searchsorted(par_tcols, tau_aged), 1, len(par_tcols) - 1))
+        il = ir - 1
+        w  = ((tau_aged - par_tcols[il]) / (par_tcols[ir] - par_tcols[il])
+              if par_tcols[ir] != par_tcols[il] else 0.0)
+        s_aged = (1 - w) * par_np[:-1, il] + w * par_np[:-1, ir]
 
-    ret_d = pd.DataFrame(ret_d_rows).T
+        if tau < 1.0:
+            dur = np.full(D - 1, tau)
+        else:
+            n_c     = int(round(tau))
+            weights = np.arange(1, n_c + 1, dtype=float)
+            dur     = (int_df_mat[:-1, :n_c] * weights[None, :]).sum(axis=1)
+
+        rf_arr = rf_vec[:-1]
+        ret_d_mat[:, j] = ((s_now - rf_arr) * dt_d
+                           + dur * (s_now - s_aged)
+                           - dur * (s_next - s_now))
+
+    ret_d = pd.DataFrame(ret_d_mat, index=dates[:-1], columns=avail)
     ret_d.index.name = "date"
 
     # ── Month-end CM returns ──────────────────────────────────────────────────
@@ -277,51 +288,45 @@ def build_return_panels(
     ret_m = pd.DataFrame(ret_m_rows).T
     ret_m.index.name = "date"
 
-    # ── Sihvonen log excess returns ───────────────────────────────────────────
-    zero_me = zero.loc[[d for d in me_valid if d in zero.index]]
+    # ── Sihvonen log excess returns (vectorised across dates) ────────────────
+    zero_me    = zero.reindex([d for d in me_valid if d in zero.index])
+    zm_np      = zero_me.to_numpy(float) / 100.0   # (M, 70) annual cc decimal
+    zm_cols    = zero_me.columns.to_numpy(float)    # TARGET_TENORS
+    me_idx     = list(zero_me.index)
+    M          = len(me_idx)
 
-    rx_rows: dict = {}
-    c_rows:  dict = {}
-    yc_rows: dict = {}
+    ns_arr  = np.array(SIHVONEN_MONTHS)            # [12,24,...,120]
+    yrs_n   = ns_arr / 12.0                         # [1..10]
+    yrs_nm1 = (ns_arr - 1) / 12.0                  # [11/12, 23/12, ...]
+    yr_1m   = 1.0 / 12.0
 
-    for i in range(len(me_valid) - 1):
-        t, t1 = me_valid[i], me_valid[i + 1]
-        if t not in zero_me.index or t1 not in zero_me.index:
-            continue
+    def _query_cols(Z, taus):
+        """Vectorised linear interp of Z (D×70) at each tau in taus. Returns (D, K)."""
+        out = np.empty((len(Z), len(taus)))
+        for k, tau in enumerate(taus):
+            ir = int(np.clip(np.searchsorted(zm_cols, tau), 1, len(zm_cols) - 1))
+            il = ir - 1
+            w  = ((tau - zm_cols[il]) / (zm_cols[ir] - zm_cols[il])
+                  if zm_cols[ir] != zm_cols[il] else 0.0)
+            out[:, k] = (1 - w) * Z[:, il] + w * Z[:, ir]
+        return out
 
-        zt0 = zero_me.loc[t].dropna()
-        zt1 = zero_me.loc[t1].dropna()
+    Z0 = zm_np[:-1]   # (M-1, 70) — zero curve at t
+    Z1 = zm_np[1:]    # (M-1, 70) — zero curve at t+1
 
-        t0_tens = zt0.index.to_numpy(float)
-        t0_ylds = zt0.to_numpy(float) / 100.0   # % → decimal
-        t1_tens = zt1.index.to_numpy(float)
-        t1_ylds = zt1.to_numpy(float) / 100.0
+    yn_t    = _query_cols(Z0, yrs_n)              / 12.0  # (M-1, 10) monthly
+    ynm1_t1 = _query_cols(Z1, yrs_nm1)            / 12.0
+    ynm1_t  = _query_cols(Z0, yrs_nm1)            / 12.0
+    y1_t    = _query_cols(Z0, np.array([yr_1m]))   / 12.0  # (M-1, 1)
 
-        # Callables for z_t and z_tp1 (closed over arrays)
-        def _z_t(tau, ts=t0_tens, ys=t0_ylds):
-            return float(np.interp(tau, ts, ys))
+    ns2d   = ns_arr[None, :]                               # (1, 10)
+    rx_mat = (-(ns2d - 1) * ynm1_t1 + ns2d * yn_t - y1_t) * 1e4
+    c_mat  = (-(ns2d - 1) * ynm1_t  + ns2d * yn_t - y1_t) * 1e4
+    yc_mat = (ns2d - 1) * (ynm1_t1 - ynm1_t) * 1e4
 
-        def _z_tp1(tau, ts=t1_tens, ys=t1_ylds):
-            return float(np.interp(tau, ts, ys))
-
-        rx_row: dict = {}
-        c_row:  dict = {}
-        yc_row: dict = {}
-
-        for n, yr in zip(SIHVONEN_MONTHS, SIHVONEN_YEARS):
-            rx = log_excess_return_bp(_z_t, _z_tp1, n)
-            c, yc = _carry_yc_bp(_z_t, _z_tp1, n)
-            rx_row[yr] = rx
-            c_row[yr]  = c
-            yc_row[yr] = yc
-
-        rx_rows[t] = rx_row
-        c_rows[t]  = c_row
-        yc_rows[t] = yc_row
-
-    rx_m = pd.DataFrame(rx_rows).T
-    c_m  = pd.DataFrame(c_rows).T
-    yc_m = pd.DataFrame(yc_rows).T
+    rx_m = pd.DataFrame(rx_mat, index=me_idx[:-1], columns=SIHVONEN_YEARS)
+    c_m  = pd.DataFrame(c_mat,  index=me_idx[:-1], columns=SIHVONEN_YEARS)
+    yc_m = pd.DataFrame(yc_mat, index=me_idx[:-1], columns=SIHVONEN_YEARS)
     for df in (rx_m, c_m, yc_m):
         df.index.name = "date"
 
@@ -359,38 +364,38 @@ def build_rx_monthly(
     zm   = zero.reindex([d for d in me if d in zero.index]).dropna(how="all")
     dates = list(zm.index)
 
-    rx_rows: dict = {}
-    c_rows:  dict = {}
-    yc_rows: dict = {}
+    zm_np   = zm.to_numpy(float) / 100.0      # (M, 70) annual cc decimal
+    zm_cols = zm.columns.to_numpy(float)      # TARGET_TENORS
 
-    for i in range(len(dates) - 1):
-        t, t1 = dates[i], dates[i + 1]
-        z0 = zm.loc[t].dropna() / 100.0
-        z1 = zm.loc[t1].dropna() / 100.0
-        t0t, t0v = z0.index.to_numpy(float), z0.to_numpy(float)
-        t1t, t1v = z1.index.to_numpy(float), z1.to_numpy(float)
+    ns_arr  = np.array(SIHVONEN_MONTHS)
+    yrs_n   = ns_arr / 12.0
+    yrs_nm1 = (ns_arr - 1) / 12.0
+    yr_1m   = 1.0 / 12.0
 
-        def z_t(τ, ts=t0t, ys=t0v):   return float(np.interp(τ, ts, ys))
-        def z_tp1(τ, ts=t1t, ys=t1v): return float(np.interp(τ, ts, ys))
+    def _qcols(Z, taus):
+        out = np.empty((len(Z), len(taus)))
+        for k, tau in enumerate(taus):
+            ir = int(np.clip(np.searchsorted(zm_cols, tau), 1, len(zm_cols) - 1))
+            il = ir - 1
+            w  = ((tau - zm_cols[il]) / (zm_cols[ir] - zm_cols[il])
+                  if zm_cols[ir] != zm_cols[il] else 0.0)
+            out[:, k] = (1 - w) * Z[:, il] + w * Z[:, ir]
+        return out
 
-        rx_row: dict = {}
-        c_row:  dict = {}
-        yc_row: dict = {}
-        for n, yr in zip(SIHVONEN_MONTHS, SIHVONEN_YEARS):
-            yn_t    = z_t(n / 12.0) / 12.0
-            ynm1_t  = z_t((n - 1) / 12.0) / 12.0
-            ynm1_t1 = z_tp1((n - 1) / 12.0) / 12.0
-            y1_t    = z_t(1.0 / 12.0) / 12.0
-            rx_row[yr] = (-(n - 1) * ynm1_t1 + n * yn_t - y1_t) * 1e4
-            c_row[yr]  = (-(n - 1) * ynm1_t  + n * yn_t - y1_t) * 1e4
-            yc_row[yr] = (n - 1) * (ynm1_t1 - ynm1_t) * 1e4
-        rx_rows[t] = rx_row
-        c_rows[t]  = c_row
-        yc_rows[t] = yc_row
+    Z0 = zm_np[:-1];  Z1 = zm_np[1:]
+    yn_t    = _qcols(Z0, yrs_n)             / 12.0
+    ynm1_t1 = _qcols(Z1, yrs_nm1)           / 12.0
+    ynm1_t  = _qcols(Z0, yrs_nm1)           / 12.0
+    y1_t    = _qcols(Z0, np.array([yr_1m])) / 12.0
 
-    rx_m = pd.DataFrame(rx_rows).T
-    c_m  = pd.DataFrame(c_rows).T
-    yc_m = pd.DataFrame(yc_rows).T
+    ns2d   = ns_arr[None, :]
+    rx_mat = (-(ns2d - 1) * ynm1_t1 + ns2d * yn_t - y1_t) * 1e4
+    c_mat  = (-(ns2d - 1) * ynm1_t  + ns2d * yn_t - y1_t) * 1e4
+    yc_mat = (ns2d - 1) * (ynm1_t1 - ynm1_t) * 1e4
+
+    rx_m = pd.DataFrame(rx_mat, index=dates[:-1], columns=SIHVONEN_YEARS)
+    c_m  = pd.DataFrame(c_mat,  index=dates[:-1], columns=SIHVONEN_YEARS)
+    yc_m = pd.DataFrame(yc_mat, index=dates[:-1], columns=SIHVONEN_YEARS)
     for df in (rx_m, c_m, yc_m):
         df.index.name = "date"
 
@@ -404,6 +409,7 @@ def build_all_return_panels(
     start: Optional[str] = None,
     end: Optional[str] = None,
     tenors: Optional[list[float]] = None,
+    zero_curves: Optional[dict] = None,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """Build return panels for all markets.  Returns {market: panels_dict}."""
     if markets is None:
@@ -411,6 +417,9 @@ def build_all_return_panels(
         markets = OIS_MARKETS
 
     return {
-        mkt: build_return_panels(mkt, start=start, end=end, tenors=tenors)
+        mkt: build_return_panels(
+            mkt, start=start, end=end, tenors=tenors,
+            zero_curve=zero_curves.get(mkt) if zero_curves else None,
+        )
         for mkt in markets
     }
