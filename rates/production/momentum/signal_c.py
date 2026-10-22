@@ -242,3 +242,58 @@ def build_signal_c(
         result[market] = {"long_only": lo_df, "long_short": ls_df}
 
     return result
+
+
+def build_signal_c_pnl(
+    panels_by_market: dict[str, dict[str, pd.DataFrame]],
+    n: int = 12,
+) -> dict[str, pd.DataFrame]:
+    """
+    Per-market monthly PnL for Signal C (long-only and long-short variants).
+
+    pnl = sum_bucket( pos(t-1) × ret_bucket(t) ) per market.
+
+    Positions: LP weights from build_signal_c (date × 6 buckets).
+    Returns:   bucket-midpoint monthly CM returns interpolated from ret_m.
+
+    Returns
+    -------
+    {
+      "long_only":  date × market DataFrame, monthly PnL in bp
+      "long_short": date × market DataFrame, monthly PnL in bp
+    }
+    Annualise Sharpe with √12.
+    """
+    sigs = build_signal_c(panels_by_market, n=n)
+
+    lo: dict[str, pd.Series] = {}
+    ls: dict[str, pd.Series] = {}
+
+    for market, d in sigs.items():
+        panels = panels_by_market[market]
+        ret_b, _ = _bucket_returns(panels["ret_m"], panels["z_m"])
+
+        for out_dict, pos_df in [(lo, d["long_only"]), (ls, d["long_short"])]:
+            common_idx = pos_df.index.intersection(ret_b.index)
+            common_col = pos_df.columns.intersection(ret_b.columns)
+
+            if len(common_idx) < 12 or len(common_col) == 0:
+                continue
+
+            pnl = (
+                pos_df.loc[common_idx, common_col].shift(1)
+                * ret_b.loc[common_idx, common_col]
+            ).sum(axis=1)
+            out_dict[market] = pnl
+
+    def _to_df(d: dict) -> pd.DataFrame:
+        if not d:
+            return pd.DataFrame()
+        df = pd.concat(d.values(), axis=1, keys=d.keys())
+        df.index.name = "date"
+        return df
+
+    return {
+        "long_only":  _to_df(lo),
+        "long_short": _to_df(ls),
+    }

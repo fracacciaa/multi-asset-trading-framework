@@ -181,3 +181,90 @@ def build_signal_b(
         }
 
     return result
+
+
+def build_signal_b_pnl(
+    panels_by_market: dict[str, dict[str, pd.DataFrame]],
+    h: int = 1,
+    train_frac: float = 0.40,
+) -> dict[str, pd.DataFrame]:
+    """
+    Per-market monthly PnL for each Signal B variant.
+
+    For B1 / B3 (per-tenor signals):
+      pnl = sum_tenor( sign(signal(t-1)) × rx_m(t) )
+
+    For B2 / B4 (scalar signals applied uniformly across tenors):
+      pnl = sign(signal(t-1)) × sum_tenor( rx_m(t) )
+
+    Returns
+    -------
+    {
+      "b1_own":      date × market DataFrame, monthly PnL in bp
+      "b2_factor":   date × market DataFrame, monthly PnL in bp
+      "b3_yieldchg": date × market DataFrame, monthly PnL in bp
+      "b4_pc1":      date × market DataFrame, monthly PnL in bp
+    }
+    Annualise Sharpe with √12.
+    """
+    sigs = build_signal_b(panels_by_market, h=h, train_frac=train_frac)
+
+    b1: dict[str, pd.Series] = {}
+    b2: dict[str, pd.Series] = {}
+    b3: dict[str, pd.Series] = {}
+    b4: dict[str, pd.Series] = {}
+
+    for market, d in sigs.items():
+        rx = panels_by_market[market]["rx_m"]
+
+        # ── B1: own-maturity sign momentum ───────────────────────────────────
+        own_sign = d["own_sign"]
+        cols = own_sign.columns.intersection(rx.columns)
+        idx  = own_sign.index.intersection(rx.index)
+        if len(idx) >= 12 and len(cols) > 0:
+            b1[market] = (
+                own_sign.loc[idx, cols].shift(1) * rx.loc[idx, cols]
+            ).sum(axis=1)
+
+        # ── B3: yield-change sign momentum ───────────────────────────────────
+        yldchg = d["yieldchg"]     # already sign-flipped: positive → expect +return
+        cols3 = yldchg.columns.intersection(rx.columns)
+        idx3  = yldchg.index.intersection(rx.index)
+        if len(idx3) >= 12 and len(cols3) > 0:
+            b3[market] = (
+                np.sign(yldchg.loc[idx3, cols3].shift(1)) * rx.loc[idx3, cols3]
+            ).sum(axis=1)
+
+        # ── B2: factor momentum (scalar → uniform across tenors) ──────────────
+        factor = d["factor"]
+        idx2 = factor.index.intersection(rx.index)
+        cols2 = rx.columns.tolist()
+        if len(idx2) >= 12 and len(cols2) > 0:
+            b2[market] = (
+                np.sign(factor.loc[idx2].shift(1)) * rx.loc[idx2, cols2].sum(axis=1)
+            )
+
+        # ── B4: PC1 scalar momentum (uniform across tenors) ───────────────────
+        pc_sig = d["pc1"]
+        if not pc_sig.empty and "pc1" in pc_sig.columns:
+            idx4 = pc_sig.index.intersection(rx.index)
+            cols4 = rx.columns.tolist()
+            if len(idx4) >= 12 and len(cols4) > 0:
+                b4[market] = (
+                    np.sign(pc_sig.loc[idx4, "pc1"].shift(1))
+                    * rx.loc[idx4, cols4].sum(axis=1)
+                )
+
+    def _to_df(d: dict) -> pd.DataFrame:
+        if not d:
+            return pd.DataFrame()
+        df = pd.concat(d.values(), axis=1, keys=d.keys())
+        df.index.name = "date"
+        return df
+
+    return {
+        "b1_own":      _to_df(b1),
+        "b2_factor":   _to_df(b2),
+        "b3_yieldchg": _to_df(b3),
+        "b4_pc1":      _to_df(b4),
+    }
