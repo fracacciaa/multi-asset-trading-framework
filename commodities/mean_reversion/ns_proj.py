@@ -1,21 +1,14 @@
 """
 NS 3-factor null-space residual mean-reversion signal (Signal B).
 
-Architecture (from discussion):
-  Fit:    NS 3-factor on up to FIT_DEPTH (8) contracts; λ grid-searched daily.
-  Trade:  front TRADE_DEPTH (4) contracts only.
-  Signal: z-score of N·e where N = null(X_{4×3}ᵀ), λ_trade = 1.7937/M̄_t (1/months).
-  Position: hysteresis × null-space direction N.
-  PnL:    pos_{t-1} · (N_{t-1}ᵀ Δlog F_{1:4, t}).
+Signal = -N · log F_{1:4}   where N = null(X_{4×3}ᵀ), X built with fixed
+λ_trade = 1.7937 / 2.5 months⁻¹ (curvature peak at midpoint of traded strip).
 
-Contrast with signal.py (Signal A):
-  BC 4-factor | LOO residuals | manual F1/F4/F8 fly | calibrated-once λ
+N is constant (X4 depends only on fixed maturities [1,2,3,4]), so the signal
+reduces to a fixed linear combination of four log prices — no NS fitting needed.
 
-Key design choices:
-  - IS (not LOO) residuals: fit on 8 gives enough DOF that IS artefacts are small.
-  - λ_trade per-market per-day from closed form: no tuning, exact curvature alignment.
-  - Sign of N fixed: first element always positive so alpha = N·e is consistently oriented.
-  - Null-space dim = 1 (4 contracts, 3 factors) → unique butterfly direction per day.
+Position: hysteresis on z-score (enter |z| > 1, exit when z crosses zero).
+PnL:      pos_{t-1} · (N^T Δlog F_{1:4, t}).
 """
 
 from __future__ import annotations
@@ -24,65 +17,105 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from commodities.data import fetch_term_structure, fetch_term_structure_far
+from commodities.data import fetch_term_structure, fetch_tickers, business_days_to_month_end_panel
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-FIT_DEPTH   = 8
-TRADE_DEPTH = 4
-LAM_GRID    = np.arange(0.05, 2.01, 0.05)   # 1/months; covers peak-at-M ∈ [0.9, 36]
-MIN_FIT     = 4                               # min valid contracts to attempt fit
-Z_EWMA_HL   = 63
-Z_MIN_PER   = 30
-Z_VOL_FLOOR = 1e-6
-HYST_ENTRY  = 1.0
+TRADE_DEPTH     = 4
+LAM_TRADE       = 1.7937 / np.arange(1, TRADE_DEPTH + 1).mean()  # ≈ 0.7175 /month
+Z_EWMA_HL       = 63
+Z_MIN_PER       = 30
+Z_VOL_FLOOR     = 1e-6
+HYST_ENTRY      = 1.0
+ROLL_OUT_BUFFER = 2  # business days before month-end to flatten entire butterfly
 
 
 # ── NS design matrix ──────────────────────────────────────────────────────────
 
-def _design(M: np.ndarray, lam) -> np.ndarray:
-    """
-    NS 3-factor design matrix [1, slope, curvature].
-    M: (..., d) maturities in months; lam: broadcastable scalar or (..., 1).
-    Returns X: (..., d, 3).
-    """
+def _design(M: np.ndarray, lam: float) -> np.ndarray:
+    """NS 3-factor design matrix [level, slope, curvature] for maturities M."""
     x = np.maximum(M * lam, 1e-8)
     s = (1.0 - np.exp(-x)) / x
     return np.stack([np.ones_like(M), s, s - np.exp(-x)], axis=-1)
 
 
-# ── Batched OLS fit ───────────────────────────────────────────────────────────
+# ── Null-space direction (computed once) ──────────────────────────────────────
 
-def _residuals(M: np.ndarray, P: np.ndarray, lam) -> np.ndarray:
+def _build_N() -> np.ndarray:
     """
-    Batched OLS NS residuals.
-    M, P: (n, d); lam: scalar or (n, 1).  Returns (n, d) residuals.
+    Unit-norm null-space vector of X4^T, where X4 = _design([1,2,3,4], LAM_TRADE).
+
+    N is the unique direction orthogonal to all three NS factors on the
+    [1,2,3,4]-month strip.  Sign fixed so N[0] > 0.
     """
-    X   = _design(M, lam)                          # (n, d, 3)
-    XtX = np.einsum('ndi,ndj->nij', X, X)                    # (n, 3, 3)
-    XtP = np.einsum('ndi,nd->ni',   X, P)                   # (n, 3)
-    b   = np.linalg.solve(XtX, XtP[:, :, None]).squeeze(-1) # (n, 3)
-    return P - np.einsum('ndi,ni->nd', X, b)                 # (n, d)
+    M4 = np.arange(1, TRADE_DEPTH + 1, dtype=float)
+    X4 = _design(M4, LAM_TRADE)                   # (4, 3)
+    U  = np.linalg.svd(X4, full_matrices=True)[0]  # (4, 4)
+    N  = U[:, 3]                                    # last left singular vector
+    return N if N[0] >= 0 else -N
+
+
+_N = _build_N()   # computed once at import time
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def _build_log_curves(n: int = FIT_DEPTH) -> dict[str, pd.DataFrame]:
+_KEYS = ["front", "second", "third", "fourth"]
+
+
+def _build_log_curves() -> dict[str, pd.DataFrame]:
     ts   = fetch_term_structure()
-    coms = list(ts["front"].columns)
-    tsf  = fetch_term_structure_far() if n > 4 else None
-    k4   = ["front", "second", "third", "fourth"]
-    k8   = ["fifth",  "sixth",  "seventh", "eighth"]
     curves: dict[str, pd.DataFrame] = {}
-    for com in coms:
-        parts = []
-        for i, k in enumerate(k4[:min(n, 4)]):
-            parts.append(np.log(ts[k][com].replace(0.0, np.nan)).rename(i + 1))
-        if tsf is not None:
-            for i, k in enumerate(k8[:max(0, n - 4)]):
-                parts.append(np.log(tsf[k][com].replace(0.0, np.nan)).rename(i + 5))
+    for com in ts["front"].columns:
+        parts = [np.log(ts[k][com].replace(0.0, np.nan)).rename(i + 1)
+                 for i, k in enumerate(_KEYS)]
         curves[com] = pd.concat(parts, axis=1).sort_index().dropna(how="all")
     return curves
+
+
+def _specific_butterfly_return(
+    com: str,
+    index: pd.Index,
+    ts: dict,
+    tickers: dict,
+) -> pd.Series:
+    """
+    N^T Δlog F using specific-contract continuity + all-or-nothing roll buffer.
+
+    For leg j, find the price of the contract held at t-1 by scanning all 4
+    generic ranks on day t (cross-rank lookup).  Entire butterfly is NaN if ANY
+    of F1–F4 is within ROLL_OUT_BUFFER business days of its delivery month end.
+    """
+    n_ret = pd.Series(0.0, index=index, dtype=float)
+    tickers_4: dict[str, pd.Series] = {}
+
+    for j, key_j in enumerate(_KEYS):
+        if key_j not in ts or com not in ts[key_j].columns:
+            return pd.Series(np.nan, index=index)
+        if key_j not in tickers or com not in tickers[key_j].columns:
+            return pd.Series(np.nan, index=index)
+
+        tk_held = tickers[key_j][com].reindex(index).shift(1)   # contract held yesterday
+        tickers_4[key_j] = tickers[key_j][com].reindex(index)
+
+        # Cross-rank lookup: find today's price of yesterday's held contract
+        found_price = pd.Series(np.nan, index=index, dtype=float)
+        for key_r in _KEYS:
+            if key_r not in ts or com not in ts[key_r].columns:
+                continue
+            if key_r not in tickers or com not in tickers[key_r].columns:
+                continue
+            match = tickers[key_r][com].reindex(index).eq(tk_held) & tk_held.notna()
+            found_price = found_price.combine_first(ts[key_r][com].reindex(index).where(match))
+
+        price_prev = ts[key_j][com].reindex(index).shift(1)
+        n_ret = n_ret + _N[j] * np.log(found_price / price_prev)
+
+    # All-or-nothing buffer: flatten entire butterfly if any leg is near roll
+    bdte = business_days_to_month_end_panel(pd.DataFrame(tickers_4).reindex(index))
+    near_roll = (bdte <= ROLL_OUT_BUFFER).any(axis=1)
+
+    return n_ret.where(~near_roll)
 
 
 # ── Z-score and positioning ───────────────────────────────────────────────────
@@ -110,138 +143,74 @@ def _hyst(z: pd.Series) -> pd.Series:
 
 # ── Per-commodity pipeline ────────────────────────────────────────────────────
 
-def _process(log_curve: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
+def _alpha(log_curve: pd.DataFrame) -> pd.Series:
     """
-    Returns (alpha_raw, N_df):
-      alpha_raw : pd.Series (T,)   — raw -N·e (sign-flipped: positive = cheap in N dir)
-      N_df      : pd.DataFrame (T, TRADE_DEPTH) — null-space direction, consistent sign
+    Raw signal: alpha(t) = -N · log F_{1:4}(t).
+
+    NaN on days where any of the four log prices is missing.
     """
-    n_fit   = min(FIT_DEPTH,   log_curve.shape[1])
-    n_trade = min(TRADE_DEPTH, log_curve.shape[1])
-    T, idx  = len(log_curve), log_curve.index
-
-    alpha_arr = np.full(T, np.nan)
-    N_arr     = np.full((T, n_trade), np.nan)
-
-    if n_trade < TRADE_DEPTH:
-        return (pd.Series(alpha_arr, index=idx),
-                pd.DataFrame(N_arr,  index=idx, columns=range(1, n_trade + 1)))
-
-    P = log_curve.iloc[:, :n_fit].values.astype(float)
-    M = np.tile(np.arange(1, n_fit + 1, dtype=float), (T, 1))   # months, fixed
-
-    good = np.all(np.isfinite(P), axis=1)
-    if good.sum() < MIN_FIT:
-        return (pd.Series(alpha_arr, index=idx),
-                pd.DataFrame(N_arr,  index=idx, columns=range(1, n_trade + 1)))
-
-    Pg, Mg = P[good], M[good]
-
-    # ── Grid search: pick λ minimising SSE per day ────────────────────────────
-    sse      = np.column_stack([(_residuals(Mg, Pg, lam) ** 2).sum(1) for lam in LAM_GRID])
-    best_lam = LAM_GRID[sse.argmin(1)]   # (n_good,)
-
-    # IS residuals with per-day optimal λ
-    E_good = np.full_like(Pg, np.nan)
-    for lv in np.unique(best_lam):
-        m = best_lam == lv
-        E_good[m] = _residuals(Mg[m], Pg[m], lv)
-
-    # ── Null-space projection on front TRADE_DEPTH contracts ──────────────────
-    E4 = E_good[:, :n_trade]
-    M4 = Mg[:,    :n_trade]
-
-    # λ_trade: curvature loading peaks at the mean maturity of the traded strip
-    lam_tr = (1.7937 / M4.mean(1, keepdims=True))    # (n_good, 1) 1/months
-
-    X4 = _design(M4, lam_tr)                          # (n_good, 4, 3)
-    U  = np.linalg.svd(X4, full_matrices=True)[0]     # (n_good, 4, 4)
-    N  = U[:, :, 3]                                    # (n_good, 4) left null space
-
-    # Fix sign convention: first element always positive for consistent orientation
-    N *= np.where(N[:, :1] >= 0, 1.0, -1.0)
-
-    alpha = (N * E4).sum(1)    # N · e
-
-    alpha_arr[good] = -alpha   # sign flip: positive = curve cheap in N direction
-    N_arr[good]     = N
-
-    return (pd.Series(alpha_arr, index=idx),
-            pd.DataFrame(N_arr,  index=idx, columns=range(1, n_trade + 1)))
+    P4  = log_curve.iloc[:, :TRADE_DEPTH].values.astype(float)
+    raw = -(P4 @ _N)
+    raw[~np.all(np.isfinite(P4), axis=1)] = np.nan
+    return pd.Series(raw, index=log_curve.index)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def compute_pnl(
-    n_fit: int = FIT_DEPTH,
-    start: Optional[str] = None,
-    end:   Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Per-commodity daily log-return PnL for Signal B (NS null-space, lag-1).
-
-    Position entered at close of t:  pos_t × N_t  (4D weight in F1–F4)
-    Earns t→t+1 return:  sum_k N_{t,k} × Δlog F_{k, t+1}
-    Returns DataFrame (date × commodity).
-    """
-    curves = _build_log_curves(n_fit)
-    out: dict[str, pd.Series] = {}
-
-    for com, lc in curves.items():
-        alpha, N_df = _process(lc)
-        if alpha.isna().all():
-            continue
-        pos   = _hyst(_zscore(alpha))
-        ret4  = lc.iloc[:, :TRADE_DEPTH].diff()
-        n_ret = (N_df * ret4).sum(axis=1)     # N_{t} · Δlog F_{1:4, t}
-        out[com] = pos.shift(1) * n_ret        # lag: position from t earns at t+1
-
-    df = pd.concat(out.values(), axis=1, keys=out.keys())
-    df.index.name = "date"
-    if start is not None:
-        df = df.loc[start:]
-    if end is not None:
-        df = df.loc[:end]
-    return df
-
-
 def compute_signal(
-    n_fit: int = FIT_DEPTH,
     start: Optional[str] = None,
     end:   Optional[str] = None,
 ) -> pd.DataFrame:
-    """Z-scored null-space loading per commodity (pre-positioning)."""
-    curves = _build_log_curves(n_fit)
-    out: dict[str, pd.Series] = {}
-    for com, lc in curves.items():
-        alpha, _ = _process(lc)
-        if not alpha.isna().all():
-            out[com] = _zscore(alpha)
+    """Z-scored null-space signal per commodity (pre-positioning)."""
+    curves = _build_log_curves()
+    out = {com: _zscore(_alpha(lc))
+           for com, lc in curves.items()
+           if not _alpha(lc).isna().all()}
     df = pd.concat(out.values(), axis=1, keys=out.keys())
     df.index.name = "date"
-    if start is not None:
-        df = df.loc[start:]
-    if end is not None:
-        df = df.loc[:end]
-    return df
+    return df.loc[start:end] if start or end else df
 
 
 def compute_positions(
-    n_fit: int = FIT_DEPTH,
     start: Optional[str] = None,
     end:   Optional[str] = None,
 ) -> pd.DataFrame:
-    """Scalar hysteresis positions {-1, 0, +1} per commodity (pre-return application)."""
-    curves = _build_log_curves(n_fit)
-    out: dict[str, pd.Series] = {}
-    for com, lc in curves.items():
-        alpha, _ = _process(lc)
-        if not alpha.isna().all():
-            out[com] = _hyst(_zscore(alpha))
+    """Hysteresis positions {-1, 0, +1} per commodity."""
+    curves = _build_log_curves()
+    out = {com: _hyst(_zscore(_alpha(lc)))
+           for com, lc in curves.items()
+           if not _alpha(lc).isna().all()}
     df = pd.concat(out.values(), axis=1, keys=out.keys())
     df.index.name = "date"
-    if start is not None:
-        df = df.loc[start:]
-    if end is not None:
-        df = df.loc[:end]
-    return df
+    return df.loc[start:end] if start or end else df
+
+
+def compute_pnl(
+    start: Optional[str] = None,
+    end:   Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Per-commodity daily log-return PnL for Signal B (lag-1).
+
+    Position entered at close of t:  pos_t × N  (4D weight in F1–F4)
+    Earns t→t+1 return:  N^T Δlog F_{1:4, t+1}  (specific-contract continuity)
+
+    Roll handling: specific-contract cross-rank lookup per leg; entire butterfly
+    NaN when any leg is within ROLL_OUT_BUFFER business days of delivery month end.
+    """
+    curves  = _build_log_curves()
+    ts      = fetch_term_structure()
+    tickers = fetch_tickers()
+
+    out: dict[str, pd.Series] = {}
+    for com, lc in curves.items():
+        a = _alpha(lc)
+        if a.isna().all():
+            continue
+        pos   = _hyst(_zscore(a))
+        n_ret = _specific_butterfly_return(com, lc.index, ts, tickers)
+        out[com] = pos.shift(1) * n_ret
+
+    df = pd.concat(out.values(), axis=1, keys=out.keys())
+    df.index.name = "date"
+    return df.loc[start:end] if start or end else df

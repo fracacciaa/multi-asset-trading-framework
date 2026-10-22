@@ -23,6 +23,7 @@ from commodities.data import (
     fetch_tickers,
     fetch_tickers_power,
     tenor_from_tickers,
+    business_days_to_month_end_panel,
 )
 from commodities.signals import (
     COMMODITY_SECTORS,
@@ -31,6 +32,7 @@ from commodities.signals import (
     xs_carry_enhanced,
     curve_curvature,
 )
+from commodities.mean_reversion.ns_proj import compute_pnl as _ns_compute_pnl
 
 TD = 252  # trading days per year
 
@@ -52,23 +54,58 @@ PARAMS = dict(
 
 # ── Returns ───────────────────────────────────────────────────────────────────
 
-def roll_safe_returns(
-    prices: pd.DataFrame,
-    tickers: pd.DataFrame,
+def specific_contract_returns(
+    ts: dict,
+    tickers: dict,
+    roll_buffer: int = 2,
 ) -> pd.DataFrame:
     """
-    Daily excess returns with NaN on roll dates and non-positive price days.
+    Specific-contract front-month returns with pre-roll buffer.
 
-    Two masks applied:
-    - Roll dates: ticker changes day-over-day (price jump is roll spread, not P&L).
-    - Non-positive prices: price <= 0 on day t OR t-1.  The t-1 case removes the
-      day-after garbage return caused by a non-positive base (e.g. WTI -$37.63 on
-      2020-04-20 would otherwise produce a nonsensical +127% return on 2020-04-21).
+    Three rules applied per commodity per day t:
+    - Non-roll day : F1[t] / F1[t-1] - 1  (same contract both days)
+    - Roll day     : F1[t] / F2[t-1] - 1  when tickers["second"][t-1] ==
+                     tickers["front"][t], i.e. the new front's prior price is
+                     available as yesterday's second contract — no roll-spread
+                     contamination.  NaN otherwise.
+    - Pre-roll buffer: NaN when the front contract is within roll_buffer
+                     business days of its delivery month end (all-or-nothing
+                     flatten before the roll, not just on it).
+    - Non-positive prices: NaN when F1[t] <= 0 or F1[t-1] <= 0.
     """
-    ret = prices.pct_change()
-    roll_mask = tickers.ne(tickers.shift(1)) & tickers.notna() & tickers.shift(1).notna()
-    bad_price  = (prices <= 0) | (prices.shift(1) <= 0)
-    return ret.where(~roll_mask & ~bad_price)
+    F1  = ts["front"]
+    F2  = ts["second"]
+    tk1 = tickers["front"]
+    tk2 = tickers["second"]
+
+    cols = F1.columns.intersection(tk1.columns)
+
+    # Base return: F1[t] / F1[t-1] - 1
+    ret = F1[cols].pct_change()
+
+    # On roll days, replace denominator with F2[t-1] (new front's prior price)
+    is_roll = (
+        tk1[cols].ne(tk1[cols].shift(1))
+        & tk1[cols].notna()
+        & tk1[cols].shift(1).notna()
+    )
+    new_front_was_second = (
+        tk2[cols].shift(1).eq(tk1[cols])
+        & tk2[cols].shift(1).notna()
+    )
+    roll_specific = F1[cols] / F2[cols].shift(1) - 1
+    ret = ret.where(~is_roll).combine_first(
+        roll_specific.where(is_roll & new_front_was_second)
+    )
+
+    # Pre-roll buffer: NaN when within roll_buffer business days of month end
+    bdte = business_days_to_month_end_panel(tk1[cols])
+    near_roll = bdte <= roll_buffer
+
+    # Non-positive price guard (includes day-after a negative price)
+    bad_price = (F1[cols] <= 0) | (F1[cols].shift(1) <= 0)
+
+    return ret.where(~near_roll & ~bad_price)
 
 
 # ── Volatility and scaling ────────────────────────────────────────────────────
@@ -274,6 +311,56 @@ def _build_signals(
     return sigs
 
 
+# ── Signal B runner (NS null-space, separate return series) ──────────────────
+
+def _run_ns_signal_b(
+    index: pd.Index,
+    start: Optional[str],
+    end: Optional[str],
+    p: dict,
+) -> dict:
+    """
+    Run Signal B (NS null-space butterfly) through a book-level vol-scaling pipeline.
+
+    Signal B uses null-space-weighted returns across F1–F4 (not front-month
+    returns), so per-instrument vol_scale is not applicable.  Per-commodity PnL
+    is summed net of 4-leg butterfly costs, then scaled to p["book_vol"] using a
+    lagged EWMA vol estimate.
+
+    NOTE: The reported Sharpe (~10–13) is NOT comparable to the directional signals.
+    The null-space butterfly daily vol is ~1/10th of front-month vol (NS explains
+    ~99% of curve variance), so the book-scaling step applies ~5–10x leverage to
+    reach the same vol target, making the SR numerically large but the strategy
+    non-scalable beyond a small fixed allocation.  Use this signal as a
+    relative-value overlay with a fixed notional budget, not as a vol-parity
+    allocation.
+    """
+    from commodities.mean_reversion.ns_proj import compute_positions as _ns_positions, TRADE_DEPTH
+
+    pnl_b = _ns_compute_pnl(start=start, end=end)
+    pos   = _ns_positions(start=start, end=end)
+
+    # 4-leg butterfly costs: cost per unit position change across all contracts
+    turnover_cost = pos.diff().abs() * TRADE_DEPTH * p["cost_bps"] * 1e-4
+    net_pnl_b = (pnl_b - turnover_cost).reindex(columns=pnl_b.columns)
+
+    port = net_pnl_b.sum(axis=1).reindex(index).fillna(0.0)
+
+    com = p["cov_hl"] / np.log(2)
+    vol = port.ewm(com=com, min_periods=120).std() * np.sqrt(TD)
+    vol = vol.replace(0, np.nan).clip(lower=1e-6)
+    k = (p["book_vol"] / vol).clip(0, p["k_max"]).shift(1)
+    port_scaled = port * k
+
+    pos_aligned = pos.reindex(index).fillna(0.0)
+    avg_turnover = pos_aligned.diff().abs().sum(axis=1).mean() * TD
+
+    row = evaluate(port_scaled)
+    row["avg_turnover_pa"] = float(avg_turnover)
+    row.update({f"sr_{yr}": v for yr, v in _subperiod_sharpes(port_scaled).items()})
+    return row
+
+
 # ── Main comparison runner ────────────────────────────────────────────────────
 
 def run_comparison(
@@ -311,9 +398,8 @@ def run_comparison(
     else:
         prices, ts, tk = prices_gen, ts_gen, tk_gen
 
-    # ── Roll-safe returns ──────────────────────────────────────────────────────
-    front_tickers = tk["front"].reindex(columns=prices.columns)
-    returns = roll_safe_returns(prices, front_tickers)
+    # ── Specific-contract returns (with pre-roll buffer) ──────────────────────
+    returns = specific_contract_returns(ts, tk).reindex(columns=prices.columns)
 
     # ── Build raw signals ──────────────────────────────────────────────────────
     raw_signals = _build_signals(prices, ts, tk, p)
@@ -331,6 +417,8 @@ def run_comparison(
         row["avg_turnover_pa"] = float(bt["turnover"].mean() * TD)
         row.update({f"sr_{yr}": v for yr, v in _subperiod_sharpes(pnl).items()})
         rows[label] = row
+
+    rows["ns_nullspace_b"] = _run_ns_signal_b(returns.index, start, end, p)
 
     result = pd.DataFrame(rows).T
     result.index.name = "signal"

@@ -378,6 +378,35 @@ def tenor_from_tickers(
     return (days / 365.25).where(days > 0)
 
 
+def business_days_to_month_end_panel(tickers_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Business days from each observation date to the first day of the month
+    *after* the contract's delivery month — the effective roll deadline.
+
+    Uses the Bloomberg ticker to extract delivery month/year via _parse_expiry.
+    Vectorized: unique tickers per column are parsed once, not per row.
+
+    Returns a same-shape float DataFrame.  NaN where the ticker cannot be parsed.
+    """
+    result = pd.DataFrame(
+        np.nan, index=tickers_df.index, columns=tickers_df.columns, dtype=float
+    )
+    obs = tickers_df.index.normalize().to_numpy(dtype="datetime64[D]")
+
+    for col in tickers_df.columns:
+        expiry = tickers_df[col].map(_parse_expiry)          # Timestamp(yr, mo, 15) or NaT
+        valid  = expiry.notna()
+        if not valid.any():
+            continue
+        # First day of the month after the delivery month
+        next_mo = (
+            expiry[valid].dt.to_period("M").apply(lambda p: (p + 1).to_timestamp())
+        ).to_numpy(dtype="datetime64[D]")
+        result.loc[valid, col] = np.busday_count(obs[valid], next_mo).astype(float)
+
+    return result
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _slice(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
