@@ -5,21 +5,20 @@ Mirror of fx/production/run.py.  Run once; all downstream Sharpe queries
 read parquet instead of re-running NS calibration and fit loops.
 
 Outputs written to rates/signals/:
-  ns_factors.parquet     date × (market, factor)  NS level/slope/curvature
-  carry.parquet          date × market             within-curve carry (−β₂)
-  mean_reversion.parquet date × market             factor-neutral NS residual z-score
-  carry_cc.parquet       date × market             cross-country carry positions
-  momentum_a.parquet     date × (market, tenor)    MOP TSMOM position sizes
-  rx_m.parquet           date × (market, tenor)    Sihvonen monthly log excess returns (bp)
-  ret_d.parquet          date × (market, tenor)    daily CM returns (bp)
-  ois_carry.parquet      (market,date,tenor,horiz) OIS static carry panel (long format)
+  ns_factors.parquet          date × (market, factor)       NS level/slope/curvature
+  momentum_a_daily.parquet    date × (market, tenor)        MOP TSMOM position sizes
+  momentum_a_daily_pnl.parquet date × market                momentum daily PnL (bp)
+  mean_reversion.parquet      date × market                 factor-neutral NS residual z-score
+  mean_reversion_pnl.parquet  date × market                 mean reversion daily PnL (bp)
+  carry_ois_par.parquet       date × (market, tenor)        within-curve carry OIS positions
+  carry_ois_par_pnl.parquet   date × market                 within-curve carry OIS PnL (bp)
+  rx_m.parquet                date × (market, tenor)        Sihvonen monthly log excess returns (bp)
+  ret_d.parquet               date × (market, tenor)        daily CM returns (bp)
   manifest.json
 
-Sharpe recipe (any signal):
-  df = pd.read_parquet("rates/signals/rx_m.parquet")
-  sig = pd.read_parquet("rates/signals/carry.parquet")
-  pnl = sig.shift(1).reindex(df.index, method="ffill") * df[("US", 10.0)]
-  sr  = pnl.mean() / pnl.std() * np.sqrt(252)
+Sharpe recipe (any *_pnl file):
+  pnl = pd.read_parquet("rates/signals/carry_ois_par_pnl.parquet")
+  sr  = pnl[market].dropna().mean() / pnl[market].dropna().std() * np.sqrt(252)
 """
 
 from __future__ import annotations
@@ -32,14 +31,13 @@ import numpy as np
 import pandas as pd
 
 from rates.production.nelson_siegel import extract_factors_all_markets
-from rates.production.signals import carry, carry_cross_country
 from rates.production.mean_reversion.signal import mean_reversion_rv, mean_reversion_pnl
-from rates.production.carry.experiment import within_curve_carry_pnl
 from rates.production.momentum.returns import build_all_return_panels
 from rates.production.momentum.signal_a import build_signal_a_daily
 from rates.production.momentum.signal_a import DM_MARKETS as MOM_MARKETS
-from rates.production.carry.carry_ois import ois_carry_all_markets
-from rates.production.carry.cross_country import DM_MARKETS as CC_DM_MARKETS
+from rates.production.carry.carry_ois_par import ois_par_carry_pnl, OIS_PAR_MARKETS
+from rates.production.carry.signal import build_positions
+from rates.production.carry.carry_ois_par import ois_par_carry_panel, BENCHMARK_TENORS as CARRY_TENORS
 from rates.production.ois_data import OIS_MARKETS, fetch_ois_curves
 from rates.production.yc_builder import build_zero_curve
 
@@ -148,14 +146,43 @@ def run(
     _save("ns_factors.parquet", ns_factors)
     _log(f"  shape: {ns_factors.shape}")
 
-    # ── Step 4: Within-curve carry (−β₂) ──────────────────────────────────────
-    _log("Carry: within-curve NS slope signal...")
-    carry_sig = carry(ns_factors)
-    _save("carry.parquet", carry_sig)
+    # ── Step 4: Within-curve carry OIS ────────────────────────────────────────
+    _log("Within-curve carry OIS: positions (5Y + 10Y, daily rebalance, lag=1)...")
+    carry_mkts = [m for m in OIS_PAR_MARKETS if m in markets]
 
-    _log("Carry PnL: per-tenor DV01-neutral positions × cm_total_return_bp...")
-    carry_pnl = within_curve_carry_pnl(markets=markets, start=start, end=end)
-    _save("carry_pnl.parquet", carry_pnl)
+    carry_pos_frames: dict = {}
+    for mkt in carry_mkts:
+        try:
+            panel = ois_par_carry_panel(mkt, tenors=CARRY_TENORS,
+                                        horizons={"3M": 0.25},
+                                        start=start, end=end)
+            if panel.empty:
+                continue
+            sub        = panel.xs("3M", level="horizon")
+            carry_wide = sub["total_carry_bp"].unstack("tenor")
+            dmod_wide  = sub["dmod"].unstack("tenor")
+            pos = build_positions(carry_wide, dmod_wide,
+                                  rebalance="daily", lag=1,
+                                  xs_mode="z", neutralize=("level",),
+                                  gross=1.0, duration_adj="per_dur")
+            carry_pos_frames[mkt] = pos
+        except Exception as exc:
+            _log(f"  Warning: carry position failed for {mkt}: {exc}")
+
+    if carry_pos_frames:
+        carry_pos = pd.concat(carry_pos_frames, axis=1)
+        carry_pos.columns.names = ["market", "tenor"]
+    else:
+        carry_pos = pd.DataFrame()
+    _save("carry_ois_par.parquet", carry_pos)
+
+    _log("Within-curve carry OIS PnL: pos × daily mark-to-market (§6.2 approx)...")
+    carry_pnl = ois_par_carry_pnl(
+        markets=carry_mkts, tenors=CARRY_TENORS, start=start, end=end,
+    )
+    _save("carry_ois_par_pnl.parquet", carry_pnl)
+    if not carry_pnl.empty:
+        _log(f"  {len(carry_pnl)} days, {len(carry_pnl.columns)} markets")
 
     # ── Step 5: Mean reversion ─────────────────────────────────────────────────
     _log("Mean reversion: factor-neutral NS residuals...")
@@ -168,75 +195,35 @@ def run(
                                 zero_curves=zero_curves)
     _save("mean_reversion_pnl.parquet", mr_pnl)
 
-    # ── Step 6: Cross-country carry ────────────────────────────────────────────
-    _log("Cross-country carry: DV01-neutral positions (DM only)...")
-    cc_mkts = [m for m in CC_DM_MARKETS if m in markets]
-    cc_sig = carry_cross_country(markets=cc_mkts, start=start, end=end)
-    _save("carry_cc.parquet", cc_sig)
-
-    _log("Cross-country carry PnL: per-market pos × 10Y CM return...")
-    if not cc_sig.empty and not ret_d_all.empty:
-        cc_ret_10y: dict[str, pd.Series] = {}
-        mkt_level = ret_d_all.columns.get_level_values("market")
-        for mkt in cc_sig.columns:
-            if mkt not in mkt_level:
-                continue
-            mkt_tenors = ret_d_all[mkt].columns.to_numpy(float)
-            closest    = float(mkt_tenors[np.argmin(np.abs(mkt_tenors - 10.0))])
-            cc_ret_10y[mkt] = ret_d_all[(mkt, closest)]
-        if cc_ret_10y:
-            cc_ret_df  = pd.DataFrame(cc_ret_10y)
-            common_idx = cc_sig.index.intersection(cc_ret_df.index)
-            # cc_sig already has lag=1 applied in carry_cross_country
-            cc_pnl = cc_sig.loc[common_idx] * cc_ret_df.loc[common_idx]
-            cc_pnl.index.name = "date"
-        else:
-            cc_pnl = pd.DataFrame()
-    else:
-        cc_pnl = pd.DataFrame()
-    _save("carry_cc_pnl.parquet", cc_pnl)
-
-    # ── Step 7: OIS carry panel ────────────────────────────────────────────────
-    _log("OIS carry: static carry panel (long format)...")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ois_carry = ois_carry_all_markets(
-            markets=markets, start=start, end=end, zero_curves=zero_curves,
-        )
-    _save("ois_carry.parquet", ois_carry)
-    if not ois_carry.empty:
-        _log(f"  {len(ois_carry):,} rows, {ois_carry.index.get_level_values('market').nunique()} markets")
-
     # ── Manifest ───────────────────────────────────────────────────────────────
     manifest = {
         "markets":     sorted(markets),
-        "cc_markets":  sorted(cc_mkts),
+        "carry_markets": sorted(carry_mkts),
         "mom_markets": sorted(mom_panels.keys()),
         "start":       str(start) if start else None,
         "end":         str(end) if end else None,
         "ns_model":    "ns_calibrated",
-        "carry_cc_lam": 0.3,
+        "carry_tenors": CARRY_TENORS,
         "signals": [
-            "mean_reversion",
             "momentum_a_daily",
+            "carry_within_curve_ois",
+            "mean_reversion",
         ],
         "files": {
-            "ns_factors":           "date × (market,factor) MultiIndex cols; level/slope/curvature",
-            "carry":                "date × market; within-curve carry scalar (−β₂) — signal only",
-            "carry_pnl":            "date × market; per-tenor DV01-neutral pos × cm_total_return_bp — use for Sharpe (daily, √252)",
-            "mean_reversion":       "date × market; factor-neutral NS residual z-score — signal only",
-            "mean_reversion_pnl":   "date × market; per-tenor pos(t-1)×(−Δresid(t)) summed — use for Sharpe (daily, √252)",
-            "carry_cc":             "date × market; cross-country carry positions — signal only",
-            "carry_cc_pnl":         "date × market; cc pos(t-1)×10Y ret_d(t) — use for Sharpe (daily, √252)",
-            "momentum_a_daily":     "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
-            "momentum_a_daily_pnl": "date × market; daily pos(t-1)×ret_d(t) summed — use for Sharpe (daily, √252)",
-            "rx_m":                 "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
-            "ret_d":                "date × (market,tenor); daily CM constant-maturity returns (bp)",
-            "ois_carry":            "long format (market,date,tenor,horizon); static carry (bp)",
+            "ns_factors":             "date × (market,factor) MultiIndex cols; level/slope/curvature",
+            "carry_ois_par":          "date × (market,tenor) MultiIndex cols; within-curve carry OIS positions — signal only",
+            "carry_ois_par_pnl":      "date × market; §6.2 pos × daily mark-to-market — use for Sharpe (daily, √252)",
+            "mean_reversion":         "date × market; factor-neutral NS residual z-score — signal only",
+            "mean_reversion_pnl":     "date × market; per-tenor pos(t-1)×(−Δresid(t)) summed — use for Sharpe (daily, √252)",
+            "momentum_a_daily":       "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
+            "momentum_a_daily_pnl":   "date × market; daily pos(t-1)×ret_d(t) summed — use for Sharpe (daily, √252)",
+            "rx_m":                   "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
+            "ret_d":                  "date × (market,tenor); daily CM constant-maturity returns (bp)",
         },
         "sharpe_recipe": (
             "Always use the *_pnl files. "
             "sr = pnl[market].dropna().mean() / pnl[market].dropna().std() * sqrt(252). "
+            "carry_ois_par_pnl: §6.2 income+roll-down, DV01-neutral 5Y+10Y cross-section, daily rebalance. "
             "mean_reversion_pnl: per-tenor z-score × (−Δresid), summed. "
             "momentum_a_daily_pnl: per-tenor vol-scaled positions × daily CM returns, summed."
         ),
@@ -247,20 +234,17 @@ def run(
 
     _log("Done.")
     return {
-        "ns_factors":         ns_factors,
-        "carry":              carry_sig,
-        "carry_pnl":          carry_pnl,
-        "mean_reversion":     mr_sig,
-        "mean_reversion_pnl": mr_pnl,
-        "carry_cc":             cc_sig,
-        "carry_cc_pnl":         cc_pnl,
+        "ns_factors":           ns_factors,
+        "carry_ois_par":        carry_pos,
+        "carry_ois_par_pnl":    carry_pnl,
+        "mean_reversion":       mr_sig,
+        "mean_reversion_pnl":   mr_pnl,
         "momentum_a_daily":     mom_a_daily,
         "momentum_a_daily_pnl": mom_a_daily_pnl,
-        "rx_m":               rx_m_all,
-        "ret_d":              ret_d_all,
-        "ois_carry":          ois_carry,
-        "all_panels":         all_panels,
-        "manifest":           manifest,
+        "rx_m":                 rx_m_all,
+        "ret_d":                ret_d_all,
+        "all_panels":           all_panels,
+        "manifest":             manifest,
     }
 
 

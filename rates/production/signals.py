@@ -223,6 +223,54 @@ def carry_cross_country(
     return pos_df
 
 
+def within_curve_carry_ois(
+    markets: Optional[list[str]] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    tenors: Optional[list[float]] = None,
+) -> pd.DataFrame:
+    """
+    Within-curve carry OIS position book — §6.2 par-rate approximation.
+
+    Daily rebalance, 1-day lag, DV01-neutral cross-section of 5Y and 10Y.
+
+    Returns date × (market, tenor) MultiIndex DataFrame of position weights.
+    """
+    from rates.production.carry.carry_ois_par import ois_par_carry_panel, OIS_PAR_MARKETS
+    from rates.production.carry.signal import build_positions
+
+    if markets is None:
+        markets = OIS_PAR_MARKETS
+    if tenors is None:
+        tenors = [5.0, 10.0]
+
+    mkt_frames: dict = {}
+    for market in markets:
+        try:
+            panel = ois_par_carry_panel(market, tenors=tenors,
+                                        horizons={"3M": 0.25},
+                                        start=start, end=end)
+            if panel.empty:
+                continue
+            sub        = panel.xs("3M", level="horizon")
+            carry_wide = sub["total_carry_bp"].unstack("tenor")
+            dmod_wide  = sub["dmod"].unstack("tenor")
+            pos = build_positions(carry_wide, dmod_wide,
+                                  rebalance="daily", lag=1,
+                                  xs_mode="z", neutralize=("level",),
+                                  gross=1.0, duration_adj="per_dur")
+            mkt_frames[market] = pos
+        except Exception:
+            continue
+
+    if not mkt_frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(mkt_frames, axis=1)
+    combined.columns.names = ["market", "tenor"]
+    return combined
+
+
 def build_signals(
     markets: Optional[list[str]] = None,
     start: Optional[str] = None,
@@ -232,31 +280,18 @@ def build_signals(
     """
     Run the full rates signal pipeline.
 
-    Momentum uses Signal A daily (daily TSMOM, inverse-vol sized, per tenor).
-    Carry uses ns_calibrated (fast, OLS).
-    Mean reversion uses the ex_raw factor-neutral NS residual signal.
-    Cross-country carry uses carry_reprice on NS-fitted 10Y curves with DV01
-    neutralisation; returns a ready-to-trade position book.
-
     Returns
     -------
     dict with keys:
-      'momentum'            — date × (market, tenor) daily position sizes
-      'carry'               — date × market raw signal (unnormalised)
-      'mean_reversion'      — date × market raw signal (unnormalised)
-      'carry_cross_country' — date × market position weights (ready-to-trade)
+      'momentum'             — date × (market, tenor) daily position sizes
+      'carry_within_curve'   — date × (market, tenor) daily position weights
+      'mean_reversion'       — date × market raw signal (unnormalised)
     """
-    ns_factors = extract_factors_all_markets(
-        markets=markets, start=start, end=end,
-        model="ns_calibrated",
-    )
-
     return {
-        "momentum":            momentum_a_daily(markets=markets, start=start, end=end,
-                                                tenors=mom_tenors),
-        "carry":               carry(ns_factors),
-        "mean_reversion":      mean_reversion_rv(markets=markets, start=start, end=end),
-        "carry_cross_country": carry_cross_country(markets=markets, start=start, end=end),
+        "momentum":           momentum_a_daily(markets=markets, start=start, end=end,
+                                               tenors=mom_tenors),
+        "carry_within_curve": within_curve_carry_ois(markets=markets, start=start, end=end),
+        "mean_reversion":     mean_reversion_rv(markets=markets, start=start, end=end),
     }
 
 
