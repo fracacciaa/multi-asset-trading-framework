@@ -36,6 +36,7 @@ MOP_H         = 1                    # 1-month holding period
 # Primary DM instrument set (mirrors MOP's 13 bond futures)
 DM_MARKETS = ["US", "EUR", "UK", "Japan", "Canada", "Australia", "New Zealand", "Sweden"]
 PRIMARY_TENORS: list[float] = [2.0, 5.0, 10.0, 30.0]
+DAILY_K = 252  # ~1 trading year
 
 
 # ── Ex ante volatility ────────────────────────────────────────────────────────
@@ -77,7 +78,56 @@ def tsmom_position(
     return pos
 
 
-# ── Panel builder ─────────────────────────────────────────────────────────────
+# ── Panel builders ────────────────────────────────────────────────────────────
+
+def build_signal_a_daily(
+    panels_by_market: dict[str, dict[str, pd.DataFrame]],
+    tenors: Optional[list[float]] = None,
+    k: int = DAILY_K,
+) -> pd.DataFrame:
+    """
+    Daily TSMOM: formation window and vol-scaling at daily frequency.
+
+    Formation: rolling k-day sum of ret_d (daily CM returns in bp).
+    Vol:       ex_ante_vol() kept daily — no month-end resampling.
+    Position:  sign(past_k_days) × (TARGET_VOL_BP / sigma_daily)
+
+    Same sign convention and position units as build_signal_a().
+    Positive = long duration (receive fixed).
+    Apply shift(1) before multiplying by ret_d to get PnL.
+    """
+    if tenors is None:
+        tenors = PRIMARY_TENORS
+
+    cols: dict = {}
+
+    for market, panels in panels_by_market.items():
+        ret_d = panels["ret_d"]
+
+        for tau in tenors:
+            if tau not in ret_d.columns:
+                continue
+
+            sigma_daily = ex_ante_vol(ret_d[tau].dropna())
+            past        = ret_d[tau].rolling(k).sum()
+
+            common = sigma_daily.index.intersection(past.index)
+            if len(common) < k + 5:
+                continue
+
+            pos = np.sign(past.loc[common]) * (
+                TARGET_VOL_BP / sigma_daily.loc[common].replace(0, np.nan)
+            )
+            cols[(market, tau)] = pos
+
+    if not cols:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(cols)
+    result.columns = pd.MultiIndex.from_tuples(result.columns, names=["market", "tenor"])
+    result.index.name = "date"
+    return result
+
 
 def build_signal_a(
     panels_by_market: dict[str, dict[str, pd.DataFrame]],
