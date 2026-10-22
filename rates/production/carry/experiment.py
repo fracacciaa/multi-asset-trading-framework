@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from rates.production.ns_core import fit_ns, NSFit
+from rates.production.ois_data import fetch_ois_curves
 from rates.production.evaluate import SpecResult
 from .config import CarryConfig
 from .measures import (
@@ -489,3 +490,61 @@ GRID: list[tuple[str, CarryConfig]] = [
     # ── Axis 9: rolldown source (contamination demo only, never ship) ─────────
     ("rolldown_raw", _r(rolldown_source="raw")),
 ]
+
+# Avoid circular import: cross_country.py imports BASELINE from here.
+_CARRY_DM_MARKETS = ["US", "EUR", "UK", "Japan", "Canada", "Australia", "New Zealand", "Sweden"]
+
+
+def within_curve_carry_pnl(
+    markets: Optional[list[str]] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    lam: float = 0.3,
+    basis: str = "ns",
+) -> pd.DataFrame:
+    """
+    Per-market daily PnL: per-tenor DV01-neutral carry positions × cm_total_return_bp.
+
+    Replicates Pipeline B from compare_carry_pipelines.py using BASELINE config
+    (reprice carry, monthly rebalance, lag=1, level-neutral DV01 positions).
+
+    Each tenor's position is sized by the carry signal; PnL = sum_tenor(pos × ret).
+    This is the correct backtest — not scalar(−β₂) × single 10Y return.
+
+    Returns date × market DataFrame of daily PnL in bp.
+    """
+    if markets is None:
+        markets = _CARRY_DM_MARKETS
+
+    mkt_series: dict[str, pd.Series] = {}
+    for market in markets:
+        try:
+            curves  = fetch_ois_curves(market, start=start, end=end)
+            fund_col = (0.25 if 0.25 in curves.columns
+                        else min(curves.columns, key=lambda x: abs(x - 0.25)))
+            funding = curves[fund_col]
+
+            carry_df, dur_df, fits = _compute_carry_panel(curves, funding, BASELINE, lam, basis)
+            if carry_df.empty:
+                continue
+
+            tenors = carry_df.columns.to_numpy(float)
+            pos    = build_positions(
+                carry_df, dur_df,
+                rebalance=BASELINE.rebalance,
+                lag=BASELINE.lag,
+                xs_mode=BASELINE.xs_mode,
+                neutralize=BASELINE.neutralize,
+                gross=BASELINE.gross_dv01,
+            )
+            pnl_c, pnl_yc = _compute_pnl_series(curves, funding, pos, fits, tenors)
+            mkt_series[market] = pnl_c + pnl_yc
+        except Exception:
+            continue
+
+    if not mkt_series:
+        return pd.DataFrame()
+
+    df = pd.concat(mkt_series.values(), axis=1, keys=mkt_series.keys())
+    df.index.name = "date"
+    return df
