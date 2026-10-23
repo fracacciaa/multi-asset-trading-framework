@@ -62,13 +62,25 @@
   "rr_orientation": "foreign_oriented (FCU call - FCU put)",
   "mid_only_note": "No bid/ask data. Dupuy attractive-currency filter is vacuous with mid quotes. TC_BP values are flat placeholders, not estimates.",
   "momentum": {
-    "signal": "XS f=9m h=1",
-    "train_sr": 0.51,
-    "test_sr": 0.56
+    "monthly": {
+      "signal": "XS f=9m h=1",
+      "train_sr": 0.51,
+      "test_sr": 0.56
+    },
+    "daily": {
+      "halflife_days": 126,
+      "is_sr": 0.06,
+      "is_sr_by_hl": {
+        "10": -0.413,
+        "32": -0.197,
+        "63": 0.056,
+        "95": 0.032,
+        "126": 0.06
+      }
+    }
   },
-  "mv_floor_hit_rate": 0.015015015015015015,
   "mv_floor_hit_rate_daily": 0.00778318276580959,
-  "cs_corr_fd_rr": -0.9105626402849071,
+  "cs_corr_fd_rr": -0.9103341327551961,
   "portfolio_monotone": true,
   "daily_carry": {
     "fd_source": "fd_m forward-filled to business daily",
@@ -76,5 +88,16 @@
     "dupuy_lag_days": 21,
     "dupuy_mv_window": 21,
     "e3_min_periods": 756
+  },
+  "mean_reversion": {
+    "ns_loo_model": "ns3\u00b7loo\u00b7grid\u00b7vfts\u00b7agg",
+    "ns_loo_rebalance": "monthly VF TS (desired_vol=10%)",
+    "ns_loo_pnl_type": "rx_d",
+    "oos_sr_ns_loo": 0.45,
+    "ns_loo_corr_carry": -0.024,
+    "fly_model": "ns3_fixed\u00b7smooth\u00b7fly_1m3m6m",
+    "fly_n_pairs": 4,
+    "fly_pnl_type": "rx_d",
+    "oos_sr_fly": 0.366
   }
 }

@@ -1,0 +1,61 @@
+{
+  "markets": [
+    "Australia",
+    "Canada",
+    "China",
+    "EUR",
+    "India",
+    "Japan",
+    "New Zealand",
+    "Sweden",
+    "Switzerland",
+    "UK",
+    "US"
+  ],
+  "carry_markets": [
+    "Australia",
+    "Canada",
+    "EUR",
+    "Japan",
+    "New Zealand",
+    "Sweden",
+    "Switzerland",
+    "UK",
+    "US"
+  ],
+  "mom_markets": [
+    "Australia",
+    "Canada",
+    "EUR",
+    "Japan",
+    "New Zealand",
+    "Sweden",
+    "Switzerland",
+    "UK",
+    "US"
+  ],
+  "start": null,
+  "end": null,
+  "ns_model": "ns_calibrated",
+  "carry_tenors": [
+    5.0,
+    10.0
+  ],
+  "signals": [
+    "momentum_a_daily",
+    "carry_within_curve_ois",
+    "mean_reversion"
+  ],
+  "files": {
+    "ns_factors": "date \u00d7 (market,factor) MultiIndex cols; level/slope/curvature",
+    "carry_ois_par": "date \u00d7 (market,tenor) MultiIndex cols; within-curve carry OIS positions \u2014 signal only",
+    "carry_ois_par_pnl": "date \u00d7 market; \u00a76.2 pos \u00d7 daily mark-to-market \u2014 use for Sharpe (daily, \u221a252)",
+    "mean_reversion": "date \u00d7 market; factor-neutral NS residual z-score \u2014 signal only",
+    "mean_reversion_pnl": "date \u00d7 market; per-tenor pos(t-1)\u00d7(\u2212\u0394resid(t)) summed \u2014 use for Sharpe (daily, \u221a252)",
+    "momentum_a_daily": "date \u00d7 (market,tenor); daily TSMOM positions (252d window) \u2014 signal only",
+    "momentum_a_daily_pnl": "date \u00d7 market; daily pos(t-1)\u00d7ret_d(t) summed \u2014 use for Sharpe (daily, \u221a252)",
+    "rx_m": "date \u00d7 (market,tenor); Sihvonen monthly log excess returns (bp)",
+    "ret_d": "date \u00d7 (market,tenor); daily CM constant-maturity returns (bp)"
+  },
+  "sharpe_recipe": "Always use the *_pnl files. sr = pnl[market].dropna().mean() / pnl[market].dropna().std() * sqrt(252). carry_ois_par_pnl: \u00a76.2 income+roll-down, DV01-neutral 5Y+10Y cross-section, daily rebalance. mean_reversion_pnl: per-tenor z-score \u00d7 (\u2212\u0394resid), summed. momentum_a_daily_pnl: per-tenor vol-scaled positions \u00d7 daily CM returns, summed."
+}
