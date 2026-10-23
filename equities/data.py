@@ -3,6 +3,7 @@ Equities data ingestion.
 Parses Bloomberg wide-format Excel exports and exposes price / fundamental DataFrames.
 """
 
+import os
 import pandas as pd
 import numpy as np
 from functools import lru_cache
@@ -23,7 +24,7 @@ def load_bloomberg_excel(path: str) -> dict[str, pd.DataFrame]:
     Returns a dict with keys: 'prices', 'market_cap', 'fcf', 'shares_out', 'eps_fwd'.
     Each value is a date × ticker DataFrame, forward-filled and indexed by DatetimeIndex.
     """
-    raw = pd.read_excel(path, header=None)
+    raw = pd.read_excel(path, header=None, engine="calamine")
     header = raw.iloc[0]
     data = raw.iloc[1:].reset_index(drop=True)
 
@@ -71,7 +72,24 @@ def load_bloomberg_excel(path: str) -> dict[str, pd.DataFrame]:
 
 @lru_cache(maxsize=1)
 def _cached_load(path: str) -> dict[str, pd.DataFrame]:
-    return load_bloomberg_excel(path)
+    cache_dir = os.path.join(os.path.dirname(path), ".bbg_cache")
+    cache_stamp = os.path.join(cache_dir, os.path.basename(path) + ".stamp")
+    cache_ok = (
+        os.path.isdir(cache_dir)
+        and os.path.exists(cache_stamp)
+        and os.path.getmtime(cache_stamp) >= os.path.getmtime(path)
+    )
+    if cache_ok:
+        return {
+            field: pd.read_parquet(os.path.join(cache_dir, f"{field}.parquet"))
+            for field in _FIELDS
+        }
+    data = load_bloomberg_excel(path)
+    os.makedirs(cache_dir, exist_ok=True)
+    for field, df in data.items():
+        df.to_parquet(os.path.join(cache_dir, f"{field}.parquet"))
+    open(cache_stamp, "w").close()
+    return data
 
 
 def fetch_prices(

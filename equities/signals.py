@@ -214,27 +214,24 @@ def carry(
 
 def combined_signal(
     prices: pd.DataFrame,
-    fundamentals=None,
-    weights=None,
+    fundamentals: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
-    Combine available signals into a single z-scored signal.
-    weights: dict with keys 'momentum', 'mean_reversion', 'carry' summing to 1.
-    Only implemented signals are included; weights are renormalized accordingly.
+    Equal-weight blend of all available equities signals.
+
+    Delegates to equities.blend.equal_weight + combine_signals.
+    Carry requires fundamentals; it is included only when fundamentals is provided.
     """
-    if weights is None:
-        weights = {"momentum": 1 / 3, "mean_reversion": 1 / 3, "carry": 1 / 3}
+    from equities.blend import equal_weight, combine_signals
 
-    parts = {}
-    try:
-        parts["momentum"] = momentum(prices)
-    except Exception:
-        pass
-    # mean_reversion and carry added once implemented
+    sigs: dict[str, pd.DataFrame] = {
+        "momentum":      momentum(prices),
+        "tsmom":         tsmom(prices),
+        "mean_reversion": mean_reversion(prices),
+        "bollinger":     bollinger(prices),
+    }
+    if fundamentals is not None:
+        sigs["carry"] = carry(prices, fundamentals)
 
-    if not parts:
-        raise RuntimeError("No signals could be computed")
-
-    available_weight = sum(weights[k] for k in parts)
-    sig = sum(weights[k] / available_weight * v for k, v in parts.items())
-    return sig
+    weights = equal_weight(list(sigs.keys()))
+    return combine_signals(sigs, weights)
