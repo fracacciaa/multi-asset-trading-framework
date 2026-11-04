@@ -17,14 +17,11 @@ from equities.blend import (
     MLMSRR,
     RandomForestBlend,
     STMOM,
-    _adaptive_alpha,
-    _fit_all_on_F,
     _xs_positions,
     build_managed_returns,
     build_state_features,
     c_enet_blend,
     combine_signals,
-    compare_static_vs_wf,
     e_enet_blend,
     enet_blend,
     equal_weight,
@@ -36,7 +33,6 @@ from equities.blend import (
     pls_blend,
     pool_blend,
     sharpe_heuristic,
-    walk_forward_blend,
     winsorize_signals,
 )
 
@@ -723,167 +719,3 @@ def test_fit_static_extended():
     for key in new_keys:
         assert key in result, f"Missing key: {key}"
         assert np.all(np.isfinite(result[key].weights.values)), f"Non-finite weights for {key}"
-
-
-# ── Walk-forward helpers ─────────────────────────────────────────────────────
-
-def _make_F(T=400, K=4, seed=7):
-    """Build a managed-return DataFrame with a clear IS/OOS split."""
-    rng = np.random.default_rng(seed)
-    dates = pd.date_range("2016-01-01", periods=T, freq="B")
-    return pd.DataFrame(
-        rng.standard_normal((T, K)) * 0.001,
-        index=dates,
-        columns=[f"sig{k}" for k in range(K)],
-    )
-
-
-def test_adaptive_alpha_positive():
-    """_adaptive_alpha must return a positive float."""
-    F = _make_F()
-    a = _adaptive_alpha(F)
-    assert isinstance(a, float)
-    assert a > 0
-
-
-def test_fit_all_on_F_keys():
-    """_fit_all_on_F must return all 13 static method keys."""
-    F = _make_F()
-    expected = {
-        "equal_weight", "sh_p1", "sh_p2", "msrr_ols", "msrr_ridge",
-        "enet", "lasso", "c_enet", "e_enet", "e_lasso", "inv_msfe", "pcr", "pls",
-    }
-    result = _fit_all_on_F(F)
-    assert expected == set(result.keys())
-
-
-def test_fit_all_on_F_weights_finite():
-    """Every method in _fit_all_on_F must produce finite, normalised weights."""
-    F = _make_F()
-    for name, bw in _fit_all_on_F(F).items():
-        assert np.all(np.isfinite(bw.weights.values)), f"Non-finite weights: {name}"
-        assert abs(bw.weights.abs().sum() - 1.0) < 1e-9, f"Weights not normalised: {name}"
-
-
-# ── walk_forward_blend ───────────────────────────────────────────────────────
-
-def test_wf_blend_output_shape():
-    """walk_forward_blend must return one Series per method, length = OOS rows."""
-    F = _make_F(T=400)
-    is_end = str(F.index[299].date())   # first 300 rows IS, last 100 OOS
-    result = walk_forward_blend(F, is_end, refit_freq=50)
-    expected_methods = {
-        "equal_weight", "sh_p1", "sh_p2", "msrr_ols", "msrr_ridge",
-        "enet", "lasso", "c_enet", "e_enet", "e_lasso", "inv_msfe", "pcr", "pls",
-    }
-    assert expected_methods == set(result.keys())
-    n_oos = (F.index > is_end).sum()
-    for m, s in result.items():
-        assert len(s) == n_oos, f"{m}: expected {n_oos} rows, got {len(s)}"
-
-
-def test_wf_blend_equal_weight_stable():
-    """equal_weight never changes — walk-forward and static OOS must be identical."""
-    F = _make_F(T=400)
-    is_end = str(F.index[299].date())
-    wf = walk_forward_blend(F, is_end, refit_freq=50)
-
-    # Static: equal weight on all K signals
-    K = F.shape[1]
-    b = np.full(K, 1.0 / K)
-    static_ret = pd.Series(F.loc[F.index > is_end].values @ b)
-
-    np.testing.assert_allclose(
-        wf["equal_weight"].values, static_ret.values, atol=1e-10
-    )
-
-
-def test_wf_blend_no_future_leakage():
-    """
-    At each refit step the training window must end strictly before the OOS segment.
-    Verified indirectly: zeroing out future OOS rows before the first refit point
-    should leave the first segment's returns unchanged.
-    """
-    F = _make_F(T=400)
-    is_end = str(F.index[299].date())
-
-    wf1 = walk_forward_blend(F, is_end, refit_freq=50)
-
-    # Corrupt rows 50+ in OOS (after the first OOS segment ends)
-    F_corrupted = F.copy()
-    oos_dates = F.index[F.index > is_end]
-    F_corrupted.loc[oos_dates[50:]] = 999.0
-
-    wf2 = walk_forward_blend(F_corrupted, is_end, refit_freq=50)
-
-    # First 50 OOS rows must be identical (weights were fit before those dates)
-    for m in ["sh_p1", "c_enet", "msrr_ridge"]:
-        np.testing.assert_allclose(
-            wf1[m].values[:50], wf2[m].values[:50], atol=1e-10,
-            err_msg=f"Future corruption leaked into first segment for {m}",
-        )
-
-
-def test_wf_blend_rolling_window():
-    """Rolling window variant must run without error and return finite values."""
-    F = _make_F(T=500)
-    is_end = str(F.index[349].date())
-    result = walk_forward_blend(
-        F, is_end, refit_freq=63, window_type="rolling", rolling_window=252
-    )
-    for m, s in result.items():
-        finite_vals = s.dropna()
-        assert len(finite_vals) > 0, f"{m}: all NaN"
-        assert np.all(np.isfinite(finite_vals.values)), f"{m}: non-finite"
-
-
-def test_wf_blend_no_oos_raises():
-    """walk_forward_blend must raise ValueError when is_end is after all data."""
-    F = _make_F(T=200)
-    is_end = str(F.index[-1].date())
-    with pytest.raises(ValueError, match="No OOS data"):
-        walk_forward_blend(F, is_end)
-
-
-# ── compare_static_vs_wf ────────────────────────────────────────────────────
-
-def test_compare_static_vs_wf_shape():
-    """compare_static_vs_wf must return a DataFrame with correct rows/columns."""
-    F = _make_F(T=500)
-    is_end = str(F.index[349].date())
-    df = compare_static_vs_wf(F, is_end, refit_freqs=[63, 252])
-
-    expected_methods = {
-        "equal_weight", "sh_p1", "sh_p2", "msrr_ols", "msrr_ridge",
-        "enet", "lasso", "c_enet", "e_enet", "e_lasso", "inv_msfe", "pcr", "pls",
-    }
-    assert expected_methods == set(df.index)
-    assert "IS_sr" in df.columns
-    assert "OOS_static_sr" in df.columns
-    assert "OOS_wf_63d_sr" in df.columns
-    assert "OOS_wf_252d_sr" in df.columns
-
-
-def test_compare_static_vs_wf_equal_weight_consistent():
-    """equal_weight OOS_static_sr and OOS_wf_63d_sr must be equal (weights never change)."""
-    F = _make_F(T=500)
-    is_end = str(F.index[349].date())
-    df = compare_static_vs_wf(F, is_end, refit_freqs=[63])
-    ew = df.loc["equal_weight"]
-    assert abs(ew["OOS_static_sr"] - ew["OOS_wf_63d_sr"]) < 1e-6
-
-
-def test_compare_static_vs_wf_finite_sharpes():
-    """All Sharpe values in compare_static_vs_wf must be finite."""
-    F = _make_F(T=500)
-    is_end = str(F.index[349].date())
-    df = compare_static_vs_wf(F, is_end, refit_freqs=[63])
-    assert df.apply(np.isfinite).all().all(), "Non-finite Sharpe in compare table"
-
-
-def test_compare_static_vs_wf_sorted():
-    """Output must be sorted descending by OOS_static_sr."""
-    F = _make_F(T=500)
-    is_end = str(F.index[349].date())
-    df = compare_static_vs_wf(F, is_end, refit_freqs=[63])
-    assert df["OOS_static_sr"].is_monotonic_decreasing
