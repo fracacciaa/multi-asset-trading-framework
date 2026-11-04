@@ -1,7 +1,15 @@
 """
-Equities signals: momentum, mean reversion, carry.
-All signals return a cross-sectional winsorized DataFrame indexed date × ticker.
-Normalization (z-score, Grinold, beta-orthogonalization) is handled by ViewFormationXS.
+Equities signals: momentum, tsmom, mean reversion, carry.
+
+Raw signal functions return cross-sectional winsorized DataFrames (date × ticker).
+They are not intended to be used directly — always call build_vf_positions() to get
+signals that have been processed through ViewFormation and are ready for blending.
+
+Pipeline:
+    build_vf_positions()
+        → momentum / tsmom / mean_reversion / carry   (raw signals, this file)
+        → ViewFormationXS / ViewFormationTS            (equities/view_formation.py)
+        → dict[str, pd.DataFrame] of positions        (ready for equities/blend.py)
 """
 
 import pandas as pd
@@ -193,25 +201,93 @@ def carry(
     q_hi = composite.quantile(1 - winsor_pct, axis=1)
     return composite.clip(lower=q_lo, upper=q_hi, axis=0)
 
-def combined_signal(
+def build_vf_positions(
     prices: pd.DataFrame,
-    fundamentals: Optional[dict] = None,
-) -> pd.DataFrame:
+    fundamentals: dict,
+    returns: pd.DataFrame,
+    warmup: int = 504,
+    rebal_freq: int = 21,
+    cov_lookback: int = 504,
+    vol_halflife: int = 21,
+    cor_halflife: int = 126,
+    vf_params: Optional[dict] = None,
+) -> dict[str, pd.DataFrame]:
     """
-    Equal-weight blend of all available equities signals.
+    Canonical entry point for equities signals.
 
-    Delegates to equities.blend.equal_weight + combine_signals.
-    Carry requires fundamentals; it is included only when fundamentals is provided.
+    Computes all 4 signals, runs each through ViewFormation on a rolling
+    monthly rebalance schedule, and returns pre-formed position DataFrames
+    ready to pass directly into equities/blend.py.
+
+    Parameters
+    ----------
+    prices        : date × ticker adjusted close prices
+    fundamentals  : dict with keys market_cap, fcf, eps_fwd (output of fetch_fundamentals)
+    returns       : date × ticker daily returns (prices.pct_change())
+    warmup        : trading days before first rebalance (for covariance estimation)
+    rebal_freq    : rebalance every N trading days (default 21 = monthly)
+    cov_lookback  : rolling window length for covariance estimation
+    vol_halflife  : EWMA halflife for volatility in estimate_covariance
+    cor_halflife  : EWMA halflife for correlation in estimate_covariance
+    vf_params     : optional dict of ViewFormationXS params (e.g. use_rank, tanh_scale)
+
+    Returns
+    -------
+    dict[str, pd.DataFrame]
+        Keys: "momentum", "tsmom", "mean_reversion", "carry"
+        Values: date × ticker DataFrames of VF-processed portfolio weights,
+                held constant between rebalance dates.
     """
-    from equities.blend import equal_weight, combine_signals
+    from optimization import estimate_covariance
+    from equities.view_formation import ViewFormationXS, ViewFormationTS
 
-    sigs: dict[str, pd.DataFrame] = {
+    _SIGNAL_KINDS: dict[str, str] = {
+        "momentum":       "xs",
+        "tsmom":          "ts",
+        "mean_reversion": "xs",
+        "carry":          "xs",
+    }
+
+    raw_signals: dict[str, pd.DataFrame] = {
         "momentum":       momentum(prices),
         "tsmom":          tsmom(prices),
         "mean_reversion": mean_reversion(prices),
+        "carry":          carry(prices, fundamentals),
     }
-    if fundamentals is not None:
-        sigs["carry"] = carry(prices, fundamentals)
 
-    weights = equal_weight(list(sigs.keys()))
-    return combine_signals(sigs, weights)
+    all_dates    = returns.index
+    rebal_dates  = all_dates[warmup::rebal_freq]
+    positions    = {name: pd.DataFrame(0.0, index=all_dates, columns=prices.columns)
+                   for name in raw_signals}
+
+    xs_params = {"use_rank": False, **(vf_params or {})}
+
+    for i, rd in enumerate(rebal_dates):
+        cov        = estimate_covariance(
+            returns.loc[:rd].iloc[-cov_lookback:],
+            vol_halflife=vol_halflife,
+            cor_halflife=cor_halflife,
+        )
+        next_rd    = rebal_dates[i + 1] if i + 1 < len(rebal_dates) else all_dates[-1]
+        hold_dates = all_dates[(all_dates > rd) & (all_dates <= next_rd)]
+
+        for name, sig_df in raw_signals.items():
+            if rd not in sig_df.index:
+                continue
+            raw = sig_df.loc[rd].dropna()
+            common = raw.index.intersection(cov.index)
+            if len(common) < 10:
+                continue
+            try:
+                if _SIGNAL_KINDS[name] == "ts":
+                    vf = ViewFormationTS(raw.loc[common], cov.loc[common, common])
+                else:
+                    vf = ViewFormationXS(raw.loc[common], cov.loc[common, common],
+                                         params=xs_params)
+                w = vf.generate_view()
+            except Exception:
+                continue
+            for d in hold_dates:
+                positions[name].loc[d, w.index] = w.values
+
+    return positions
