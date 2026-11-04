@@ -17,7 +17,7 @@ from typing import Optional
 
 from backtest import run_backtest
 from optimization import estimate_covariance
-from view_formation import ViewFormationXS, ViewFormationTS, _DEFAULT_PARAMS, _DEFAULT_TS_PARAMS
+from equities.view_formation import ViewFormationXS, ViewFormationTS, _DEFAULT_PARAMS, _DEFAULT_TS_PARAMS
 
 
 def run_research_backtest(

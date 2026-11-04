@@ -17,7 +17,7 @@ import numpy as np
 from typing import Optional
 
 from optimization import estimate_covariance
-from view_formation import ViewFormationXS
+from equities.view_formation import ViewFormationXS
 from backtest import run_backtest, apply_transaction_costs
 import performance
 

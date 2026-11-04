@@ -26,7 +26,7 @@ from rates.production.yc_builder    import build_zero_curve
 from rates.production.nelson_siegel import (
     calibrate_lambda, extract_factors, _reconstruct_fitted, _ns_loadings,
 )
-from view_formation import ViewFormationTS
+from equities.view_formation import ViewFormationTS
 
 TRAIN_END   = "2018-12-31"
 OOS_START   = "2019-01-01"

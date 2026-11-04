@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from backtest_research import run_research_backtest
-from view_formation import ViewFormationXS, ViewFormationTS
+from equities.view_formation import ViewFormationXS, ViewFormationTS
 from rates.production.mean_reversion.rv import (
     build_rv_signals, build_rv_returns,
 )

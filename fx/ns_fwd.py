@@ -36,7 +36,7 @@ from fx.production.data import (
     build_panels,
 )
 from rates.production.ns_core import ns_loadings
-from view_formation import ViewFormationTS
+from equities.view_formation import ViewFormationTS
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 

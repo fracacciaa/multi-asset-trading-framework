@@ -90,25 +90,6 @@ def mean_reversion(
     return signal.clip(lower=q_lo, upper=q_hi, axis=0)
 
 
-def bollinger(
-    prices: pd.DataFrame,
-    halflife: int = 21,
-    winsor_pct: float = 0.01,
-) -> pd.DataFrame:
-    """
-    Bollinger-style deviation from EWMA trend.
-
-    Signal = -(price / ewma_price - 1): below trend → positive (buy),
-    above trend → negative (sell). halflife controls trend smoothing
-    (not vol estimation — conceptually separate).
-    Returns raw winsorized signal; normalization delegated to ViewFormationXS.
-    """
-    ewma_price = prices.ewm(halflife=halflife).mean()
-    signal = -(prices / ewma_price - 1)
-    q_lo = signal.quantile(winsor_pct, axis=1)
-    q_hi = signal.quantile(1 - winsor_pct, axis=1)
-    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
-
 def carry(
     prices: pd.DataFrame,
     fundamentals: dict,
@@ -225,10 +206,9 @@ def combined_signal(
     from equities.blend import equal_weight, combine_signals
 
     sigs: dict[str, pd.DataFrame] = {
-        "momentum":      momentum(prices),
-        "tsmom":         tsmom(prices),
+        "momentum":       momentum(prices),
+        "tsmom":          tsmom(prices),
         "mean_reversion": mean_reversion(prices),
-        "bollinger":     bollinger(prices),
     }
     if fundamentals is not None:
         sigs["carry"] = carry(prices, fundamentals)

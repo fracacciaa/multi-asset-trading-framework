@@ -20,7 +20,7 @@ import pandas as pd
 
 from rates.production.nelson_siegel import extract_factors_all_markets
 from rates.production.ois_data import OIS_MARKETS
-from view_formation import ViewFormationTS
+from equities.view_formation import ViewFormationTS
 
 OOS_START   = "2019-01-01"
 MR_LOOKBACK = 252

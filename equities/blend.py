@@ -5,7 +5,7 @@ Combines raw signal score DataFrames (date × ticker, output of equities/signals
 before ViewFormation) into a single composite signal.
 
 Pipeline position in the stack:
-    equities/signals.py  →  equities/blend.py  →  view_formation.py  →  portfolio weights
+    equities/signals.py  →  equities/view_formation.py  →  equities/blend.py  →  portfolio weights
 
 Static blend methods (return BlendWeights):
     equal_weight        — 1/K on each signal (benchmark)
