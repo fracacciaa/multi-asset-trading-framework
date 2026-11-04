@@ -1,11 +1,15 @@
 """
 Signal blending for equities.
 
-Combines raw signal score DataFrames (date × ticker, output of equities/signals.py,
-before ViewFormation) into a single composite signal.
+Combines ViewFormation position DataFrames (date × ticker, output of
+equities/view_formation.py) into a single composite portfolio.
 
 Pipeline position in the stack:
     equities/signals.py  →  equities/view_formation.py  →  equities/blend.py  →  portfolio weights
+
+All inputs to managed_return, build_managed_returns, and combine_signals are expected
+to be pre-formed position DataFrames — i.e. the per-asset weight outputs of
+ViewFormationXS.generate_view() or ViewFormationTS.generate_view(), not raw signal scores.
 
 Static blend methods (return BlendWeights):
     equal_weight        — 1/K on each signal (benchmark)
@@ -19,7 +23,7 @@ Static blend methods (return BlendWeights):
     pls_blend           — Partial Least Squares (Gu et al. 2020)
 
 Preprocessing utilities:
-    winsorize_signals   — clip signal scores at cross-sectional quantile (Mekelburg & Strauss 2023)
+    winsorize_signals   — clip position values at cross-sectional quantile
     pool_blend          — ensemble pooling of multiple BlendWeights (Mekelburg & Strauss 2023)
 
 Dynamic / ML methods (time-varying weights or direct positions):
@@ -32,8 +36,7 @@ Dynamic / ML methods (time-varying weights or direct positions):
 
 For the statistical methods (Sharpe, Ridge, ENet …), blend weights are estimated from
 managed returns F_k, where each sleeve k earns F_k[t+1] = Σᵢ p[i,k,t] r[i,t+1].
-Positions p[i,k,t] are constructed inside this module from raw signal scores via
-simple cross-sectional z-scoring (no ViewFormation required here).
+Positions p[i,k,t] are the VF-output weights — no additional normalisation is applied.
 """
 
 from __future__ import annotations
@@ -54,7 +57,8 @@ def _xs_positions(signal: pd.DataFrame) -> pd.DataFrame:
     """
     Cross-sectional z-score → gross-normalised positions.
 
-    Used only internally to construct managed returns for the statistical estimators.
+    Utility for tests and research. Not part of the production pipeline — the
+    production path runs ViewFormation before blend, so positions arrive pre-formed.
     NaN tickers are excluded from the z-score computation and carry NaN positions.
     """
     mu = signal.mean(axis=1)
@@ -66,34 +70,34 @@ def _xs_positions(signal: pd.DataFrame) -> pd.DataFrame:
 
 # ── Managed-return construction ─────────────────────────────────────────────────
 
-def managed_return(signal: pd.DataFrame, forward_returns: pd.DataFrame) -> pd.Series:
+def managed_return(positions: pd.DataFrame, forward_returns: pd.DataFrame) -> pd.Series:
     """
-    Scalar managed portfolio return for one signal sleeve.
+    Scalar managed portfolio return for one VF signal sleeve.
 
     F_k[t+1] = Σᵢ p[i,k,t] · r[i,t+1]
 
-    Positions are constructed from the raw signal via _xs_positions (XS z-score,
-    gross-normalised). NaN positions and returns are treated as zero.
+    positions must be pre-formed VF output weights (date × ticker).
+    No additional normalisation is applied. NaN entries are treated as zero.
     """
-    pos = _xs_positions(signal)
-    common_dates = pos.index.intersection(forward_returns.index)
-    common_tickers = pos.columns.intersection(forward_returns.columns)
-    p = pos.loc[common_dates, common_tickers].fillna(0.0)
+    common_dates   = positions.index.intersection(forward_returns.index)
+    common_tickers = positions.columns.intersection(forward_returns.columns)
+    p = positions.loc[common_dates, common_tickers].fillna(0.0)
     r = forward_returns.loc[common_dates, common_tickers].fillna(0.0)
     return (p * r).sum(axis=1).rename("managed_return")
 
 
 def build_managed_returns(
-    signals: dict[str, pd.DataFrame],
+    positions: dict[str, pd.DataFrame],
     forward_returns: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Build a T × K DataFrame of managed portfolio returns.
+    Build a T × K DataFrame of managed portfolio returns from VF position DataFrames.
 
-    Each column k contains the scalar return series for signal k.
+    Each column k contains the scalar return series F_k[t] = Σᵢ p[i,k,t] · r[i,t].
+    positions must be pre-formed VF output weights (date × ticker per signal).
     Rows with any NaN are dropped so all estimators share an identical sample.
     """
-    F = {name: managed_return(sig, forward_returns) for name, sig in signals.items()}
+    F = {name: managed_return(pos, forward_returns) for name, pos in positions.items()}
     return pd.DataFrame(F).dropna()
 
 
@@ -185,41 +189,38 @@ def msrr_ridge(F: pd.DataFrame, lam: float = 0.0) -> BlendWeights:
 # ── Applying blend weights ──────────────────────────────────────────────────────
 
 def combine_signals(
-    signals: dict[str, pd.DataFrame],
+    positions: dict[str, pd.DataFrame],
     weights: BlendWeights,
 ) -> pd.DataFrame:
     """
-    Weighted sum of cross-sectionally z-scored signal DataFrames.
+    Weighted sum of VF position DataFrames.
 
-    Each signal is z-scored per date before blending so that signals with
-    different natural scales contribute according to the blend weights alone.
+    positions must be pre-formed VF output weights (date × ticker per signal).
+    No additional normalisation is applied — VF already handles beta-stripping,
+    Grinold scaling, and vol-targeting before this function is called.
     Signals absent from `weights` are silently skipped; weights are renormalised
     on the available subset.
 
-    Output is a combined raw signal (date × ticker) ready to feed ViewFormationXS.
+    Output is a combined position DataFrame (date × ticker).
     """
     w = weights.weights
-    available = {k: signals[k] for k in w.index if k in signals}
+    available = {k: positions[k] for k in w.index if k in positions}
     if not available:
         raise ValueError(
-            f"No signals match blend weights. "
-            f"Weight keys: {list(w.index)}, signal keys: {list(signals.keys())}"
+            f"No positions match blend weights. "
+            f"Weight keys: {list(w.index)}, position keys: {list(positions.keys())}"
         )
 
     w_avail = w.reindex(list(available.keys())).dropna()
     w_avail = w_avail / w_avail.abs().sum()
 
-    idx = sorted(set.union(*(set(df.index) for df in available.values())))
+    idx  = sorted(set.union(*(set(df.index)   for df in available.values())))
     cols = sorted(set.union(*(set(df.columns) for df in available.values())))
 
     combo = pd.DataFrame(0.0, index=idx, columns=cols)
     for name, wk in w_avail.items():
-        sig = available[name]
-        mu = sig.mean(axis=1)
-        sd = sig.std(axis=1).replace(0.0, np.nan)
-        z = sig.sub(mu, axis=0).div(sd, axis=0)
-        z = z.reindex(index=idx, columns=cols).fillna(0.0)
-        combo = combo.add(wk * z)
+        pos = available[name].reindex(index=idx, columns=cols).fillna(0.0)
+        combo = combo.add(wk * pos)
 
     return combo
 
@@ -783,39 +784,41 @@ def pcr_blend(F: pd.DataFrame, n_components: int = 2) -> BlendWeights:
     """
     Principal Components Regression blend (PCR, Gu et al. 2020).
 
-    Step 1 — PCA on F → n_comp principal-component scores (T × n_comp).
-    Step 2 — OLS: lstsq(scores, ones(T)) → component coefficients c.
-    Step 3 — Map back to signal space: b = V.T @ c  (V = pca.components_, n_comp × K).
-    """
-    try:
-        from sklearn.decomposition import PCA
-    except ImportError as e:
-        raise ImportError("sklearn is required for pcr_blend.") from e
+    Uses SVD on F/sqrt(T) to get eigenvectors of the second-moment matrix M=F'F/T
+    (not the centered covariance). This avoids the degeneracy of sklearn PCA, which
+    centers the data before decomposition — making lstsq(scores, ones(T)) return
+    near-zero coefficients because zero-mean predictors can't fit a constant target.
 
+    Step 1 — SVD of F/sqrt(T) → right singular vectors V (eigenvectors of M).
+    Step 2 — OLS: lstsq(F @ V.T, ones(T)) → component coefficients c.
+    Step 3 — Map back to signal space: b = V.T @ c.
+    """
     Fv = F.values.astype(float)
     T, K = Fv.shape
     n_comp = min(n_components, K, T - 1)
 
-    pca = PCA(n_components=n_comp)
-    scores = pca.fit_transform(Fv)  # T × n_comp
+    # SVD of F/sqrt(T): right singular vectors are eigenvectors of M = F'F/T
+    _, s, Vt = np.linalg.svd(Fv / np.sqrt(T), full_matrices=False)
+    Vt = Vt[:n_comp]            # (n_comp, K)
+    scores = Fv @ Vt.T          # (T, n_comp) — NOT centered
 
     c, _, _, _ = np.linalg.lstsq(scores, np.ones(T), rcond=None)
-    b = pca.components_.T @ c  # K
+    b = Vt.T @ c                # (K,)
 
+    var_explained = float((s[:n_comp] ** 2).sum() / (s ** 2).sum())
     w = pd.Series(b, index=F.columns)
-    return BlendWeights(
-        w, f"pcr_{n_comp}",
-        {"n_components": n_comp, "var_explained": float(pca.explained_variance_ratio_.sum())},
-    )
+    return BlendWeights(w, f"pcr_{n_comp}", {"n_components": n_comp, "var_explained": var_explained})
 
 
 def pls_blend(F: pd.DataFrame, n_components: int = 2) -> BlendWeights:
     """
     Partial Least Squares blend (PLS, Gu et al. 2020).
 
-    PLSRegression with target y=ones(T) (MSRR target).
-    PLS maximises covariance between F components and y, weighting directions
-    that best predict the portfolio return unit vector.
+    Uses y = F.mean(axis=1) (cross-signal average managed return) as the PLS target
+    instead of ones(T). The original ones(T) target is constant (zero variance), which
+    causes PLS to degenerate immediately because it maximises covariance with y and
+    cov(anything, constant) = 0. The mean-return target finds signal combinations that
+    track the aggregate alpha direction, which is the natural PLS analogue of MSRR.
     """
     try:
         from sklearn.cross_decomposition import PLSRegression
@@ -826,12 +829,15 @@ def pls_blend(F: pd.DataFrame, n_components: int = 2) -> BlendWeights:
     T, K = Fv.shape
     n_comp = min(n_components, K, T - 1)
 
+    y = Fv.mean(axis=1)   # aggregate managed return across signals
     pls = PLSRegression(n_components=n_comp, scale=False)
-    pls.fit(Fv, np.ones(T).reshape(-1, 1))
+    pls.fit(Fv, y.reshape(-1, 1))
 
     # coef_ shape varies across sklearn versions: can be (K, 1) or (1, K)
     coef = pls.coef_
     b = coef.ravel()
+    if len(b) != K:
+        b = coef.T.ravel()
     if len(b) != K:
         b = np.zeros(K)
 

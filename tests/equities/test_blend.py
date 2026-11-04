@@ -39,7 +39,7 @@ from equities.blend import (
 
 # ── Fixtures ────────────────────────────────────────────────────────────────────
 
-def _make_signals(T=300, N=20, K=4, seed=0):
+def _make_positions(T=300, N=20, K=4, seed=0):
     rng = np.random.default_rng(seed)
     dates = pd.date_range("2018-01-01", periods=T, freq="B")
     tickers = [f"T{i}" for i in range(N)]
@@ -58,7 +58,7 @@ def _make_signals(T=300, N=20, K=4, seed=0):
 
 def test_xs_positions_gross_exposure():
     """Gross exposure should be 1 on every date (up to floating point)."""
-    signals, _, _, _, _ = _make_signals()
+    signals, _, _, _, _ = _make_positions()
     sig = list(signals.values())[0]
     pos = _xs_positions(sig)
     gross = pos.abs().sum(axis=1).dropna()
@@ -67,7 +67,7 @@ def test_xs_positions_gross_exposure():
 
 def test_xs_positions_dollar_neutral():
     """Positions should sum to ~0 (dollar-neutral by construction of z-score)."""
-    signals, _, _, _, _ = _make_signals()
+    signals, _, _, _, _ = _make_positions()
     sig = list(signals.values())[0]
     pos = _xs_positions(sig)
     net = pos.sum(axis=1).dropna()
@@ -92,7 +92,7 @@ def test_equal_weight_abs_sum():
 
 def test_sharpe_heuristic_positive():
     """Signal with higher Sharpe should receive higher weight."""
-    signals, fwd_ret, names, _, _ = _make_signals(seed=7)
+    signals, fwd_ret, names, _, _ = _make_positions(seed=7)
     F = build_managed_returns(signals, fwd_ret)
 
     # Boost sig0 to have clearly positive Sharpe
@@ -105,7 +105,7 @@ def test_sharpe_heuristic_positive():
 
 def test_sharpe_heuristic_all_negative_fallback():
     """All-negative Sharpe → fallback to equal weight."""
-    signals, fwd_ret, names, _, _ = _make_signals(seed=1)
+    signals, fwd_ret, names, _, _ = _make_positions(seed=1)
     F = build_managed_returns(signals, fwd_ret)
     F_neg = -F.abs() - 0.1  # force negative mean for all
     bw = sharpe_heuristic(F_neg, power=1)
@@ -117,7 +117,7 @@ def test_sharpe_heuristic_all_negative_fallback():
 
 def test_sharpe_heuristic_power2_more_concentrated():
     """power=2 should concentrate weight more than power=1."""
-    signals, fwd_ret, names, _, _ = _make_signals(seed=3)
+    signals, fwd_ret, names, _, _ = _make_positions(seed=3)
     F = build_managed_returns(signals, fwd_ret)
     # Ensure at least some positive Sharpe
     F = F.abs()
@@ -131,7 +131,7 @@ def test_sharpe_heuristic_power2_more_concentrated():
 
 def test_msrr_ridge_algebra():
     """msrr_ridge must equal solve(M + λI, μ) exactly."""
-    signals, fwd_ret, names, _, _ = _make_signals(seed=2)
+    signals, fwd_ret, names, _, _ = _make_positions(seed=2)
     F = build_managed_returns(signals, fwd_ret)
     lam = 0.05
 
@@ -175,7 +175,7 @@ def test_msrr_ols_direction_matches_mv():
 
 def test_msrr_ridge_lambda0_same_as_ols():
     """msrr_ridge(lam=0) method label should be 'msrr_ols'."""
-    signals, fwd_ret, _, _, _ = _make_signals()
+    signals, fwd_ret, _, _, _ = _make_positions()
     F = build_managed_returns(signals, fwd_ret)
     bw = msrr_ridge(F, lam=0.0)
     assert bw.method == "msrr_ols"
@@ -199,7 +199,7 @@ def test_msrr_ridge_finite_weights_singular():
 
 def test_static_no_leakage():
     """Static estimators are pure functions of F_train; future data is irrelevant."""
-    signals, fwd_ret, names, dates, tickers = _make_signals(T=300, seed=10)
+    signals, fwd_ret, names, dates, tickers = _make_positions(T=300, seed=10)
     F_train = build_managed_returns(signals, fwd_ret).iloc[:150]
 
     bw_before = msrr_ridge(F_train, lam=0.01)
@@ -220,7 +220,7 @@ def test_static_no_leakage():
 # ── combine_signals ─────────────────────────────────────────────────────────────
 
 def test_combine_signals_shape():
-    signals, _, names, dates, tickers = _make_signals()
+    signals, _, names, dates, tickers = _make_positions()
     bw = equal_weight(names)
     combo = combine_signals(signals, bw)
     assert combo.shape == (len(dates), len(tickers))
@@ -229,7 +229,7 @@ def test_combine_signals_shape():
 
 def test_combine_signals_missing_key_skipped():
     """A weight referencing a non-existent signal is silently skipped."""
-    signals, _, names, _, _ = _make_signals(K=3)
+    signals, _, names, _, _ = _make_positions(K=3)
     w = pd.Series({"sig0": 0.5, "sig1": 0.3, "ghost": 0.2})
     bw = BlendWeights(w, "custom")
     combo = combine_signals(signals, bw)
@@ -237,17 +237,17 @@ def test_combine_signals_missing_key_skipped():
 
 
 def test_combine_signals_no_match_raises():
-    signals, _, _, _, _ = _make_signals()
+    signals, _, _, _, _ = _make_positions()
     w = pd.Series({"NONEXISTENT": 1.0})
     bw = BlendWeights(w, "bad")
-    with pytest.raises(ValueError, match="No signals match"):
+    with pytest.raises(ValueError, match="No positions match"):
         combine_signals(signals, bw)
 
 
 # ── fit_static convenience ──────────────────────────────────────────────────────
 
 def test_fit_static_returns_all_methods():
-    signals, fwd_ret, _, _, _ = _make_signals()
+    signals, fwd_ret, _, _, _ = _make_positions()
     result = fit_static(signals, fwd_ret)
     expected_keys = {
         "equal_weight", "sh_p1", "sh_p2", "msrr_ols", "msrr_ridge",
@@ -262,7 +262,7 @@ def test_fit_static_returns_all_methods():
 # ── state features ──────────────────────────────────────────────────────────────
 
 def test_state_features_shape():
-    signals, fwd_ret, _, _, _ = _make_signals(K=4)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     assert z.shape[0] == len(F)
@@ -271,7 +271,7 @@ def test_state_features_shape():
 
 def test_state_features_no_lookahead():
     """Perturbing F after date t must not change z at dates ≤ t."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=4)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4)
     F = build_managed_returns(signals, fwd_ret)
     z_orig = build_state_features(F, lookback=21)
 
@@ -291,7 +291,7 @@ def test_state_features_no_lookahead():
 
 def test_mlmsrr_seed_reproducibility():
     """Same seed → identical weights."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=3, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=3, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -347,7 +347,7 @@ def test_mlmsrr_quadratic_plausibility():
 
 
 def test_mlmsrr_combine_signals_shape():
-    signals, fwd_ret, _, dates, tickers = _make_signals(K=3, T=200)
+    signals, fwd_ret, _, dates, tickers = _make_positions(K=3, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -361,7 +361,7 @@ def test_mlmsrr_combine_signals_shape():
 
 def test_mlmsrr_sharpe_objective_runs():
     """Sharpe objective should train without raising."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=3, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=3, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -376,7 +376,7 @@ def test_mlmsrr_sharpe_objective_runs():
 
 def test_mlmsrr_softmax_weights_sum_to_one():
     """With softmax activation, blend weights must sum to 1 on every date."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=4, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -393,7 +393,7 @@ def test_mlmsrr_softmax_weights_sum_to_one():
 
 def test_enet_blend_finite():
     """ENet weights must be finite and |w|.sum() = 1."""
-    signals, fwd_ret, _, _, _ = _make_signals()
+    signals, fwd_ret, _, _, _ = _make_positions()
     F = build_managed_returns(signals, fwd_ret)
     bw = enet_blend(F, alpha=0.01, l1_ratio=0.5)
     assert np.all(np.isfinite(bw.weights.values))
@@ -402,7 +402,7 @@ def test_enet_blend_finite():
 
 def test_enet_blend_non_negative():
     """With non_negative=True, all weights must be ≥ 0."""
-    signals, fwd_ret, _, _, _ = _make_signals()
+    signals, fwd_ret, _, _, _ = _make_positions()
     F = build_managed_returns(signals, fwd_ret)
     bw = enet_blend(F, alpha=0.001, l1_ratio=0.5, non_negative=True)
     assert np.all(bw.weights.values >= -1e-12)
@@ -446,7 +446,7 @@ def test_c_enet_selected_equal_weight():
 
 def test_c_enet_fallback_to_ew():
     """Very large alpha zeros all signals → fallback to equal weight."""
-    signals, fwd_ret, names, _, _ = _make_signals(K=3)
+    signals, fwd_ret, names, _, _ = _make_positions(K=3)
     F = build_managed_returns(signals, fwd_ret)
     bw = c_enet_blend(F, alpha=1e6, l1_ratio=0.5)
     assert bw.diagnostics["fallback"] is True
@@ -457,7 +457,7 @@ def test_c_enet_fallback_to_ew():
 
 def test_e_enet_selected_equal_weight():
     """Active signals after e_enet_blend should each receive weight 1/l."""
-    signals, fwd_ret, _, _, _ = _make_signals()
+    signals, fwd_ret, _, _, _ = _make_positions()
     F = build_managed_returns(signals, fwd_ret)
     bw = e_enet_blend(F, alpha=0.01, l1_ratio=0.8)
     active = [k for k, w in bw.weights.items() if abs(w) > 1e-8]
@@ -489,7 +489,7 @@ def test_inv_msfe_finite():
 
 def test_pcr_finite():
     """PCR blend must return finite weights and report var_explained."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=4)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4)
     F = build_managed_returns(signals, fwd_ret)
     bw = pcr_blend(F, n_components=2)
     assert np.all(np.isfinite(bw.weights.values))
@@ -498,7 +498,7 @@ def test_pcr_finite():
 
 def test_pls_finite():
     """PLS blend must return finite weights."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=4)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4)
     F = build_managed_returns(signals, fwd_ret)
     bw = pls_blend(F, n_components=2)
     assert np.all(np.isfinite(bw.weights.values))
@@ -508,7 +508,7 @@ def test_pls_finite():
 
 def test_winsorize_signals_clips():
     """After winsorization, no value should lie outside [q, 1-q] cross-sectional range."""
-    signals, _, names, _, _ = _make_signals(K=3, T=100)
+    signals, _, names, _, _ = _make_positions(K=3, T=100)
     q = 0.10
     wsig = winsorize_signals(signals, q=q)
     for name in names:
@@ -525,7 +525,7 @@ def test_winsorize_signals_clips():
 
 def test_pool_blend_mean():
     """Pooled mean weights must equal the per-signal average of input weights."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=4)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4)
     F = build_managed_returns(signals, fwd_ret)
     bw1 = sharpe_heuristic(F, power=1)
     bw2 = msrr_ridge(F, lam=0.01)
@@ -538,7 +538,7 @@ def test_pool_blend_mean():
 
 def test_pool_blend_methods():
     """Median and trimmed_mean pooling should produce finite weights."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=4)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4)
     F = build_managed_returns(signals, fwd_ret)
     blend_list = [sharpe_heuristic(F, p) for p in [1, 2]]
     for method in ("median", "trimmed_mean"):
@@ -550,7 +550,7 @@ def test_pool_blend_methods():
 
 def test_mlmsrr_huber_runs():
     """Huber objective should train without error and produce finite weights."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=3, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=3, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -565,7 +565,7 @@ def test_mlmsrr_huber_runs():
 
 def test_gbrt_blend_finite():
     """GBRTBlend.predict_weights must return a finite T × K DataFrame."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=3, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=3, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -579,7 +579,7 @@ def test_gbrt_blend_finite():
 
 def test_rf_blend_finite():
     """RandomForestBlend.predict_weights must return a finite T × K DataFrame."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=3, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=3, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -595,7 +595,7 @@ def test_rf_blend_finite():
 
 def test_linear_dynamic_blend_shape():
     """predict_weights must return T × K DataFrame with finite values."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=3, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=3, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -609,7 +609,7 @@ def test_linear_dynamic_blend_shape():
 
 def test_linear_dynamic_blend_no_lookahead():
     """Perturbing z after the midpoint must not change weights at earlier dates."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=3, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=3, T=200)
     F = build_managed_returns(signals, fwd_ret)
     z = build_state_features(F, lookback=21)
     common = F.index.intersection(z.dropna().index)
@@ -634,7 +634,7 @@ def test_linear_dynamic_blend_no_lookahead():
 
 def test_dma_blend_weights_sum_to_one():
     """DMA probability weights must sum to 1 on every date."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=4, T=200)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4, T=200)
     F = build_managed_returns(signals, fwd_ret)
 
     dma = DMABlend(alpha=0.99)
@@ -677,7 +677,7 @@ def test_dma_blend_forgetting():
 
 def test_stmom_output_range():
     """All STMOM positions must lie in (−1, 1)."""
-    signals, fwd_ret, _, _, tickers = _make_signals(K=3, T=150, N=10)
+    signals, fwd_ret, _, _, tickers = _make_positions(K=3, T=150, N=10)
     st = STMOM(n_signals=3, tau=1, hidden_size=0, n_epochs=5, seeds=[42])
     st.fit(signals, fwd_ret)
     pos = st.predict_positions(signals).dropna()
@@ -687,7 +687,7 @@ def test_stmom_output_range():
 
 def test_stmom_output_shape():
     """STMOM positions shape must match (T, N)."""
-    signals, fwd_ret, _, dates, tickers = _make_signals(K=3, T=150, N=10)
+    signals, fwd_ret, _, dates, tickers = _make_positions(K=3, T=150, N=10)
     st = STMOM(n_signals=3, tau=1, hidden_size=8, n_epochs=5, seeds=[42])
     st.fit(signals, fwd_ret)
     pos = st.predict_positions(signals)
@@ -696,7 +696,7 @@ def test_stmom_output_shape():
 
 def test_stmom_seed_reproducibility():
     """Same seed must produce identical positions."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=3, T=150, N=10)
+    signals, fwd_ret, _, _, _ = _make_positions(K=3, T=150, N=10)
 
     st1 = STMOM(n_signals=3, tau=1, hidden_size=0, n_epochs=5, seeds=[99])
     st1.fit(signals, fwd_ret)
@@ -713,7 +713,7 @@ def test_stmom_seed_reproducibility():
 
 def test_fit_static_extended():
     """Extended fit_static must include all new keys with finite weights."""
-    signals, fwd_ret, _, _, _ = _make_signals(K=4)
+    signals, fwd_ret, _, _, _ = _make_positions(K=4)
     result = fit_static(signals, fwd_ret)
     new_keys = {"enet", "lasso", "c_enet", "e_enet", "e_lasso", "inv_msfe", "pcr", "pls"}
     for key in new_keys:
