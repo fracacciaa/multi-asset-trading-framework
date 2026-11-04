@@ -22,6 +22,10 @@ Static blend methods (return BlendWeights):
     pcr_blend           — Principal Components Regression (Gu et al. 2020)
     pls_blend           — Partial Least Squares (Gu et al. 2020)
 
+Walk-forward evaluation:
+    walk_forward_blend  — re-estimate all static methods every N days over OOS period
+    compare_static_vs_wf — summary table: static IS/OOS Sharpe vs walk-forward OOS Sharpe
+
 Preprocessing utilities:
     winsorize_signals   — clip position values at cross-sectional quantile
     pool_blend          — ensemble pooling of multiple BlendWeights (Mekelburg & Strauss 2023)
@@ -258,6 +262,204 @@ def fit_static(
     result["pcr"] = pcr_blend(F, n_components=n_components)
     result["pls"] = pls_blend(F, n_components=n_components)
     return result
+
+
+# ── Walk-forward evaluation ────────────────────────────────────────────────────
+
+def _adaptive_alpha(F: pd.DataFrame) -> float:
+    """Data-adaptive ENet alpha = mean(diag(M)) * 0.01, M = F'F/T."""
+    return max(float(np.mean(F.values ** 2)) * 0.01, 1e-10)
+
+
+def _fit_all_on_F(
+    F_train: pd.DataFrame,
+    ridge_lam: float = 0.01,
+    enet_l1_ratio: float = 0.5,
+    n_components: int = 2,
+    alpha: Optional[float] = None,
+) -> dict[str, BlendWeights]:
+    """
+    Fit all static blend methods on a pre-built managed-return DataFrame.
+
+    alpha defaults to the data-adaptive value (_adaptive_alpha) if not supplied.
+    Exceptions per method are silently swallowed so a single bad window never
+    aborts the whole walk-forward loop.
+    """
+    if alpha is None:
+        alpha = _adaptive_alpha(F_train)
+    names = list(F_train.columns)
+    _BUILDERS = {
+        "equal_weight": lambda: equal_weight(names),
+        "sh_p1":        lambda: sharpe_heuristic(F_train, power=1),
+        "sh_p2":        lambda: sharpe_heuristic(F_train, power=2),
+        "msrr_ols":     lambda: msrr_ridge(F_train, lam=0.0),
+        "msrr_ridge":   lambda: msrr_ridge(F_train, lam=ridge_lam),
+        "enet":         lambda: enet_blend(F_train, alpha=alpha, l1_ratio=enet_l1_ratio),
+        "lasso":        lambda: enet_blend(F_train, alpha=alpha, l1_ratio=1.0),
+        "c_enet":       lambda: c_enet_blend(F_train, alpha=alpha, l1_ratio=enet_l1_ratio),
+        "e_enet":       lambda: e_enet_blend(F_train, alpha=alpha, l1_ratio=enet_l1_ratio),
+        "e_lasso":      lambda: e_enet_blend(F_train, alpha=alpha, l1_ratio=1.0),
+        "inv_msfe":     lambda: inv_msfe_blend(F_train),
+        "pcr":          lambda: pcr_blend(F_train, n_components=n_components),
+        "pls":          lambda: pls_blend(F_train, n_components=n_components),
+    }
+    out: dict[str, BlendWeights] = {}
+    for name, fn in _BUILDERS.items():
+        try:
+            out[name] = fn()
+        except Exception:
+            pass
+    return out
+
+
+def walk_forward_blend(
+    F: pd.DataFrame,
+    is_end: str,
+    refit_freq: int = 63,
+    window_type: str = "expanding",
+    rolling_window: int = 756,
+    ridge_lam: float = 0.01,
+    enet_l1_ratio: float = 0.5,
+    n_components: int = 2,
+    adaptive_alpha: bool = True,
+    enet_alpha: float = 0.01,
+) -> dict[str, pd.Series]:
+    """
+    Walk-forward evaluation of all static blend methods.
+
+    At each refit step, re-fits every static method on the available training
+    window (expanding from is_end, or rolling of length rolling_window rows),
+    holds the resulting weights for the next refit_freq OOS days, then moves
+    the window forward and repeats.
+
+    Parameters
+    ----------
+    F             : T × K DataFrame of managed returns (output of build_managed_returns)
+    is_end        : Last date of the initial in-sample window (e.g. "2020-12-31")
+    refit_freq    : Re-estimate every N trading days (default 63 ≈ quarterly)
+    window_type   : "expanding" (all history up to t) or "rolling" (last rolling_window rows)
+    rolling_window: Training rows for rolling window (ignored when window_type="expanding")
+    ridge_lam     : Lambda for msrr_ridge
+    enet_l1_ratio : ElasticNet l1_ratio
+    n_components  : n_components for PCR and PLS
+    adaptive_alpha: Use data-adaptive ENet alpha = mean(diag(M))*0.01 per window
+    enet_alpha    : Fixed alpha if adaptive_alpha=False
+
+    Returns
+    -------
+    dict[str, pd.Series]
+        method → managed portfolio return series over the OOS period.
+        NaN where a method could not be estimated for a given window.
+    """
+    F_oos = F.loc[F.index > is_end]
+    if len(F_oos) == 0:
+        raise ValueError(f"No OOS data after is_end={is_end!r}.")
+
+    _METHODS = [
+        "equal_weight", "sh_p1", "sh_p2", "msrr_ols", "msrr_ridge",
+        "enet", "lasso", "c_enet", "e_enet", "e_lasso", "inv_msfe", "pcr", "pls",
+    ]
+    n_oos = len(F_oos)
+    col_idx = {m: i for i, m in enumerate(_METHODS)}
+    ret_mat = np.full((n_oos, len(_METHODS)), np.nan)
+
+    oos_dates = F_oos.index
+    refit_points = list(range(0, n_oos, refit_freq))
+
+    for step, start_i in enumerate(refit_points):
+        end_i = refit_points[step + 1] if step + 1 < len(refit_points) else n_oos
+        train_cutoff = oos_dates[start_i]   # first date of this OOS segment
+
+        if window_type == "expanding":
+            F_train = F.loc[F.index < train_cutoff]
+        else:  # rolling
+            F_before = F.loc[F.index < train_cutoff]
+            F_train = F_before.iloc[-rolling_window:]
+
+        if len(F_train) < 20:
+            continue
+
+        alpha = _adaptive_alpha(F_train) if adaptive_alpha else enet_alpha
+        weights = _fit_all_on_F(F_train, ridge_lam, enet_l1_ratio, n_components, alpha)
+
+        F_period = F_oos.iloc[start_i:end_i].values   # (period, K)
+        for m, bw in weights.items():
+            if m not in col_idx:
+                continue
+            b = bw.weights.reindex(F.columns).fillna(0.0).values
+            ret_mat[start_i:end_i, col_idx[m]] = F_period @ b
+
+    return {
+        m: pd.Series(ret_mat[:, col_idx[m]], index=oos_dates, name=m)
+        for m in _METHODS
+    }
+
+
+def compare_static_vs_wf(
+    F: pd.DataFrame,
+    is_end: str,
+    refit_freqs: list[int] = (63, 252),
+    window_type: str = "expanding",
+    rolling_window: int = 756,
+    ridge_lam: float = 0.01,
+    enet_l1_ratio: float = 0.5,
+    n_components: int = 2,
+    adaptive_alpha: bool = True,
+    enet_alpha: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Summary table comparing single-window static Sharpes vs walk-forward OOS Sharpes.
+
+    Fits each static blend method once on [start, is_end] and computes OOS Sharpe
+    with weights held fixed, then recomputes OOS Sharpe under walk-forward
+    re-estimation for each frequency in refit_freqs.
+
+    Parameters mirror walk_forward_blend; refit_freqs is a list of periods to compare.
+
+    Returns
+    -------
+    pd.DataFrame indexed by method, columns:
+        IS_sr          : annualised IS Sharpe (static fit on [start, is_end])
+        OOS_static_sr  : annualised OOS Sharpe with weights frozen at is_end
+        OOS_wf_{f}d_sr : annualised walk-forward OOS Sharpe, re-fit every f days
+    Sorted by OOS_static_sr descending.
+    """
+    F_is  = F.loc[F.index <= is_end]
+    F_oos = F.loc[F.index >  is_end]
+
+    def _ann_sr(s: pd.Series) -> float:
+        s = s.dropna()
+        return float(s.mean() / s.std() * np.sqrt(252)) if len(s) > 1 else np.nan
+
+    alpha_is = _adaptive_alpha(F_is) if adaptive_alpha else enet_alpha
+    static_w = _fit_all_on_F(F_is, ridge_lam, enet_l1_ratio, n_components, alpha_is)
+
+    rows: dict[str, dict] = {}
+    for m, bw in static_w.items():
+        b = bw.weights.reindex(F.columns).fillna(0.0).values
+        rows[m] = {
+            "IS_sr":         _ann_sr(pd.Series(F_is.values  @ b, index=F_is.index)),
+            "OOS_static_sr": _ann_sr(pd.Series(F_oos.values @ b, index=F_oos.index)),
+        }
+
+    for freq in refit_freqs:
+        wf = walk_forward_blend(
+            F, is_end,
+            refit_freq=freq,
+            window_type=window_type,
+            rolling_window=rolling_window,
+            ridge_lam=ridge_lam,
+            enet_l1_ratio=enet_l1_ratio,
+            n_components=n_components,
+            adaptive_alpha=adaptive_alpha,
+            enet_alpha=enet_alpha,
+        )
+        col = f"OOS_wf_{freq}d_sr"
+        for m, ret_s in wf.items():
+            if m in rows:
+                rows[m][col] = _ann_sr(ret_s)
+
+    return pd.DataFrame(rows).T.sort_values("OOS_static_sr", ascending=False)
 
 
 # ── ML MSRR ────────────────────────────────────────────────────────────────────

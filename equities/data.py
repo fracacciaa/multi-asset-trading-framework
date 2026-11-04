@@ -119,6 +119,27 @@ def fetch_universe(path: str = "/Users/francescocaccia/Downloads/EQH saved.xlsx"
     return list(_cached_load(path)["prices"].columns)
 
 
+def load_managed_returns() -> pd.DataFrame:
+    """
+    Load the pre-computed managed returns from cache.
+
+    Returns the T × 4 DataFrame (momentum, tsmom, mean_reversion, carry) built by
+    build_vf_positions → build_managed_returns and saved to equities/cache/.
+    Use equities.config.IS_END to slice IS / OOS windows.
+
+    Raises FileNotFoundError if the cache does not exist — run:
+        python -m equities.cache_managed_returns
+    to regenerate it.
+    """
+    from equities.config import MANAGED_RETURNS_PATH
+    if not os.path.exists(MANAGED_RETURNS_PATH):
+        raise FileNotFoundError(
+            f"Managed returns cache not found at {MANAGED_RETURNS_PATH!r}. "
+            "Run: python -m equities.cache_managed_returns"
+        )
+    return pd.read_parquet(MANAGED_RETURNS_PATH)
+
+
 def _slice(
     df: pd.DataFrame,
     tickers: Optional[list],
