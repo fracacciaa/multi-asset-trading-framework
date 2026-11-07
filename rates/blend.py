@@ -65,6 +65,9 @@ SIGNAL_FILES: dict[str, str] = {
     "mean_reversion": "mean_reversion_pnl.parquet",
 }
 
+IS_END    = "2018-12-31"
+OOS_START = "2019-01-01"
+
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
@@ -143,3 +146,69 @@ def combined_return(
             r = r + w[k] * F[k]
     r.name = "combined"
     return r
+
+
+def fit_lasso_blend(
+    F_train: pd.DataFrame,
+    alpha: float = 0.01,
+) -> "BlendWeights":
+    """
+    Fit LASSO blend weights on a training window.
+
+    F_train must be vol-normalised before calling (use vol_normalise).
+    LASSO (l1_ratio=1) selects the dominant signal(s) and zeros out the rest.
+    alpha=0.01 is the default penalty strength; increase to force more sparsity.
+    """
+    return enet_blend(F_train, alpha=alpha, l1_ratio=1.0)
+
+
+def vol_normalise(
+    F_train: pd.DataFrame,
+    F_apply: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Scale each signal column to unit annualised vol using training-window σ only.
+
+    Prevents the blend estimator from being dominated by the highest-variance
+    signal (momentum operates on a ~1000× larger PnL scale than MR).
+    Returns (F_train_normalised, F_apply_normalised).
+    """
+    sigma = F_train.std() * np.sqrt(252)
+    sigma = sigma.replace(0.0, np.nan)
+    return F_train.div(sigma), F_apply.div(sigma)
+
+
+def run_blend(
+    signals_dir: Optional[str | Path] = None,
+    alpha: float = 0.01,
+) -> dict:
+    """
+    Canonical rates blend pipeline.
+
+    Loads managed returns, vol-normalises, fits LASSO on IS, returns
+    weights and combined OOS return series.
+
+    Returns
+    -------
+    dict with keys:
+        weights     BlendWeights fitted on IS
+        F_is        vol-normalised IS managed returns (T_is × K)
+        F_oos       vol-normalised OOS managed returns (T_oos × K)
+        r_is        combined IS return series
+        r_oos       combined OOS return series
+    """
+    F = load_managed_returns(signals_dir=signals_dir)
+    F_is_raw  = F.loc[F.index <= IS_END]
+    F_oos_raw = F.loc[F.index >= OOS_START]
+
+    F_is, F_oos = vol_normalise(F_is_raw, F_oos_raw)
+
+    weights = fit_lasso_blend(F_is, alpha=alpha)
+
+    return {
+        "weights": weights,
+        "F_is":    F_is,
+        "F_oos":   F_oos,
+        "r_is":    combined_return(F_is,  weights),
+        "r_oos":   combined_return(F_oos, weights),
+    }
