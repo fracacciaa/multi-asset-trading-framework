@@ -212,3 +212,59 @@ def run_blend(
         "r_is":    combined_return(F_is,  weights),
         "r_oos":   combined_return(F_oos, weights),
     }
+
+
+def run_rates_blend(
+    markets: list[str] | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    alpha: float = 0.01,
+    rebuild_signals: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """
+    Full rates pipeline: build signals → LASSO blend.
+
+    Step 1 — Signal pipeline (rates/production/run.py):
+        Fetches OIS curves, computes momentum, carry and mean_reversion PnL
+        parquets and writes them to rates/signals/.  Skipped when
+        rebuild_signals=False and all three PnL parquets already exist.
+
+    Step 2 — Blend (rates/blend.run_blend):
+        Loads the three PnL parquets, vol-normalises to unit annual vol using
+        IS σ, fits LASSO on IS data, applies weights to OOS.
+
+    Parameters
+    ----------
+    markets         OIS markets to include (default: all 11).
+    start / end     Date range for the signal pipeline (default: full history).
+    alpha           LASSO penalty strength (default 0.01).
+    rebuild_signals Force re-run of the signal pipeline even if parquets exist.
+    verbose         Print progress from the signal pipeline.
+
+    Returns
+    -------
+    dict with keys:
+        weights     BlendWeights (LASSO, fitted on IS)
+        F_is        vol-normalised IS managed returns (T_is × 3)
+        F_oos       vol-normalised OOS managed returns (T_oos × 3)
+        r_is        combined IS return series
+        r_oos       combined OOS return series
+    """
+    from rates.production.run import run as _run_signals, OUTPUT_DIR
+
+    pnl_paths = [OUTPUT_DIR / f for f in SIGNAL_FILES.values()]
+    needs_build = rebuild_signals or not all(p.exists() for p in pnl_paths)
+
+    if needs_build:
+        if verbose:
+            missing = [p.name for p in pnl_paths if not p.exists()]
+            if missing:
+                print(f"Missing parquets: {missing} — running signal pipeline...")
+            else:
+                print("rebuild_signals=True — re-running signal pipeline...")
+        _run_signals(markets=markets, start=start, end=end, verbose=verbose)
+    elif verbose:
+        print("Signal parquets found — skipping rebuild. Pass rebuild_signals=True to refresh.")
+
+    return run_blend(alpha=alpha)
