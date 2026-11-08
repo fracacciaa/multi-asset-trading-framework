@@ -58,6 +58,7 @@ from equities.blend import (                                        # noqa: F401
     RandomForestBlend,
     DMABlend,
     STMOM,
+    RollingMSRR,
 )
 
 # ── FX-specific constants ─────────────────────────────────────────────────────
@@ -233,32 +234,52 @@ def load_monthly_managed_returns(
     return F
 
 
+def combined_return_rolling(
+    F: pd.DataFrame,
+    weights_history: pd.DataFrame,
+) -> pd.Series:
+    """
+    Apply time-varying blend weights to the managed-return matrix.
+
+    At each t, weights are normalised to sum to 1 in absolute value.
+    Dates where weights are NaN (warm-up period) are dropped.
+    """
+    idx = F.index.intersection(weights_history.dropna().index)
+    w = weights_history.loc[idx]
+    row_norm = w.abs().sum(axis=1).replace(0.0, np.nan)
+    w = w.div(row_norm, axis=0)
+    return (F.loc[idx] * w).sum(axis=1).rename("combined")
+
+
 def run_fx_blend(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
-    alpha: float = 0.01,
+    lookback: int = 36,
+    min_obs: int = 24,
 ) -> dict:
     """
-    Canonical FX blend pipeline: monthly managed returns → LASSO blend.
+    Canonical FX blend pipeline: monthly managed returns → rolling OLS MSRR.
 
     Loads the three production signal managed returns, vol-normalises to unit
-    annual vol using IS σ only (no look-ahead), fits LASSO on IS data, and
-    applies the weights to both splits.
+    annual vol using IS σ only (no look-ahead), fits a rolling OLS MSRR on IS
+    data (lookback=36m), and predicts weights on OOS.
 
     Parameters
     ----------
     signals_dir   Directory containing the parquet files.  Default: fx/signals/.
     is_end        Last date of the in-sample period.  Default: "2020-12-31".
-    alpha         LASSO penalty strength.  Default: 0.01.
+    lookback      Rolling window length in months.  Default: 36.
+    min_obs       Minimum observations before weights are produced.  Default: 24.
 
     Returns
     -------
     dict with keys:
-        weights     BlendWeights (LASSO, fitted on IS)
-        F_is        vol-normalised IS managed returns  (T_is × 3, monthly)
-        F_oos       vol-normalised OOS managed returns (T_oos × 3, monthly)
-        r_is        combined IS return series  (monthly)
-        r_oos       combined OOS return series (monthly)
+        weights_history   DataFrame of time-varying IS blend weights  (T_is × 3)
+        weights_oos       DataFrame of time-varying OOS blend weights (T_oos × 3)
+        F_is              vol-normalised IS managed returns  (T_is × 3, monthly)
+        F_oos             vol-normalised OOS managed returns (T_oos × 3, monthly)
+        r_is              combined IS return series  (monthly)
+        r_oos             combined OOS return series (monthly)
     """
     F = load_monthly_managed_returns(signals_dir=signals_dir)
     F_is_raw  = F.loc[F.index <= is_end]
@@ -269,12 +290,16 @@ def run_fx_blend(
     F_is  = F_is_raw.div(sigma)
     F_oos = F_oos_raw.div(sigma)
 
-    weights = enet_blend(F_is, alpha=alpha, l1_ratio=1.0)
+    model = RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)
+    model.fit(F_is)
+    w_is  = model._weights_history
+    w_oos = model.predict_weights(F_oos)
 
     return {
-        "weights": weights,
-        "F_is":    F_is,
-        "F_oos":   F_oos,
-        "r_is":    combined_return(F_is,  weights),
-        "r_oos":   combined_return(F_oos, weights),
+        "weights_history": w_is,
+        "weights_oos":     w_oos,
+        "F_is":            F_is,
+        "F_oos":           F_oos,
+        "r_is":            combined_return_rolling(F_is,  w_is),
+        "r_oos":           combined_return_rolling(F_oos, w_oos),
     }

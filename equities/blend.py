@@ -186,6 +186,88 @@ def msrr_ridge(F: pd.DataFrame, lam: float = 0.0) -> BlendWeights:
     )
 
 
+def msrr_lasso(F: pd.DataFrame, lam: float = 0.01) -> BlendWeights:
+    """
+    LASSO MSRR: b = argmin (1/2T)||Fb - 1||_2^2 + lam * ||b||_1.
+
+    Identical to enet_blend(alpha=lam, l1_ratio=1.0) -- presented as a sibling
+    to msrr_ridge so all three penalties (OLS / Ridge / LASSO) share one API.
+    lam is on the same scale as ridge's lam.
+    """
+    bw = enet_blend(F, alpha=lam, l1_ratio=1.0)
+    return BlendWeights(bw.weights, "msrr_lasso", {"lambda": lam})
+
+
+class RollingMSRR:
+    """
+    Rolling-window MSRR: refit at every time step on the last `lookback`
+    observations.  Produces time-varying blend weights with no look-ahead.
+
+    penalty:
+        "ols"   — b_t = M_t^{-1} μ_t  (no regularisation, via lstsq)
+        "ridge" — b_t = (M_t + λI)^{-1} μ_t
+        "lasso" — LASSO (enet l1_ratio=1) refitted on the rolling window
+
+    The first `min_obs` time steps return no weights (NaN rows) while the
+    window is warming up.  Downstream _dynamic_return() already handles NaN
+    rows via dropna(), so no special casing is needed.
+    """
+
+    def __init__(
+        self,
+        penalty: str = "ridge",
+        lam: float = 0.01,
+        alpha: float = 0.01,
+        lookback: int = 36,
+        min_obs: int = 24,
+    ):
+        if penalty not in ("ols", "ridge", "lasso"):
+            raise ValueError(f"penalty must be 'ols', 'ridge', or 'lasso', got {penalty!r}")
+        self.penalty  = penalty
+        self.lam      = lam
+        self.alpha    = alpha
+        self.lookback = lookback
+        self.min_obs  = min_obs
+        self._weights_history: Optional[pd.DataFrame] = None
+
+    def _roll(self, F: pd.DataFrame) -> pd.DataFrame:
+        cols = list(F.columns)
+        K    = len(cols)
+        rows: dict = {}
+
+        for i in range(len(F)):
+            start  = max(0, i - self.lookback)
+            window = F.iloc[start:i]          # excludes t → no look-ahead
+            if len(window) < self.min_obs:
+                continue
+
+            if self.penalty == "lasso":
+                bw = enet_blend(window, alpha=self.alpha, l1_ratio=1.0)
+                rows[F.index[i]] = bw.weights
+            else:
+                Fv = window.values.astype(float)
+                mu = Fv.mean(axis=0)
+                M  = Fv.T @ Fv / len(Fv)
+                lam = 0.0 if self.penalty == "ols" else self.lam
+                A   = M + lam * np.eye(K)
+                try:
+                    b = np.linalg.lstsq(A, mu, rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    continue
+                rows[F.index[i]] = pd.Series(b, index=cols)
+
+        if not rows:
+            return pd.DataFrame(columns=cols)
+        return pd.DataFrame(rows).T
+
+    def fit(self, F_train: pd.DataFrame) -> "RollingMSRR":
+        self._weights_history = self._roll(F_train)
+        return self
+
+    def predict_weights(self, F_new: pd.DataFrame) -> pd.DataFrame:
+        return self._roll(F_new)
+
+
 # ── Applying blend weights ──────────────────────────────────────────────────────
 
 def combine_signals(
@@ -1055,8 +1137,15 @@ class LinearDynamicBlend:
     whether state-conditioned *linear* weighting helps before going nonlinear.
     """
 
-    def __init__(self, ridge_lam: float = 0.01):
+    def __init__(
+        self,
+        ridge_lam: float = 0.01,
+        penalty: str = "ridge",
+        lasso_alpha: float = 0.01,
+    ):
         self.ridge_lam = ridge_lam
+        self.penalty = penalty
+        self.lasso_alpha = lasso_alpha
         self._gamma0: Optional[np.ndarray] = None   # (K,)
         self._gamma1: Optional[np.ndarray] = None   # (K, D_z)
         self._signal_names: Optional[list[str]] = None
@@ -1076,13 +1165,23 @@ class LinearDynamicBlend:
 
         y = np.ones(T)
         n_feat = X.shape[1]
-        lam = self.ridge_lam * K
-        A = X.T @ X / T + lam * np.eye(n_feat)
-        b_rhs = X.T @ y / T
-        theta, _, _, _ = np.linalg.lstsq(A, b_rhs, rcond=None)
 
-        self._gamma0 = theta[:K]                # (K,)
-        self._gamma1 = theta[K:].reshape(K, D_z)  # (K, D_z)
+        if self.penalty == "lasso":
+            from sklearn.linear_model import ElasticNet
+            reg = ElasticNet(
+                alpha=self.lasso_alpha, l1_ratio=1.0,
+                fit_intercept=False, max_iter=10_000,
+            )
+            reg.fit(X, y)
+            theta = reg.coef_
+        else:
+            lam = self.ridge_lam * K if self.penalty == "ridge" else 0.0
+            A = X.T @ X / T + lam * np.eye(n_feat)
+            b_rhs = X.T @ y / T
+            theta, _, _, _ = np.linalg.lstsq(A, b_rhs, rcond=None)
+
+        self._gamma0 = theta[:K]                   # (K,)
+        self._gamma1 = theta[K:].reshape(K, D_z)   # (K, D_z)
         return self
 
     def predict_weights(self, z: pd.DataFrame) -> pd.DataFrame:

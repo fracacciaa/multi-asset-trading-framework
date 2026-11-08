@@ -204,6 +204,7 @@ def main() -> None:
         build_state_features,
         DMABlend, LinearDynamicBlend,
         GBRTBlend, RandomForestBlend, MLMSRR, STMOM,
+        RollingMSRR,
     )
 
     names = list(F_is_n.columns)
@@ -400,6 +401,25 @@ def main() -> None:
                          _dynamic_return(F_oos_n, w_oos),
                          w_is, w_oos, is_static=False))
 
+    # ── rolling MSRR variants ─────────────────────────────────────────────────
+    rolling_msrr_cfgs = {
+        "roll_msrr_ols":   dict(penalty="ols",   lam=0.0,  lookback=36, min_obs=24),
+        "roll_msrr_ridge": dict(penalty="ridge",  lam=0.01, lookback=36, min_obs=24),
+        "roll_msrr_lasso": dict(penalty="lasso",  alpha=0.01, lookback=36, min_obs=24),
+    }
+    rolling_msrr_weights: dict[str, tuple] = {}
+    for label, cfg in rolling_msrr_cfgs.items():
+        print(f"Fitting {label} …")
+        m = RollingMSRR(**cfg)
+        m.fit(F_is_n)
+        rolling_msrr_weights[label] = (m._weights_history, m.predict_weights(F_oos_n))
+
+    for label, (w_is, w_oos) in rolling_msrr_weights.items():
+        rows.append(_row(label, "rolling",
+                         _dynamic_return(F_is_n, w_is),
+                         _dynamic_return(F_oos_n, w_oos),
+                         w_is, w_oos, is_static=False))
+
     # STMOM (direct position model, PnL already vol-normalised above)
     rows.append({
         "method": "stmom", "type": "dynamic",
@@ -447,6 +467,37 @@ def main() -> None:
 
     print("=" * W)
     print("  MDD in vol-normalised return units  |  TO = annual one-way (blended positions)\n")
+
+    # ── MSRR comparison: static vs rolling ───────────────────────────────────
+    msrr_compare = {
+        "msrr_ols   (static)":  next(r for r in rows if r["method"] == "msrr_ols"),
+        "msrr_ridge (static)":  next(r for r in rows if r["method"] == "msrr_ridge"),
+        "msrr_lasso (static)":  next(r for r in rows if r["method"] == "lasso"),
+        "msrr_ols   (rolling)": next(r for r in rows if r["method"] == "roll_msrr_ols"),
+        "msrr_ridge (rolling)": next(r for r in rows if r["method"] == "roll_msrr_ridge"),
+        "msrr_lasso (rolling)": next(r for r in rows if r["method"] == "roll_msrr_lasso"),
+    }
+    CW = 86
+    print()
+    print("=" * CW)
+    print("  MSRR COMPARISON  static vs rolling (lookback=36m, min_obs=24m)")
+    print("=" * CW)
+    print(f"  {'Method':<24}  {'Type':<8}  {'IS':>26}   {'OOS':>26}")
+    print(f"  {'':24}  {'':8}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}   {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
+    print("  " + "─" * (CW - 2))
+    prev_type = None
+    for label, r in msrr_compare.items():
+        typ = r["type"]
+        if prev_type is not None and typ != prev_type:
+            print("  " + "─" * (CW - 2))
+        prev_type = typ
+        print(
+            f"  {label:<24}  {typ:<8}  "
+            f"{_fs(r['IS_Sharpe']):>7}  {_fm(r['IS_MDD']):>8}  {_ft(r['IS_TO']):>7}   "
+            f"{_fs(r['OOS_Sharpe']):>7}  {_fm(r['OOS_MDD']):>8}  {_ft(r['OOS_TO']):>7}"
+        )
+    print("=" * CW)
+    print()
 
     # ── weights table (static only) ───────────────────────────────────────────
     col_w = 14
