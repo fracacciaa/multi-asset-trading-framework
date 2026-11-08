@@ -182,3 +182,99 @@ def combined_return(
             r = r + w[k] * F[k]
     r.name = "combined"
     return r
+
+
+# ── Monthly 3-signal blend pipeline ──────────────────────────────────────────
+
+IS_END    = "2020-12-31"
+OOS_START = "2021-01-01"
+
+
+def load_monthly_managed_returns(
+    signals_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    """
+    Build the monthly managed-return matrix F (T × 3) for the three
+    production FX signals used in the blend pipeline.
+
+    Signals:
+        momentum   Momentum XS f=9m h=1       (monthly weights, shift(1) → rx_m)
+        mr_ns_loo  MR NS-LOO monthly VF-TS    (daily positions  → rx_d → monthly sum)
+        carry_xs   Carry XS monthly            (monthly weights, shift(1) → rx_m)
+
+    carry_dupuy is excluded: it has 0.82 IS / 0.79 OOS correlation with carry_xs.
+
+    Returns
+    -------
+    pd.DataFrame, shape (T, 3), monthly frequency (BME index).
+    """
+    sdir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+    rx_m = pd.read_parquet(sdir / "returns.parquet")["rx_m"]
+    rx_d = pd.read_parquet(sdir / _RX_FILE)
+
+    w_mom = pd.read_parquet(sdir / "signal_a_f9_h1.parquet")
+    pnl_mom = (w_mom.shift(1) * rx_m.reindex(columns=w_mom.columns)).sum(axis=1)
+
+    pos_mr = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+    pnl_mr = (
+        (pos_mr * rx_d.reindex(columns=pos_mr.columns)).sum(axis=1)
+        .resample("BME").sum()
+    )
+
+    w_cxs = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
+    pnl_cxs = (w_cxs.shift(1) * rx_m.reindex(columns=w_cxs.columns)).sum(axis=1)
+
+    F = pd.DataFrame({
+        "momentum":  pnl_mom,
+        "mr_ns_loo": pnl_mr,
+        "carry_xs":  pnl_cxs,
+    }).dropna()
+    F.index.name = "date"
+    return F
+
+
+def run_fx_blend(
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    alpha: float = 0.01,
+) -> dict:
+    """
+    Canonical FX blend pipeline: monthly managed returns → LASSO blend.
+
+    Loads the three production signal managed returns, vol-normalises to unit
+    annual vol using IS σ only (no look-ahead), fits LASSO on IS data, and
+    applies the weights to both splits.
+
+    Parameters
+    ----------
+    signals_dir   Directory containing the parquet files.  Default: fx/signals/.
+    is_end        Last date of the in-sample period.  Default: "2020-12-31".
+    alpha         LASSO penalty strength.  Default: 0.01.
+
+    Returns
+    -------
+    dict with keys:
+        weights     BlendWeights (LASSO, fitted on IS)
+        F_is        vol-normalised IS managed returns  (T_is × 3, monthly)
+        F_oos       vol-normalised OOS managed returns (T_oos × 3, monthly)
+        r_is        combined IS return series  (monthly)
+        r_oos       combined OOS return series (monthly)
+    """
+    F = load_monthly_managed_returns(signals_dir=signals_dir)
+    F_is_raw  = F.loc[F.index <= is_end]
+    F_oos_raw = F.loc[F.index >  is_end]
+
+    sigma = F_is_raw.std() * np.sqrt(12)
+    sigma = sigma.replace(0.0, np.nan)
+    F_is  = F_is_raw.div(sigma)
+    F_oos = F_oos_raw.div(sigma)
+
+    weights = enet_blend(F_is, alpha=alpha, l1_ratio=1.0)
+
+    return {
+        "weights": weights,
+        "F_is":    F_is,
+        "F_oos":   F_oos,
+        "r_is":    combined_return(F_is,  weights),
+        "r_oos":   combined_return(F_oos, weights),
+    }
