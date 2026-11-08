@@ -38,6 +38,8 @@ _DEFAULT_PARAMS = {
     "use_rank":    False,
     "use_grinold": True,
     "use_demean":  True,
+    "use_ortho":   True,
+    "use_tanh":    True,
 }
 
 
@@ -73,6 +75,8 @@ class ViewFormationXS:
         self.use_rank    = p["use_rank"]
         self.use_grinold = p["use_grinold"]
         self.use_demean  = p["use_demean"]
+        self.use_ortho   = p["use_ortho"]
+        self.use_tanh    = p["use_tanh"]
 
         # Align signal and covariance to common tickers
         common = signal.dropna().index.intersection(cov.index)
@@ -151,17 +155,20 @@ class ViewFormationXS:
             s = s / idio_vols.reindex(s.index).replace(0, np.nan)
             s = s.dropna()
 
-        # Steps 6 + 9 share the same orthogonalization
-        s = self._orthogonalize(s, betas.reindex(s.index))
+        # Step 6: Orthogonalize to market beta
+        if self.use_ortho:
+            s = self._orthogonalize(s, betas.reindex(s.index))
 
         # Step 7: Z-score pre-tanh
         s = self._zscore(s)
 
         # Step 8: tanh compression
-        s = np.tanh(s * self.tanh_scale)
+        if self.use_tanh:
+            s = np.tanh(s * self.tanh_scale)
 
         # Step 9: Re-orthogonalize
-        s = self._orthogonalize(s, betas.reindex(s.index))
+        if self.use_ortho:
+            s = self._orthogonalize(s, betas.reindex(s.index))
 
         # Step 10: Normalize to 2× leverage
         s = self._normalize_leverage(s)

@@ -28,7 +28,6 @@ from commodities.data import (
 from commodities.signals import (
     COMMODITY_SECTORS,
     tsmom,
-    xs_carry,
     xs_carry_enhanced,
     curve_curvature,
 )
@@ -286,10 +285,6 @@ def _build_signals(
 
     sigs["tsmom_252"] = tsmom(prices, lookbacks=(252,), mode=p["mode"], clip=p["clip"])
 
-    sigs["xs_carry_f1f2"] = xs_carry(
-        F1, F2, tenor=tenor_12,
-    ).reindex(columns=prices.columns)
-
     sigs["xs_carry_enh_f1f2"] = xs_carry_enhanced(
         F1.reindex(columns=prices.columns),
         F2.reindex(columns=prices.columns),
@@ -426,3 +421,71 @@ def run_comparison(
     # Sort by Sharpe descending
     result = result.sort_values("sharpe", ascending=False)
     return result
+
+
+# ── IS / OOS signal evaluation ────────────────────────────────────────────────
+
+def run_comm_signals(
+    is_end: str = "2020-12-31",
+    params: dict = PARAMS,
+    include_power: bool = False,
+) -> pd.DataFrame:
+    """
+    IS / OOS Sharpe, max drawdown, and annual turnover for each production signal.
+
+    IS : start → is_end (inclusive)
+    OOS: is_end + 1d  → present
+
+    Signals: tsmom_252, xs_carry_f1f2, xs_carry_enh_f1f2, curvature, ns_nullspace_b.
+    Returns a DataFrame indexed by signal with columns:
+        IS_sharpe, IS_maxdd, IS_to_pa, OOS_sharpe, OOS_maxdd, OOS_to_pa
+    sorted by OOS_sharpe descending.
+    """
+    p = params
+    ts_cut = pd.Timestamp(is_end)
+
+    # ── Load data ──────────────────────────────────────────────────────────────
+    prices_gen = fetch_prices()
+    ts_gen     = fetch_term_structure()
+    tk_gen     = fetch_tickers()
+
+    if include_power:
+        prices_pw = fetch_prices_power()
+        ts_pw     = fetch_term_structure_power()
+        tk_pw     = fetch_tickers_power()
+        prices = pd.concat([prices_gen, prices_pw], axis=1).sort_index()
+        ts     = {k: pd.concat([ts_gen[k], ts_pw[k]], axis=1).sort_index() for k in ts_gen}
+        tk     = {k: pd.concat([tk_gen[k], tk_pw.get(k, pd.DataFrame())], axis=1).sort_index()
+                  for k in tk_gen}
+    else:
+        prices, ts, tk = prices_gen, ts_gen, tk_gen
+
+    returns = specific_contract_returns(ts, tk).reindex(columns=prices.columns)
+    raw_signals = _build_signals(prices, ts, tk, p)
+
+    # ── Directional signals ───────────────────────────────────────────────────
+    rows: dict[str, dict] = {}
+    for label, raw_sig in raw_signals.items():
+        sig = raw_sig.reindex(index=returns.index, columns=returns.columns)
+        w = vol_scale(sig, returns, target_vol=p["asset_vol"], com=p["vol_com"])
+        w = rebalance(w, rule=p["rebal"])
+        w = book_scale(w, returns, target_vol=p["book_vol"], cov_hl=p["cov_hl"], k_max=p["k_max"])
+        bt = run_backtest(w, returns, lag=p["lag"], cost_bps=p["cost_bps"])
+
+        pnl = bt["pnl"]
+        to  = bt["turnover"]
+        pnl_is, pnl_oos = pnl[pnl.index <= ts_cut], pnl[pnl.index > ts_cut]
+        to_is,  to_oos  = to[to.index   <= ts_cut], to[to.index  > ts_cut]
+
+        rows[label] = {
+            "IS_sharpe":  sharpe(pnl_is),
+            "IS_maxdd":   max_drawdown(pnl_is),
+            "IS_to_pa":   float(to_is.mean() * TD),
+            "OOS_sharpe": sharpe(pnl_oos),
+            "OOS_maxdd":  max_drawdown(pnl_oos),
+            "OOS_to_pa":  float(to_oos.mean() * TD),
+        }
+
+    result = pd.DataFrame(rows).T
+    result.index.name = "signal"
+    return result.sort_values("OOS_sharpe", ascending=False)

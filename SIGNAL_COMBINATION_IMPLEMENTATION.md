@@ -1,4 +1,4 @@
-# Agent Implementation Specification: Multi-Asset Signal Combination and Risk-Aware Portfolio Construction
+    # Agent Implementation Specification: Multi-Asset Signal Combination and Risk-Aware Portfolio Construction
 
 **Status:** Implementation-ready research specification  
 **Purpose:** Build, evaluate, and compare modular and joint-ML methods for combining systematic trading signals across instruments and asset classes.  

@@ -40,6 +40,7 @@ from equities.blend import (                                        # noqa: F401
     equal_weight,
     sharpe_heuristic,
     msrr_ridge,
+    msrr_lasso,
     combine_signals,
     build_managed_returns,
     build_state_features,
@@ -62,11 +63,12 @@ from equities.blend import (                                        # noqa: F401
 
 # ── Commodities-specific constants ────────────────────────────────────────────
 
+IS_END = "2020-12-31"
+
 _SIGNALS_DIR = Path(__file__).parent / "signals"
 
 SIGNAL_FILES: dict[str, str] = {
     "tsmom_252":    "tsmom_252_pnl.parquet",
-    "xs_carry":     "xs_carry_pnl.parquet",
     "xs_carry_enh": "xs_carry_enh_pnl.parquet",
     "curvature":    "curvature_pnl.parquet",
 }
@@ -118,10 +120,9 @@ def build_signal_parquets(
 
     # Map from _build_signals keys → SIGNAL_FILES keys
     _key_map = {
-        "tsmom_252":          "tsmom_252",
-        "xs_carry_f1f2":      "xs_carry",
-        "xs_carry_enh_f1f2":  "xs_carry_enh",
-        "curvature":          "curvature",
+        "tsmom_252":         "tsmom_252",
+        "xs_carry_enh_f1f2": "xs_carry_enh",
+        "curvature":         "curvature",
     }
 
     print("Computing managed returns …")
@@ -209,3 +210,134 @@ def combined_return(
             r = r + w[k] * F[k]
     r.name = "combined"
     return r
+
+
+# ── Rolling OLS blend ─────────────────────────────────────────────────────────
+
+def _expanding_ols_weights(F: pd.DataFrame, min_obs: int = 252) -> pd.DataFrame:
+    """
+    Expanding-window MSRR OLS weights (causal).
+
+    At row t, the weight is fitted on F.iloc[:t] (all rows strictly before t),
+    so applying it directly to F.iloc[t] is look-ahead free.
+    Rows 0..min_obs-1 are NaN (insufficient history).
+    """
+    vals = F.values.astype(float)
+    T, K = vals.shape
+    out = np.full((T, K), np.nan)
+    ones = np.ones(min_obs)
+    for t in range(min_obs, T):
+        Ft = vals[:t]
+        ones_t = np.ones(t)
+        b, _, _, _ = np.linalg.lstsq(Ft, ones_t, rcond=None)
+        out[t] = b
+    return pd.DataFrame(out, index=F.index, columns=F.columns)
+
+
+def run_comm_blend(
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    min_obs: int = 252,
+) -> dict:
+    """
+    Canonical commodities blend pipeline: daily managed returns → rolling OLS.
+
+    Vol-normalises to unit annual vol using IS σ only (no look-ahead), then fits
+    an expanding-window MSRR OLS blend where weights at day t are estimated on
+    all data strictly before t.
+
+    Parameters
+    ----------
+    signals_dir   Directory with parquet files.  Default: commodities/signals/.
+    is_end        Last IS date.  Default: IS_END ("2020-12-31").
+    min_obs       Minimum observations before computing blend weights.  Default: 252.
+
+    Returns
+    -------
+    dict:
+        F_is        vol-normalised IS managed returns  (T_is × 3)
+        F_oos       vol-normalised OOS managed returns (T_oos × 3)
+        weights_is  pd.DataFrame (T_is × 3) expanding OLS weights, IS slice
+        weights_oos pd.DataFrame (T_oos × 3) expanding OLS weights, OOS slice
+        r_is        combined IS return series
+        r_oos       combined OOS return series
+    """
+    F = load_managed_returns(signals_dir=signals_dir)
+    F_is_raw  = F.loc[F.index <= is_end]
+    F_oos_raw = F.loc[F.index >  is_end]
+
+    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = sigma.replace(0.0, np.nan)
+    F_is  = F_is_raw.div(sigma)
+    F_oos = F_oos_raw.div(sigma)
+
+    # Expanding OLS over the full history (IS then OOS) — fully causal
+    F_full = pd.concat([F_is, F_oos])
+    w_all  = _expanding_ols_weights(F_full, min_obs=min_obs)
+
+    # L1-normalise each row so total gross = 1 (matches _dyn_blend_ret convention)
+    norm  = w_all.abs().sum(axis=1).replace(0.0, np.nan)
+    w_all = w_all.div(norm, axis=0)
+
+    w_is  = w_all.loc[F_is.index].dropna()
+    w_oos = w_all.loc[F_oos.index].dropna()
+
+    r_is  = (F_is.loc[w_is.index]   * w_is).sum(axis=1)
+    r_oos = (F_oos.loc[w_oos.index] * w_oos).sum(axis=1)
+    r_is.name  = "comm_rolling_ols"
+    r_oos.name = "comm_rolling_ols"
+
+    return {
+        "F_is":        F_is,
+        "F_oos":       F_oos,
+        "weights_is":  w_is,
+        "weights_oos": w_oos,
+        "r_is":        r_is,
+        "r_oos":       r_oos,
+    }
+
+
+def run_commodities_blend(
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    min_obs: int = 252,
+    rebuild_signals: bool = False,
+) -> dict:
+    """
+    Full commodities pipeline: build signals → rolling OLS blend.
+
+    Step 1 — Signal pipeline (commodities/blend.build_signal_parquets):
+        Computes vol-scaled managed returns for tsmom_252, xs_carry_enh, and
+        curvature and writes them to commodities/signals/.  Skipped when
+        rebuild_signals=False and all three parquets already exist.
+
+    Step 2 — Blend (run_comm_blend):
+        Loads the three parquets, vol-normalises on IS σ, fits an
+        expanding-window MSRR OLS blend (causal, daily rebalance).
+
+    Parameters
+    ----------
+    signals_dir       Parquet directory.  Default: commodities/signals/.
+    is_end            Last IS date.  Default: IS_END ("2020-12-31").
+    min_obs           Minimum obs before blend weights are non-NaN.  Default: 252.
+    rebuild_signals   Force re-run of the signal pipeline.  Default: False.
+
+    Returns
+    -------
+    Same dict as run_comm_blend().
+    """
+    sig_dir   = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+    pnl_paths = [sig_dir / f for f in SIGNAL_FILES.values()]
+    needs_build = rebuild_signals or not all(p.exists() for p in pnl_paths)
+
+    if needs_build:
+        missing = [p.name for p in pnl_paths if not p.exists()]
+        if missing:
+            print(f"Missing parquets: {missing} — running signal pipeline...")
+        else:
+            print("rebuild_signals=True — re-running signal pipeline...")
+        build_signal_parquets(output_dir=sig_dir)
+    else:
+        print("Signal parquets found — skipping rebuild. Pass rebuild_signals=True to refresh.")
+
+    return run_comm_blend(signals_dir=sig_dir, is_end=is_end, min_obs=min_obs)

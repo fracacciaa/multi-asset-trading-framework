@@ -12,7 +12,8 @@ from typing import Callable
 def run_backtest(
     returns: pd.DataFrame,
     signal_fn: Callable[[pd.Timestamp], pd.Series],
-    rebalance_freq: str = "M",
+    rebalance_freq: str = "ME",
+    rebalance_dates=None,
     transaction_cost_bps: float = 5.0,
     initial_capital: float = 1_000_000.0,
 ) -> pd.DataFrame:
@@ -33,8 +34,13 @@ def run_backtest(
         turnover      — one-way turnover on rebalance days, 0 otherwise
     """
     trading_days = returns.index
-    freq = rebalance_freq.rstrip("E") + "E" if rebalance_freq in ("M", "Q", "Y") else rebalance_freq
-    rebalance_dates = set(returns.resample(freq).last().index)
+    if rebalance_dates is not None:
+        rebalance_dates = set(rebalance_dates)
+    elif rebalance_freq == "D":
+        rebalance_dates = set(trading_days)
+    else:
+        freq = rebalance_freq.rstrip("E") + "E" if rebalance_freq in ("M", "Q", "Y") else rebalance_freq
+        rebalance_dates = set(returns.resample(freq).last().index)
 
     navs = np.empty(len(trading_days))
     daily_rets = np.zeros(len(trading_days))

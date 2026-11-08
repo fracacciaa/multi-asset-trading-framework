@@ -201,6 +201,127 @@ def carry(
     q_hi = composite.quantile(1 - winsor_pct, axis=1)
     return composite.clip(lower=q_lo, upper=q_hi, axis=0)
 
+_SIGNAL_KINDS: dict[str, str] = {
+    "momentum":       "xs",
+    "tsmom":          "ts",
+    "mean_reversion": "xs",
+    "carry":          "xs",
+}
+
+
+def build_vf_data(
+    prices: pd.DataFrame,
+    fundamentals: dict,
+    returns: pd.DataFrame,
+    warmup: int = 504,
+    rebal_freq: int = 21,
+    cov_lookback: int = 504,
+    vol_halflife: int = 21,
+    cor_halflife: int = 126,
+) -> dict:
+    """
+    Compute raw signals and covariance matrices at every VF rebalance date.
+
+    This is the slow step (~5 min). Cache the result and reuse with
+    apply_vf_params() to test different VF configurations cheaply.
+
+    Returns
+    -------
+    dict with keys:
+        raw_signals  : dict[str, pd.DataFrame]  — raw winsorized signal scores
+        cov_matrices : dict[Timestamp, pd.DataFrame]  — cov at each rebal date
+        all_dates    : DatetimeIndex
+        rebal_dates  : DatetimeIndex
+        columns      : Index  — ticker universe
+    """
+    from optimization import estimate_covariance
+
+    raw_signals: dict[str, pd.DataFrame] = {
+        "momentum":       momentum(prices),
+        "tsmom":          tsmom(prices),
+        "mean_reversion": mean_reversion(prices),
+        "carry":          carry(prices, fundamentals),
+    }
+
+    all_dates   = returns.index
+    rebal_dates = all_dates[warmup::rebal_freq]
+
+    cov_matrices: dict = {}
+    for rd in rebal_dates:
+        cov_matrices[rd] = estimate_covariance(
+            returns.loc[:rd].iloc[-cov_lookback:],
+            vol_halflife=vol_halflife,
+            cor_halflife=cor_halflife,
+        )
+
+    return {
+        "raw_signals":  raw_signals,
+        "cov_matrices": cov_matrices,
+        "all_dates":    all_dates,
+        "rebal_dates":  rebal_dates,
+        "columns":      prices.columns,
+    }
+
+
+def apply_vf_params(
+    vf_data: dict,
+    xs_params: Optional[dict] = None,
+    ts_params: Optional[dict] = None,
+) -> dict[str, pd.DataFrame]:
+    """
+    Apply ViewFormation with given params to pre-computed vf_data.
+
+    Fast (~seconds). Use after build_vf_data() to sweep VF configurations
+    without repeating the expensive covariance estimation step.
+
+    xs_params : overrides for ViewFormationXS  (use_grinold, use_demean,
+                use_ortho, use_tanh, tanh_scale, use_rank, …)
+    ts_params : overrides for ViewFormationTS  (use_ortho, desired_vol)
+    """
+    from equities.view_formation import ViewFormationXS, ViewFormationTS
+
+    raw_signals  = vf_data["raw_signals"]
+    cov_matrices = vf_data["cov_matrices"]
+    all_dates    = vf_data["all_dates"]
+    rebal_dates  = vf_data["rebal_dates"]
+
+    _xs = {"use_rank": False, **(xs_params or {})}
+
+    positions = {
+        name: pd.DataFrame(0.0, index=all_dates, columns=vf_data["columns"])
+        for name in raw_signals
+    }
+
+    for i, rd in enumerate(rebal_dates):
+        cov = cov_matrices.get(rd)
+        if cov is None:
+            continue
+        next_rd    = rebal_dates[i + 1] if i + 1 < len(rebal_dates) else all_dates[-1]
+        hold_dates = all_dates[(all_dates > rd) & (all_dates <= next_rd)]
+
+        for name, sig_df in raw_signals.items():
+            if rd not in sig_df.index:
+                continue
+            raw    = sig_df.loc[rd].dropna()
+            common = raw.index.intersection(cov.index)
+            if len(common) < 10:
+                continue
+            try:
+                if _SIGNAL_KINDS[name] == "ts":
+                    vf = ViewFormationTS(raw.loc[common], cov.loc[common, common],
+                                         params=ts_params)
+                else:
+                    vf = ViewFormationXS(raw.loc[common], cov.loc[common, common],
+                                         params=_xs)
+                w = vf.generate_view()
+            except Exception:
+                continue
+            for d in hold_dates:
+                positions[name].loc[d, w.index] = w.values
+
+    return positions
+
+
 def build_vf_positions(
     prices: pd.DataFrame,
     fundamentals: dict,
@@ -219,75 +340,11 @@ def build_vf_positions(
     monthly rebalance schedule, and returns pre-formed position DataFrames
     ready to pass directly into equities/blend.py.
 
-    Parameters
-    ----------
-    prices        : date × ticker adjusted close prices
-    fundamentals  : dict with keys market_cap, fcf, eps_fwd (output of fetch_fundamentals)
-    returns       : date × ticker daily returns (prices.pct_change())
-    warmup        : trading days before first rebalance (for covariance estimation)
-    rebal_freq    : rebalance every N trading days (default 21 = monthly)
-    cov_lookback  : rolling window length for covariance estimation
-    vol_halflife  : EWMA halflife for volatility in estimate_covariance
-    cor_halflife  : EWMA halflife for correlation in estimate_covariance
-    vf_params     : optional dict of ViewFormationXS params (e.g. use_rank, tanh_scale)
-
-    Returns
-    -------
-    dict[str, pd.DataFrame]
-        Keys: "momentum", "tsmom", "mean_reversion", "carry"
-        Values: date × ticker DataFrames of VF-processed portfolio weights,
-                held constant between rebalance dates.
+    For repeated runs with different VF params, use build_vf_data() +
+    apply_vf_params() directly to avoid recomputing covariance matrices.
     """
-    from optimization import estimate_covariance
-    from equities.view_formation import ViewFormationXS, ViewFormationTS
-
-    _SIGNAL_KINDS: dict[str, str] = {
-        "momentum":       "xs",
-        "tsmom":          "ts",
-        "mean_reversion": "xs",
-        "carry":          "xs",
-    }
-
-    raw_signals: dict[str, pd.DataFrame] = {
-        "momentum":       momentum(prices),
-        "tsmom":          tsmom(prices),
-        "mean_reversion": mean_reversion(prices),
-        "carry":          carry(prices, fundamentals),
-    }
-
-    all_dates    = returns.index
-    rebal_dates  = all_dates[warmup::rebal_freq]
-    positions    = {name: pd.DataFrame(0.0, index=all_dates, columns=prices.columns)
-                   for name in raw_signals}
-
-    xs_params = {"use_rank": False, **(vf_params or {})}
-
-    for i, rd in enumerate(rebal_dates):
-        cov        = estimate_covariance(
-            returns.loc[:rd].iloc[-cov_lookback:],
-            vol_halflife=vol_halflife,
-            cor_halflife=cor_halflife,
-        )
-        next_rd    = rebal_dates[i + 1] if i + 1 < len(rebal_dates) else all_dates[-1]
-        hold_dates = all_dates[(all_dates > rd) & (all_dates <= next_rd)]
-
-        for name, sig_df in raw_signals.items():
-            if rd not in sig_df.index:
-                continue
-            raw = sig_df.loc[rd].dropna()
-            common = raw.index.intersection(cov.index)
-            if len(common) < 10:
-                continue
-            try:
-                if _SIGNAL_KINDS[name] == "ts":
-                    vf = ViewFormationTS(raw.loc[common], cov.loc[common, common])
-                else:
-                    vf = ViewFormationXS(raw.loc[common], cov.loc[common, common],
-                                         params=xs_params)
-                w = vf.generate_view()
-            except Exception:
-                continue
-            for d in hold_dates:
-                positions[name].loc[d, w.index] = w.values
-
-    return positions
+    vf_data = build_vf_data(
+        prices, fundamentals, returns,
+        warmup, rebal_freq, cov_lookback, vol_halflife, cor_halflife,
+    )
+    return apply_vf_params(vf_data, xs_params=vf_params)
