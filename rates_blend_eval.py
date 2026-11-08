@@ -168,6 +168,98 @@ def main():
         print(f"  {label:<20}{w_str}")
     print("  " + "─" * (22 + col_w * len(names)))
 
+    # ── MSRR: static vs rolling walk-forward ─────────────────────────────────
+    from equities.blend import RollingMSRR, msrr_lasso
+
+    F_full = pd.concat([F_is_n, F_oos_n]).sort_index()
+
+    def _roll_ret(F: pd.DataFrame, w_df: pd.DataFrame) -> pd.Series:
+        idx = F.index.intersection(w_df.dropna(how="any").index)
+        F_, w_ = F.loc[idx], w_df.loc[idx]
+        norm = w_.abs().sum(axis=1).replace(0.0, np.nan)
+        return (F_ * w_.div(norm, axis=0)).sum(axis=1)
+
+    def _wt_to(w_df: pd.DataFrame) -> float:
+        w = w_df.dropna(how="any")
+        if len(w) < 2:
+            return np.nan
+        dw = w.diff().dropna().abs().sum(axis=1)
+        avg_gross = w.abs().sum(axis=1).replace(0.0, np.nan).mean()
+        return float(dw.mean() / avg_gross * 252) if avg_gross > 1e-12 else np.nan
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 2:
+            return np.nan
+        av = r.std() * np.sqrt(252)
+        if av < 1e-12:
+            return np.nan
+        cum = r.cumsum()
+        return float((cum - cum.cummax()).min() / av * 100)
+
+    static_est = {
+        "msrr_ols":   lambda F: msrr_ridge(F, lam=0.0),
+        "msrr_ridge": lambda F: msrr_ridge(F, lam=0.01),
+        "msrr_lasso": lambda F: msrr_lasso(F, lam=0.01),
+    }
+    rolling_mdls = {
+        "msrr_ols":   RollingMSRR(penalty="ols",                  lookback=252, min_obs=63),
+        "msrr_ridge": RollingMSRR(penalty="ridge", lam=0.01,      lookback=252, min_obs=63),
+        "msrr_lasso": RollingMSRR(penalty="lasso", alpha=0.01,    lookback=252, min_obs=63),
+    }
+    all_roll_w = {n: m._roll(F_full) for n, m in rolling_mdls.items()}
+
+    msrr_rows = []
+    for name, est_fn in static_est.items():
+        bw    = est_fn(F_is_n)
+        r_is  = blend_return(F_is_n, bw)
+        r_oos = blend_return(F_oos_n, bw)
+        msrr_rows.append({
+            "method": f"{name} (static)", "type": "static",
+            "IS_SR": annualized_sharpe(r_is),  "IS_MDD":  _mdd(r_is),  "IS_TO":  0.0,
+            "OOS_SR": annualized_sharpe(r_oos), "OOS_MDD": _mdd(r_oos), "OOS_TO": 0.0,
+        })
+    for name in rolling_mdls:
+        w_all = all_roll_w[name]
+        w_is  = w_all.reindex(F_is_n.index)
+        w_oos = w_all.reindex(F_oos_n.index)
+        r_is  = _roll_ret(F_is_n, w_is)
+        r_oos = _roll_ret(F_oos_n, w_oos)
+        msrr_rows.append({
+            "method": f"{name} (rolling)", "type": "rolling",
+            "IS_SR": annualized_sharpe(r_is),  "IS_MDD":  _mdd(r_is),  "IS_TO":  _wt_to(w_is),
+            "OOS_SR": annualized_sharpe(r_oos), "OOS_MDD": _mdd(r_oos), "OOS_TO": _wt_to(w_oos),
+        })
+
+    def _fsr(v):  return f"{v:+.2f}" if not np.isnan(v) else "   n/a"
+    def _fmdd(v): return f"{v:.1f}%" if not np.isnan(v) else "   n/a"
+    def _fto(v):  return f"{v:.1f}x" if not np.isnan(v) else "   n/a"
+
+    W3 = 97
+    print(f"\n{'=' * W3}")
+    print("  MSRR: STATIC vs ROLLING  (walk-forward, lookback=252d, vol-normalised F)")
+    print(f"  IS ≤ {IS_END}   |   OOS ≥ {OOS_START}")
+    print(f"{'=' * W3}")
+    print(
+        f"  {'Method':<26}  {'Type':<8}"
+        f"  {'IS Sharpe':>10}  {'IS MDD':>8}  {'IS TO':>7}"
+        f"  {'OOS Sharpe':>10}  {'OOS MDD':>8}  {'OOS TO':>7}"
+    )
+    print("  " + "─" * (W3 - 2))
+
+    prev_t = None
+    for r in msrr_rows:
+        if prev_t is not None and r["type"] != prev_t:
+            print("  " + "─" * (W3 - 2))
+        prev_t = r["type"]
+        print(
+            f"  {r['method']:<26}  {r['type']:<8}"
+            f"  {_fsr(r['IS_SR']):>10}  {_fmdd(r['IS_MDD']):>8}  {_fto(r['IS_TO']):>7}"
+            f"  {_fsr(r['OOS_SR']):>10}  {_fmdd(r['OOS_MDD']):>8}  {_fto(r['OOS_TO']):>7}"
+        )
+    print(f"{'=' * W3}")
+    print(f"  MDD = peak-to-trough / ann_vol (%). TO = blend-weight turns/yr (|Δw|/avg_gross × 252).")
+
 
 if __name__ == "__main__":
     main()

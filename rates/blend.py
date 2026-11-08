@@ -5,9 +5,15 @@ Loads the three production PnL parquets, aggregates across markets, and
 exposes the same blend API as equities/blend.py (all algorithms are imported
 directly — no duplication).
 
+Production blend: rolling OLS MSRR (RollingMSRR, penalty="ols", lookback=252d).
+  Refit OLS weights at each step on the last 252 trading days.
+  Walk-forward on the full timeline (IS + OOS) so the OOS window includes
+  the IS tail — no lookahead.
+
 Pipeline position:
     rates/signals/*_pnl.parquet  →  load_managed_returns()  →  F (T × 3)
-    F  →  fit_static / MLMSRR / LinearDynamicBlend / …  →  blend weights
+    F  →  vol_normalise()  →  F_norm
+    F_norm  →  RollingMSRR(penalty="ols")  →  time-varying blend weights
     blend weights  →  combined portfolio return
 
 Signals (production, from rates/signals/):
@@ -35,6 +41,8 @@ from equities.blend import (                                        # noqa: F401
     equal_weight,
     sharpe_heuristic,
     msrr_ridge,
+    msrr_lasso,
+    RollingMSRR,
     combine_signals,
     build_managed_returns,
     build_state_features,
@@ -148,18 +156,37 @@ def combined_return(
     return r
 
 
-def fit_lasso_blend(
-    F_train: pd.DataFrame,
-    alpha: float = 0.01,
-) -> "BlendWeights":
+def rolling_combined_return(
+    F: pd.DataFrame,
+    weights: pd.DataFrame,
+) -> pd.Series:
     """
-    Fit LASSO blend weights on a training window.
+    Apply time-varying blend weights to the managed-return matrix.
 
-    F_train must be vol-normalised before calling (use vol_normalise).
-    LASSO (l1_ratio=1) selects the dominant signal(s) and zeros out the rest.
-    alpha=0.01 is the default penalty strength; increase to force more sparsity.
+    weights is a T × K DataFrame (output of RollingMSRR._roll).
+    Rows with any NaN in weights are excluded.  Weights are L1-normalised
+    at each step so the portfolio is always fully invested.
+
+    Returns a pd.Series of daily portfolio returns.
     """
-    return enet_blend(F_train, alpha=alpha, l1_ratio=1.0)
+    idx = F.index.intersection(weights.dropna(how="any").index)
+    F_, w_ = F.loc[idx], weights.loc[idx]
+    norm = w_.abs().sum(axis=1).replace(0.0, np.nan)
+    return (F_ * w_.div(norm, axis=0)).sum(axis=1).rename("combined")
+
+
+def fit_rolling_ols(
+    lookback: int = 252,
+    min_obs: int = 63,
+) -> "RollingMSRR":
+    """
+    Build the production rolling OLS blend model.
+
+    Refit OLS MSRR weights at each step using the last `lookback` trading days.
+    Call model._roll(F_norm) on vol-normalised managed returns to get the
+    time-varying weight DataFrame (T × K), then pass to rolling_combined_return().
+    """
+    return RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)
 
 
 def vol_normalise(
@@ -180,18 +207,19 @@ def vol_normalise(
 
 def run_blend(
     signals_dir: Optional[str | Path] = None,
-    alpha: float = 0.01,
+    lookback: int = 252,
+    min_obs: int = 63,
 ) -> dict:
     """
-    Canonical rates blend pipeline.
+    Canonical rates blend pipeline (rolling OLS MSRR).
 
-    Loads managed returns, vol-normalises, fits LASSO on IS, returns
-    weights and combined OOS return series.
+    Loads managed returns, vol-normalises using IS σ, runs rolling OLS on the
+    full timeline (IS + OOS) so the OOS window always has access to the IS tail.
 
     Returns
     -------
     dict with keys:
-        weights     BlendWeights fitted on IS
+        weights     pd.DataFrame of time-varying blend weights (T_full × K)
         F_is        vol-normalised IS managed returns (T_is × K)
         F_oos       vol-normalised OOS managed returns (T_oos × K)
         r_is        combined IS return series
@@ -202,15 +230,23 @@ def run_blend(
     F_oos_raw = F.loc[F.index >= OOS_START]
 
     F_is, F_oos = vol_normalise(F_is_raw, F_oos_raw)
+    F_full = pd.concat([F_is, F_oos]).sort_index()
 
-    weights = fit_lasso_blend(F_is, alpha=alpha)
+    model   = fit_rolling_ols(lookback=lookback, min_obs=min_obs)
+    weights_raw = model._roll(F_full)
+    # L1-normalise rows so weights reflect actual portfolio allocations
+    _norm   = weights_raw.abs().sum(axis=1).replace(0.0, np.nan)
+    weights = weights_raw.div(_norm, axis=0)
+
+    w_is  = weights.reindex(F_is.index)
+    w_oos = weights.reindex(F_oos.index)
 
     return {
         "weights": weights,
         "F_is":    F_is,
         "F_oos":   F_oos,
-        "r_is":    combined_return(F_is,  weights),
-        "r_oos":   combined_return(F_oos, weights),
+        "r_is":    rolling_combined_return(F_is, w_is),
+        "r_oos":   rolling_combined_return(F_oos, w_oos),
     }
 
 
@@ -218,12 +254,13 @@ def run_rates_blend(
     markets: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
-    alpha: float = 0.01,
+    lookback: int = 252,
+    min_obs: int = 63,
     rebuild_signals: bool = False,
     verbose: bool = True,
 ) -> dict:
     """
-    Full rates pipeline: build signals → LASSO blend.
+    Full rates pipeline: build signals → rolling OLS blend.
 
     Step 1 — Signal pipeline (rates/production/run.py):
         Fetches OIS curves, computes momentum, carry and mean_reversion PnL
@@ -232,20 +269,21 @@ def run_rates_blend(
 
     Step 2 — Blend (rates/blend.run_blend):
         Loads the three PnL parquets, vol-normalises to unit annual vol using
-        IS σ, fits LASSO on IS data, applies weights to OOS.
+        IS σ, runs rolling OLS MSRR on the full timeline.
 
     Parameters
     ----------
     markets         OIS markets to include (default: all 11).
     start / end     Date range for the signal pipeline (default: full history).
-    alpha           LASSO penalty strength (default 0.01).
+    lookback        Rolling window in trading days (default 252 = 1 year).
+    min_obs         Minimum observations before first weight estimate (default 63).
     rebuild_signals Force re-run of the signal pipeline even if parquets exist.
     verbose         Print progress from the signal pipeline.
 
     Returns
     -------
     dict with keys:
-        weights     BlendWeights (LASSO, fitted on IS)
+        weights     pd.DataFrame of time-varying blend weights (T_full × K)
         F_is        vol-normalised IS managed returns (T_is × 3)
         F_oos       vol-normalised OOS managed returns (T_oos × 3)
         r_is        combined IS return series
@@ -267,4 +305,4 @@ def run_rates_blend(
     elif verbose:
         print("Signal parquets found — skipping rebuild. Pass rebuild_signals=True to refresh.")
 
-    return run_blend(alpha=alpha)
+    return run_blend(lookback=lookback, min_obs=min_obs)
