@@ -412,3 +412,159 @@ def run_fx_prod(
         print(f"  MDD = wealth drawdown at {vol_target*100:.0f}% vol target  |  TO = annual one-way (blended positions)\n")
 
     return pd.concat([r_is, r_oos]).sort_index().rename("fx_combined")
+
+
+def compare_blend_methods(
+    signals_dir: str | Path | None = None,
+    lookback: int = 36,
+    min_obs: int = 24,
+    ridge_lam: float = 0.01,
+    vol_target: float = 0.10,
+) -> pd.DataFrame:
+    """
+    Compare three FX blend methods side-by-side: Sharpe, MDD, TO.
+
+    Methods
+    -------
+    Rolling OLS MSRR   production baseline, fit on IS rolling then predict OOS
+    Rolling Ridge MSRR same rolling window with L2 penalty (lam=ridge_lam)
+    Static Ridge MSRR  IS-fit once with ridge, constant weights applied to both periods
+
+    Monthly frequency; Sharpe annualised with √12.
+    MDD at vol_target wealth scaling.
+    TO = annualised one-way turnover from blended currency-pair positions.
+
+    Returns
+    -------
+    pd.DataFrame with columns [Method, Period, Sharpe, MDD, TO].
+    """
+    sdir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+
+    F = load_monthly_managed_returns(signals_dir=sdir)
+    F_is_raw  = F.loc[F.index <= IS_END]
+    F_oos_raw = F.loc[F.index >  IS_END]
+
+    sigma = F_is_raw.std() * np.sqrt(12)
+    sigma = sigma.replace(0.0, np.nan)
+    F_is  = F_is_raw.div(sigma)
+    F_oos = F_oos_raw.div(sigma)
+    names = list(F_is.columns)
+
+    # Monthly signal position parquets for TO computation
+    monthly_pos = {
+        "momentum":  pd.read_parquet(sdir / "signal_a_f9_h1.parquet"),
+        "mr_ns_loo": (pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+                      .resample("BME").last()),
+        "carry_xs":  pd.read_parquet(sdir / "view_xs_carry_m.parquet"),
+    }
+    common_pairs = sorted(set.intersection(*[set(p.columns) for p in monthly_pos.values()]))
+
+    def _blended_pos(w_df: pd.DataFrame) -> pd.DataFrame:
+        idx = w_df.dropna().index
+        w   = w_df.loc[idx]
+        w   = w.div(w.abs().sum(axis=1).replace(0.0, np.nan), axis=0)
+        pos = pd.DataFrame(0.0, index=idx, columns=common_pairs)
+        for k in names:
+            if k not in monthly_pos or k not in sigma.index:
+                continue
+            pk = monthly_pos[k].reindex(index=idx, columns=common_pairs).fillna(0.0)
+            pos += pk.mul(w[k] / sigma[k], axis=0)
+        return pos
+
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 12 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(12))
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if r.empty:
+            return float("nan")
+        cum = (1 + r * vol_target).cumprod()
+        return float((cum / cum.cummax() - 1).min() * 100)
+
+    def _turnover(pos: pd.DataFrame) -> float:
+        return float(pos.diff().abs().sum(axis=1).mean() * 12)
+
+    def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
+        norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
+        return w_raw.div(norm, axis=0)
+
+    # ── Method 1: Rolling OLS ────────────────────────────────────────────────
+    model_ols = RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)
+    model_ols.fit(F_is)
+    w_ols_is  = model_ols._weights_history
+    w_ols_oos = model_ols.predict_weights(F_oos)
+
+    # ── Method 2: Rolling Ridge ──────────────────────────────────────────────
+    model_ridge = RollingMSRR(penalty="ridge", lam=ridge_lam, lookback=lookback, min_obs=min_obs)
+    model_ridge.fit(F_is)
+    w_ridge_is  = model_ridge._weights_history
+    w_ridge_oos = model_ridge.predict_weights(F_oos)
+
+    # ── Method 3: Static Ridge (IS-fit, constant weights) ───────────────────
+    static_bw  = msrr_ridge(F_is, lam=ridge_lam)
+    w_static_s = static_bw.weights / static_bw.weights.abs().sum()
+    w_static_is  = pd.DataFrame(
+        np.tile(w_static_s.reindex(F_is.columns).values,  (len(F_is),  1)),
+        index=F_is.index,  columns=F_is.columns,
+    )
+    w_static_oos = pd.DataFrame(
+        np.tile(w_static_s.reindex(F_oos.columns).values, (len(F_oos), 1)),
+        index=F_oos.index, columns=F_oos.columns,
+    )
+
+    methods = {
+        "Rolling OLS":   (w_ols_is,    w_ols_oos),
+        "Rolling Ridge": (w_ridge_is,  w_ridge_oos),
+        "Static Ridge":  (w_static_is, w_static_oos),
+    }
+
+    # ── Collect metrics ──────────────────────────────────────────────────────
+    records = []
+    for method_name, (w_is_, w_oos_) in methods.items():
+        r_is_  = combined_return_rolling(F_is,  w_is_)
+        r_oos_ = combined_return_rolling(F_oos, w_oos_)
+        pos_is_  = _blended_pos(w_is_)
+        pos_oos_ = _blended_pos(w_oos_)
+        for period, r, pos in [
+            ("IS",  r_is_,  pos_is_),
+            ("OOS", r_oos_, pos_oos_),
+        ]:
+            records.append({
+                "Method": method_name,
+                "Period": period,
+                "Sharpe": _sharpe(r),
+                "MDD":    _mdd(r),
+                "TO":     _turnover(pos),
+            })
+
+    df = pd.DataFrame(records)
+
+    # ── Print table ──────────────────────────────────────────────────────────
+    W = 72
+    print("=" * W)
+    print(f"  FX BLEND COMPARISON  (vol target={vol_target*100:.0f}%, λ_ridge={ridge_lam})")
+    print("=" * W)
+    print(f"  {'Method':<20}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
+    print("  " + "─" * (W - 2))
+    for _, row in df.iterrows():
+        sr  = f"{row['Sharpe']:+.2f}" if not np.isnan(row["Sharpe"]) else "   n/a"
+        mdd = f"{row['MDD']:.1f}%"    if not np.isnan(row["MDD"])    else "    n/a"
+        to  = f"{row['TO']:.1f}x"     if not np.isnan(row["TO"])     else "   n/a"
+        print(f"  {row['Method']:<20}  {row['Period']:<6}  {sr:>7}  {mdd:>8}  {to:>7}")
+        if row["Period"] == "OOS":
+            print("  " + "─" * (W - 2))
+    print("=" * W)
+
+    # ── Static Ridge IS weights ───────────────────────────────────────────────
+    col_w = 16
+    print(f"\n  Avg blend weights  (Static Ridge IS-fit, λ={ridge_lam})")
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'Signal':<20}" + "".join(f"  {s:>{col_w}}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'IS+OOS':<20}" + "".join(f"  {w_static_s.get(s, 0.0):>+{col_w}.1%}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+
+    return df

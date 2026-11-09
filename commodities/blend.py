@@ -472,3 +472,144 @@ def run_comm_prod(
     r_full = pd.concat([r_is, r_oos]).sort_index()
     r_full.name = "commodities"
     return r_full
+
+
+from equities.blend import RollingMSRR as _RollingMSRR   # noqa: E402
+
+
+def compare_blend_methods(
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    lookback: int = 252,
+    min_obs: int = 252,
+    ridge_lam: float = 0.01,
+    vol_target: float = 0.10,
+) -> pd.DataFrame:
+    """
+    Compare three commodities blend methods side-by-side: Sharpe, MDD, TO.
+
+    Methods
+    -------
+    Rolling OLS MSRR   fixed lookback=252d rolling window (note: production uses expanding OLS)
+    Rolling Ridge MSRR same rolling window with L2 penalty (lam=ridge_lam)
+    Static Ridge MSRR  IS-fit once with ridge, constant weights applied to full period
+
+    Daily frequency; Sharpe annualised with √252.
+    MDD at vol_target wealth scaling.
+    TO = annualised one-way turnover of blend weights for rolling methods; n/a for Static
+         Ridge (blend-weight TO is 0 by construction; instrument-level TO not available here).
+
+    Returns
+    -------
+    pd.DataFrame with columns [Method, Period, Sharpe, MDD, TO].
+    """
+    F = load_managed_returns(signals_dir=signals_dir)
+    F_is_raw  = F.loc[F.index <= is_end]
+    F_oos_raw = F.loc[F.index >  is_end]
+
+    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = sigma.replace(0.0, np.nan)
+    F_is  = F_is_raw.div(sigma)
+    F_oos = F_oos_raw.div(sigma)
+    F_full = pd.concat([F_is, F_oos]).sort_index()
+
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 60 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(252))
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if r.empty:
+            return float("nan")
+        cum = (1 + r * vol_target).cumprod()
+        return float((cum / cum.cummax() - 1).min() * 100)
+
+    def _blend_weight_to(w_df: pd.DataFrame) -> float:
+        """Annual one-way turnover of L1-normalised blend weights."""
+        w = w_df.dropna(how="any")
+        norm = w.abs().sum(axis=1).replace(0.0, np.nan)
+        w_norm = w.div(norm, axis=0)
+        return float(w_norm.diff().dropna(how="all").abs().sum(axis=1).mean() * 252)
+
+    def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
+        norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
+        return w_raw.div(norm, axis=0)
+
+    # ── Method 1: Rolling OLS ────────────────────────────────────────────────
+    w_ols = _normalise_w(
+        _RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)._roll(F_full)
+    )
+
+    # ── Method 2: Rolling Ridge ──────────────────────────────────────────────
+    w_roll_ridge = _normalise_w(
+        _RollingMSRR(penalty="ridge", lam=ridge_lam, lookback=lookback, min_obs=min_obs)
+        ._roll(F_full)
+    )
+
+    # ── Method 3: Static Ridge (IS-fit, constant weights) ───────────────────
+    static_bw  = msrr_ridge(F_is, lam=ridge_lam)
+    w_static_s = static_bw.weights / static_bw.weights.abs().sum()
+    w_static = pd.DataFrame(
+        np.tile(w_static_s.reindex(F_full.columns).values, (len(F_full), 1)),
+        index=F_full.index,
+        columns=F_full.columns,
+    )
+
+    methods = {
+        "Rolling OLS":   w_ols,
+        "Rolling Ridge": w_roll_ridge,
+        "Static Ridge":  w_static,
+    }
+
+    # ── Collect metrics ──────────────────────────────────────────────────────
+    records = []
+    for method_name, w_full in methods.items():
+        w_is_  = w_full.reindex(F_is.index)
+        w_oos_ = w_full.reindex(F_oos.index)
+        r_is_  = (F_is.loc[w_is_.dropna().index]   * w_is_.dropna()).sum(axis=1)
+        r_oos_ = (F_oos.loc[w_oos_.dropna().index] * w_oos_.dropna()).sum(axis=1)
+        for period, r, w in [
+            ("IS",  r_is_,  w_is_),
+            ("OOS", r_oos_, w_oos_),
+        ]:
+            records.append({
+                "Method": method_name,
+                "Period": period,
+                "Sharpe": _sharpe(r),
+                "MDD":    _mdd(r),
+                "TO":     float("nan") if method_name == "Static Ridge" else _blend_weight_to(w),
+            })
+
+    df = pd.DataFrame(records)
+
+    # ── Print table ──────────────────────────────────────────────────────────
+    W = 72
+    print("=" * W)
+    print(f"  COMMODITIES BLEND COMPARISON  (vol target={vol_target*100:.0f}%, λ_ridge={ridge_lam})")
+    print(f"  note: Rolling OLS uses fixed lookback={lookback}d; production uses expanding OLS")
+    print(f"  note: TO = blend-weight turnover (ann.); Static Ridge = n/a (0 by construction, instrument-level TO unavailable)")
+    print("=" * W)
+    print(f"  {'Method':<20}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
+    print("  " + "─" * (W - 2))
+    for _, row in df.iterrows():
+        sr  = f"{row['Sharpe']:+.2f}" if not np.isnan(row["Sharpe"]) else "   n/a"
+        mdd = f"{row['MDD']:.1f}%"    if not np.isnan(row["MDD"])    else "    n/a"
+        to  = f"{row['TO']:.2f}x"     if not np.isnan(row["TO"])     else "   n/a"
+        print(f"  {row['Method']:<20}  {row['Period']:<6}  {sr:>7}  {mdd:>8}  {to:>7}")
+        if row["Period"] == "OOS":
+            print("  " + "─" * (W - 2))
+    print("=" * W)
+
+    # ── Static Ridge IS weights ───────────────────────────────────────────────
+    names  = list(F_is.columns)
+    col_w  = 16
+    print(f"\n  Avg blend weights  (Static Ridge IS-fit, λ={ridge_lam})")
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'Signal':<20}" + "".join(f"  {s:>{col_w}}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'IS+OOS':<20}" + "".join(f"  {w_static_s.get(s, 0.0):>+{col_w}.1%}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+
+    return df

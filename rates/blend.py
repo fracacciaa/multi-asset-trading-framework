@@ -458,3 +458,154 @@ def run_rates_prod(
     print("  " + "─" * (22 + col_w * len(names)))
 
     return r_full
+
+
+def compare_blend_methods(
+    signals_dir: Optional[str | Path] = None,
+    lookback: int = 252,
+    min_obs: int = 63,
+    ridge_lam: float = 0.01,
+    vol_target: float = 0.10,
+) -> pd.DataFrame:
+    """
+    Compare three rates blend methods side-by-side: Sharpe, MDD, TO.
+
+    Methods
+    -------
+    Rolling OLS MSRR   production baseline, refit every step on last `lookback` days
+    Rolling Ridge MSRR same rolling window with L2 penalty (lam=ridge_lam)
+    Static Ridge MSRR  IS-fit once with ridge, constant weights applied to full period
+
+    Returns
+    -------
+    pd.DataFrame with columns [Method, Period, Sharpe, MDD, TO].
+    """
+    F = load_managed_returns(signals_dir=signals_dir)
+    F_is_raw  = F.loc[F.index <= IS_END]
+    F_oos_raw = F.loc[F.index >= OOS_START]
+
+    F_is, F_oos = vol_normalise(F_is_raw, F_oos_raw)
+    F_full = pd.concat([F_is, F_oos]).sort_index()
+
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 30 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(252))
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 2:
+            return float("nan")
+        cum = (1 + r * vol_target).cumprod()
+        return float((cum / cum.cummax() - 1).min() * 100)
+
+    def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
+        norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
+        return w_raw.div(norm, axis=0)
+
+    # Load signal position parquets once for TO computation
+    sig_dir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+    sig_pos: dict[str, pd.DataFrame] = {}
+    for name, fname in _POS_FILES.items():
+        path = sig_dir / fname
+        if path.exists():
+            sig_pos[name] = pd.read_parquet(path)
+
+    def _sig_to(pos_df: pd.DataFrame, start, end) -> float:
+        p = pos_df.loc[start:end].dropna(how="all")
+        if len(p) < 2:
+            return float("nan")
+        gross = p.abs().sum(axis=1).replace(0.0, np.nan).mean()
+        if gross < 1e-12 or np.isnan(gross):
+            return float("nan")
+        return float(p.diff().dropna(how="all").abs().sum(axis=1).mean() * 252 / gross)
+
+    def _blend_to(w_df: pd.DataFrame, start, end) -> float:
+        idx = w_df.dropna(how="any").index
+        idx = idx[(idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))]
+        if len(idx) == 0 or not sig_pos:
+            return float("nan")
+        w_period = w_df.loc[idx]
+        norms    = w_period.abs().sum(axis=1).replace(0.0, np.nan)
+        w_norm   = w_period.div(norms, axis=0)
+        sig_tos  = {k: _sig_to(sig_pos[k], start, end) for k in sig_pos}
+        weighted = w_norm.abs().mul(
+            pd.Series(sig_tos).reindex(w_norm.columns).fillna(0.0)
+        )
+        return float(weighted.sum(axis=1).mean())
+
+    # ── Method 1: Rolling OLS ────────────────────────────────────────────────
+    w_ols = _normalise_w(
+        RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)._roll(F_full)
+    )
+
+    # ── Method 2: Rolling Ridge ──────────────────────────────────────────────
+    w_roll_ridge = _normalise_w(
+        RollingMSRR(penalty="ridge", lam=ridge_lam, lookback=lookback, min_obs=min_obs)
+        ._roll(F_full)
+    )
+
+    # ── Method 3: Static Ridge (IS-fit, constant weights) ───────────────────
+    static_bw = msrr_ridge(F_is, lam=ridge_lam)
+    w_static_s = static_bw.weights / static_bw.weights.abs().sum()
+    w_static = pd.DataFrame(
+        np.tile(w_static_s.reindex(F_full.columns).values, (len(F_full), 1)),
+        index=F_full.index,
+        columns=F_full.columns,
+    )
+
+    methods = {
+        "Rolling OLS":   w_ols,
+        "Rolling Ridge": w_roll_ridge,
+        "Static Ridge":  w_static,
+    }
+
+    # ── Collect metrics ──────────────────────────────────────────────────────
+    records = []
+    for method_name, w_full in methods.items():
+        w_is  = w_full.reindex(F_is.index)
+        w_oos = w_full.reindex(F_oos.index)
+        r_is  = rolling_combined_return(F_is,  w_is)
+        r_oos = rolling_combined_return(F_oos, w_oos)
+        for period, r, w, t0, t1 in [
+            ("IS",  r_is,  w_is,  F_is.index[0],  F_is.index[-1]),
+            ("OOS", r_oos, w_oos, F_oos.index[0], F_oos.index[-1]),
+        ]:
+            records.append({
+                "Method": method_name,
+                "Period": period,
+                "Sharpe": _sharpe(r),
+                "MDD":    _mdd(r),
+                "TO":     _blend_to(w, t0, t1),
+            })
+
+    df = pd.DataFrame(records)
+
+    # ── Print table ──────────────────────────────────────────────────────────
+    W = 72
+    print("=" * W)
+    print(f"  RATES BLEND COMPARISON  (vol target={vol_target*100:.0f}%, λ_ridge={ridge_lam})")
+    print("=" * W)
+    print(f"  {'Method':<20}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
+    print("  " + "─" * (W - 2))
+    for _, row in df.iterrows():
+        sr  = f"{row['Sharpe']:+.2f}" if not np.isnan(row["Sharpe"]) else "   n/a"
+        mdd = f"{row['MDD']:.1f}%"    if not np.isnan(row["MDD"])    else "    n/a"
+        to  = f"{row['TO']:.1f}x"     if not np.isnan(row["TO"])     else "   n/a"
+        print(f"  {row['Method']:<20}  {row['Period']:<6}  {sr:>7}  {mdd:>8}  {to:>7}")
+        if row["Period"] == "OOS":
+            print("  " + "─" * (W - 2))
+    print("=" * W)
+
+    # ── Avg static weights for Static Ridge ──────────────────────────────────
+    names  = list(F_is.columns)
+    col_w  = 16
+    print(f"\n  Avg blend weights  (Static Ridge IS-fit, λ={ridge_lam})")
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'Signal':<20}" + "".join(f"  {s:>{col_w}}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'IS+OOS':<20}" + "".join(f"  {w_static_s.get(s, 0.0):>+{col_w}.1%}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+
+    return df

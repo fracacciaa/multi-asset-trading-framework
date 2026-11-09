@@ -819,3 +819,158 @@ def _print_prod_table(
     for sig, w in bw.weights.items():
         print(f"  {sig:<30}  {w:>+.4f}")
     print("=" * W)
+
+
+def compare_blend_methods(
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    lookback: int = 252,
+    min_obs: int = 63,
+    ridge_lam: float = 0.01,
+    rebuild: bool = False,
+    vol_target: float = 0.10,
+) -> pd.DataFrame:
+    """
+    Compare three equities blend methods side-by-side: Sharpe, MDD, TO.
+
+    Methods
+    -------
+    Rolling OLS MSRR   rolling lookback=252d refit at every step
+    Rolling Ridge MSRR same rolling window with L2 penalty (lam=ridge_lam)
+    Static Ridge MSRR  IS-fit once with ridge, constant weights — PRODUCTION method
+
+    All metrics come from a full position-level backtest (run_backtest), so
+    Sharpe and TO reflect actual ticker-level positions, not managed returns.
+    MDD is raw NAV peak-to-trough (no additional vol-target scaling).
+
+    Returns
+    -------
+    pd.DataFrame with columns [Method, Period, Sharpe, MDD, TO].
+    """
+    from equities.data import fetch_prices
+    from equities.blend import (
+        build_managed_returns, combine_signals,
+        msrr_ridge, RollingMSRR,
+    )
+    from backtest import run_backtest
+
+    positions = _load_or_build_positions(rebuild, verbose=False)
+    positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
+
+    vf_data        = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
+    vf_rebal_dates = set(vf_data["rebal_dates"])
+
+    prices  = fetch_prices(tickers=None)
+    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    ret_is  = returns.loc[returns.index <= is_end]
+    ret_oos = returns.loc[returns.index >= oos_start]
+
+    # vol-normalised managed returns (IS σ only)
+    pos_is  = {k: v.loc[v.index <= is_end]    for k, v in positions.items()}
+    pos_oos = {k: v.loc[v.index >= oos_start] for k, v in positions.items()}
+    F_is_raw  = build_managed_returns(pos_is,  ret_is)
+    F_oos_raw = build_managed_returns(pos_oos, ret_oos)
+    sigma  = F_is_raw.std().replace(0.0, np.nan)
+    F_is   = F_is_raw.div(sigma)
+    F_oos  = F_oos_raw.div(sigma)
+    F_full = pd.concat([F_is, F_oos]).sort_index()
+
+    all_tickers = sorted({t for pos in positions.values() for t in pos.columns})
+
+    def _static_sig_fn(bw):
+        combined = combine_signals(positions, bw)
+        return _make_signal_fn(combined)
+
+    def _rolling_sig_fn(weights_df):
+        def signal_fn(date):
+            avail = weights_df.index[weights_df.index <= date]
+            if avail.empty:
+                return pd.Series(dtype=float)
+            w = weights_df.loc[avail[-1]].dropna()
+            total = w.abs().sum()
+            if total < 1e-12:
+                return pd.Series(dtype=float)
+            w = w / total
+            row = pd.Series(0.0, index=all_tickers)
+            for sig_name, wk in w.items():
+                if sig_name not in positions:
+                    continue
+                pos = positions[sig_name]
+                avail_p = pos.index[pos.index <= date]
+                if avail_p.empty:
+                    continue
+                row = row.add(
+                    wk * pos.loc[avail_p[-1]].reindex(all_tickers).fillna(0.0),
+                    fill_value=0.0,
+                )
+            return row
+        return signal_fn
+
+    def _run(sig_fn):
+        bt_is  = run_backtest(ret_is,  sig_fn, rebalance_dates=vf_rebal_dates,
+                              transaction_cost_bps=0.0)
+        bt_oos = run_backtest(ret_oos, sig_fn, rebalance_dates=vf_rebal_dates,
+                              transaction_cost_bps=0.0)
+        return _stats_from_bt(bt_is), _stats_from_bt(bt_oos)
+
+    # ── Method 1: Rolling OLS ────────────────────────────────────────────────
+    w_ols  = RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)._roll(F_full)
+    s1_is, s1_oos = _run(_rolling_sig_fn(w_ols))
+
+    # ── Method 2: Rolling Ridge ──────────────────────────────────────────────
+    w_ridge = RollingMSRR(penalty="ridge", lam=ridge_lam,
+                          lookback=lookback, min_obs=min_obs)._roll(F_full)
+    s2_is, s2_oos = _run(_rolling_sig_fn(w_ridge))
+
+    # ── Method 3: Static Ridge (IS-fit) — PRODUCTION ────────────────────────
+    bw_static     = msrr_ridge(F_is, lam=ridge_lam)
+    s3_is, s3_oos = _run(_static_sig_fn(bw_static))
+
+    methods = [
+        ("Rolling OLS",         s1_is, s1_oos),
+        ("Rolling Ridge",       s2_is, s2_oos),
+        ("Static Ridge [prod]", s3_is, s3_oos),
+    ]
+
+    records = []
+    for method_name, s_is, s_oos in methods:
+        for period, s in [("IS", s_is), ("OOS", s_oos)]:
+            records.append({
+                "Method": method_name,
+                "Period": period,
+                "Sharpe": s["sharpe"],
+                "MDD":    s["max_drawdown"] * 100,
+                "TO":     s["ann_turnover"],
+            })
+
+    df = pd.DataFrame(records)
+
+    # ── Print table ──────────────────────────────────────────────────────────
+    W = 72
+    print("=" * W)
+    print(f"  EQUITIES BLEND COMPARISON  (λ_ridge={ridge_lam})")
+    print(f"  note: MDD = raw NAV peak-to-trough; TO = ann. position-level one-way")
+    print("=" * W)
+    print(f"  {'Method':<24}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
+    print("  " + "─" * (W - 2))
+    for _, row in df.iterrows():
+        sr  = f"{row['Sharpe']:+.2f}" if not np.isnan(row["Sharpe"]) else "   n/a"
+        mdd = f"{row['MDD']:.1f}%"    if not np.isnan(row["MDD"])    else "    n/a"
+        to  = f"{row['TO']:.1f}x"     if not np.isnan(row["TO"])     else "   n/a"
+        print(f"  {row['Method']:<24}  {row['Period']:<6}  {sr:>7}  {mdd:>8}  {to:>7}")
+        if row["Period"] == "OOS":
+            print("  " + "─" * (W - 2))
+    print("=" * W)
+
+    # ── Static Ridge IS weights ───────────────────────────────────────────────
+    names  = list(F_is.columns)
+    col_w  = 24
+    print(f"\n  Blend weights  (Static Ridge IS-fit, λ={ridge_lam})")
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'Signal':<20}" + "".join(f"  {s:>{col_w}}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'IS+OOS':<20}"
+          + "".join(f"  {bw_static.weights.get(s, 0.0):>+{col_w}.4f}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+
+    return df
