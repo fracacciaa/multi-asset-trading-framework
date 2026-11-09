@@ -382,6 +382,93 @@ def earnings_yield_all(
     return signal.clip(lower=q_lo, upper=q_hi, axis=0)
 
 
+def fcf_yield(
+    prices: pd.DataFrame,
+    market_cap: pd.DataFrame,
+    fcf: pd.DataFrame,
+    fcf_lag: int = 63,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Pure TTM FCF yield, sector-demeaned.
+
+    Uses realized free cash flow only — no analyst estimates, no buyback
+    component. The 63-day lag matches the reporting delay in the production
+    carry signal. Sector-demeaning removes the persistent cheap/expensive
+    sector bias (energy always cheap, tech always expensive).
+    """
+    signal = fcf.shift(fcf_lag) / market_cap.replace(0, np.nan)
+
+    sector_map = pd.Series(GICS).reindex(prices.columns)
+    for sect in sector_map.dropna().unique():
+        cols = sector_map[sector_map == sect].index.intersection(prices.columns).tolist()
+        if cols:
+            mu = signal[cols].mean(axis=1)
+            signal[cols] = signal[cols].sub(mu, axis=0)
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def earnings_revision(
+    prices: pd.DataFrame,
+    eps_fwd: pd.DataFrame,
+    lookback: int = 21,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Analyst earnings revision momentum: change in forward E/P over lookback days.
+
+    Avoids the level-based regime problem of earnings_yield_all by using the
+    *change* in analyst estimates. Rising estimates → long; falling → short.
+    Sector-demeaned to focus on relative revision dynamics within sector.
+    """
+    ep = eps_fwd / prices.shift(1).replace(0, np.nan)
+    signal = ep - ep.shift(lookback)
+
+    sector_map = pd.Series(GICS).reindex(prices.columns)
+    for sect in sector_map.dropna().unique():
+        cols = sector_map[sector_map == sect].index.intersection(prices.columns).tolist()
+        if cols:
+            mu = signal[cols].mean(axis=1)
+            signal[cols] = signal[cols].sub(mu, axis=0)
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def composite_carry(
+    prices: pd.DataFrame,
+    market_cap: pd.DataFrame,
+    fcf: pd.DataFrame,
+    eps_fwd: pd.DataFrame,
+    fcf_lag: int = 63,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Composite carry: equal-weight average of FCF yield and earnings yield.
+
+    Diversifies across two independent fundamental metrics so neither one
+    dominates. Each component is cross-sectionally standardized before
+    averaging so they contribute equally regardless of level differences.
+    """
+    c1 = fcf_yield(prices, market_cap, fcf, fcf_lag=fcf_lag)
+    c2 = earnings_yield_all(prices, eps_fwd)
+
+    def _xs_std(df):
+        mu  = df.mean(axis=1)
+        std = df.std(axis=1).replace(0, np.nan)
+        return df.sub(mu, axis=0).div(std, axis=0)
+
+    signal = (_xs_std(c1) + _xs_std(c2)) / 2.0
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
 def payout_momentum(
     prices: pd.DataFrame,
     market_cap: pd.DataFrame,
@@ -511,6 +598,9 @@ _SIGNAL_KINDS: dict[str, str] = {
     # carry extensions
     "earnings_yield_all": "xs",
     "payout_momentum":    "xs",
+    "fcf_yield":          "xs",
+    "earnings_revision":  "raw",
+    "composite_carry":    "xs",
 }
 
 
@@ -552,6 +642,7 @@ def build_vf_data(
         "carry":                    carry(prices, fundamentals),
         "threshold_mean_reversion": threshold_mean_reversion(prices),
         "earnings_yield_all":       earnings_yield_all(prices, fundamentals["eps_fwd"]),
+        "earnings_revision":        earnings_revision(prices, fundamentals["eps_fwd"]),
         **(extra_signals or {}),
     }
 
@@ -619,13 +710,22 @@ def apply_vf_params(
             if len(common) < 10:
                 continue
             try:
-                if _SIGNAL_KINDS[name] == "ts":
+                kind = _SIGNAL_KINDS[name]
+                if kind == "raw":
+                    s   = raw.loc[common]
+                    mu  = s.mean()
+                    sd  = s.std()
+                    z   = (s - mu) / (sd if sd > 1e-12 else 1.0)
+                    gross = z.abs().sum()
+                    w   = z / gross if gross > 1e-12 else z
+                elif kind == "ts":
                     vf = ViewFormationTS(raw.loc[common], cov.loc[common, common],
                                          params=ts_params)
+                    w = vf.generate_view()
                 else:
                     vf = ViewFormationXS(raw.loc[common], cov.loc[common, common],
                                          params=_xs)
-                w = vf.generate_view()
+                    w = vf.generate_view()
             except Exception:
                 continue
             # Store at the rebalance date AND hold dates so the backtest

@@ -30,7 +30,7 @@ import pandas as pd
 IS_END    = "2020-12-31"
 OOS_START = "2021-01-01"
 
-PRODUCTION_SIGNALS: list[str] = ["tsmom", "threshold_mean_reversion", "earnings_yield_all"]
+PRODUCTION_SIGNALS: list[str] = ["tsmom", "threshold_mean_reversion", "earnings_yield_all", "earnings_revision"]
 
 RESEARCH_SIGNALS: list[str] = [
     # production baseline (all 4, including momentum)
@@ -43,6 +43,7 @@ RESEARCH_SIGNALS: list[str] = [
     "threshold_mean_reversion",
     # carry extensions
     "earnings_yield_all", "payout_momentum",
+    "fcf_yield", "earnings_revision", "composite_carry",
 ]
 
 _SIGNAL_FAMILIES: dict[str, str] = {
@@ -60,6 +61,9 @@ _SIGNAL_FAMILIES: dict[str, str] = {
     "carry":               "carry",
     "earnings_yield_all":  "carry",
     "payout_momentum":     "carry",
+    "fcf_yield":           "carry",
+    "earnings_revision":   "carry",
+    "composite_carry":     "carry",
 }
 
 _VF_DATA_CACHE          = os.path.join(os.path.dirname(__file__), "cache", "vf_data.pkl")
@@ -134,10 +138,11 @@ def _load_or_build_research_vf_data(prices, fundamentals, rebuild=False, verbose
         residual_reversal, vol_scaled_reversal,
         threshold_mean_reversion,
         earnings_yield_all, payout_momentum,
+        fcf_yield, earnings_revision, composite_carry,
     )
 
     if verbose:
-        print("  computing 10 research signals …")
+        print("  computing 13 research signals …")
     extra = {
         "residual_momentum":        residual_momentum(prices),
         "fip_momentum":             fip_momentum(prices),
@@ -149,6 +154,9 @@ def _load_or_build_research_vf_data(prices, fundamentals, rebuild=False, verbose
         "threshold_mean_reversion": threshold_mean_reversion(prices),
         "earnings_yield_all":       earnings_yield_all(prices, fundamentals["eps_fwd"]),
         "payout_momentum":          payout_momentum(prices, fundamentals["market_cap"]),
+        "fcf_yield":                fcf_yield(prices, fundamentals["market_cap"], fundamentals["fcf"]),
+        "earnings_revision":        earnings_revision(prices, fundamentals["eps_fwd"]),
+        "composite_carry":          composite_carry(prices, fundamentals["market_cap"], fundamentals["fcf"], fundamentals["eps_fwd"]),
     }
 
     research_vf = {

@@ -84,6 +84,9 @@ def main():
 
     positions = load_or_build(args.rebuild)
 
+    from equities.pipeline import PRODUCTION_SIGNALS
+    positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
+
     from equities.data import fetch_prices
     prices  = fetch_prices(tickers=None)
     returns = prices.pct_change().dropna(how="all")
@@ -96,10 +99,10 @@ def main():
 
     from equities.blend import (
         build_managed_returns,
-        equal_weight, sharpe_heuristic, msrr_ridge,
+        equal_weight, sharpe_heuristic, msrr_ridge, msrr_lasso,
         enet_blend, c_enet_blend, e_enet_blend,
         inv_msfe_blend, pcr_blend, pls_blend,
-        DMABlend,
+        RollingMSRR, DMABlend,
     )
 
     # ── managed returns: T × K daily portfolio returns per sleeve ─────────────
@@ -118,6 +121,7 @@ def main():
         "sh_p2"        : sharpe_heuristic(F_is, power=2),
         "msrr_ols"     : msrr_ridge(F_is, lam=0.0),
         "msrr_ridge"   : msrr_ridge(F_is, lam=0.01),
+        "msrr_lasso"   : msrr_lasso(F_is, lam=0.01),
         "enet"         : enet_blend(F_is),
         "lasso"        : enet_blend(F_is, l1_ratio=1.0),
         "c_enet"       : c_enet_blend(F_is),
@@ -128,19 +132,32 @@ def main():
         "pls"          : pls_blend(F_is),
     }
 
-    # ── DMA: fit on IS, predict OOS ───────────────────────────────────────────
-    dma = DMABlend(alpha=0.99)
-    dma.fit(F_is)
-    dma_w_is  = dma._weights_history
-    dma_w_oos = dma.predict_weights(F_oos)
-
-    def dma_blended_return(F: pd.DataFrame, w_df: pd.DataFrame) -> pd.Series:
+    def _dynamic_return(F: pd.DataFrame, w_df: pd.DataFrame) -> pd.Series:
         idx = F.index.intersection(w_df.index)
         F_ = F.loc[idx]
         w_ = w_df.loc[idx]
         row_norm = w_.abs().sum(axis=1).replace(0.0, np.nan)
         w_ = w_.div(row_norm, axis=0)
         return (F_ * w_).sum(axis=1)
+
+    # ── rolling MSRR: fit on IS window, predict OOS ───────────────────────────
+    rolling_specs = [
+        ("roll_msrr_ols",   RollingMSRR(penalty="ols")),
+        ("roll_msrr_ridge", RollingMSRR(penalty="ridge", lam=0.01)),
+        ("roll_msrr_lasso", RollingMSRR(penalty="lasso", alpha=0.01)),
+    ]
+    rolling_results: list[tuple[str, pd.Series, pd.Series]] = []
+    for label, model in rolling_specs:
+        model.fit(F_is)
+        w_is  = model._weights_history
+        w_oos = model.predict_weights(F_oos)
+        rolling_results.append((label, _dynamic_return(F_is, w_is), _dynamic_return(F_oos, w_oos)))
+
+    # ── DMA: fit on IS, predict OOS ───────────────────────────────────────────
+    dma = DMABlend(alpha=0.99)
+    dma.fit(F_is)
+    dma_w_is  = dma._weights_history
+    dma_w_oos = dma.predict_weights(F_oos)
 
     # ── collect results ───────────────────────────────────────────────────────
     rows = []
@@ -163,12 +180,21 @@ def main():
             "OOS_Sharpe": annualized_sharpe(blend_return(F_oos, bw)),
         })
 
+    # rolling MSRR
+    for label, r_is, r_oos in rolling_results:
+        rows.append({
+            "method"    : label,
+            "type"      : "dynamic",
+            "IS_Sharpe" : annualized_sharpe(r_is),
+            "OOS_Sharpe": annualized_sharpe(r_oos),
+        })
+
     # DMA
     rows.append({
         "method"    : "dma",
         "type"      : "dynamic",
-        "IS_Sharpe" : annualized_sharpe(dma_blended_return(F_is,  dma_w_is)),
-        "OOS_Sharpe": annualized_sharpe(dma_blended_return(F_oos, dma_w_oos)),
+        "IS_Sharpe" : annualized_sharpe(_dynamic_return(F_is,  dma_w_is)),
+        "OOS_Sharpe": annualized_sharpe(_dynamic_return(F_oos, dma_w_oos)),
     })
 
     # ── print table ───────────────────────────────────────────────────────────
