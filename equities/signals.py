@@ -201,11 +201,316 @@ def carry(
     q_hi = composite.quantile(1 - winsor_pct, axis=1)
     return composite.clip(lower=q_lo, upper=q_hi, axis=0)
 
+# ── Research / extended signals ───────────────────────────────────────────────
+
+def residual_momentum(
+    prices: pd.DataFrame,
+    lookback: int = 252,
+    skip: int = 21,
+    beta_lookback: int = 252,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Market-orthogonal (residual) cross-sectional momentum.
+
+    Strip the EW-market beta component from each stock's formation-window
+    cumulative return. Residual return is a cleaner idiosyncratic signal
+    that avoids time-varying factor exposures (Blitz, Huij & Martens 2011).
+    """
+    log_ret = np.log(prices / prices.shift(1))
+    mkt_ret = log_ret.mean(axis=1)
+
+    # Vectorized rolling beta: Cov(stock, mkt) / Var(mkt)
+    cross    = log_ret.multiply(mkt_ret, axis=0)
+    roll_cov = (
+        cross.rolling(beta_lookback).mean()
+        .sub(log_ret.rolling(beta_lookback).mean()
+             .multiply(mkt_ret.rolling(beta_lookback).mean(), axis=0))
+    )
+    roll_var = (
+        mkt_ret.pow(2).rolling(beta_lookback).mean()
+        - mkt_ret.rolling(beta_lookback).mean().pow(2)
+    )
+    betas = roll_cov.div(roll_var.replace(0, np.nan), axis=0)
+
+    cum_stock = log_ret.shift(skip).rolling(lookback).sum()
+    cum_mkt   = mkt_ret.shift(skip).rolling(lookback).sum()
+
+    signal = cum_stock.sub(betas.multiply(cum_mkt, axis=0))
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def fip_momentum(
+    prices: pd.DataFrame,
+    lookback: int = 252,
+    skip: int = 21,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Frog-in-the-Pan momentum (Da, Gurun & Warachka 2014).
+
+    Weights the formation-window cumulative return by how continuous
+    (gradual) the price path was. Stocks whose gains arrived in many
+    small daily increments rather than a few large jumps show stronger
+    and more persistent momentum.
+
+    signal = (cumret + |cumret| × fip) / 2
+      where fip = (pos_days − neg_days) / total_days ∈ [-1, 1]
+
+    Consistent winners/losers get full signal strength; stocks with
+    contradictory daily-vs-cumulative information are dampened toward zero.
+    """
+    log_ret = np.log(prices / prices.shift(1))
+
+    signs   = (log_ret > 0).astype(float) - (log_ret < 0).astype(float)
+    fip     = signs.shift(skip).rolling(lookback, min_periods=lookback // 2).mean()
+    cum_ret = log_ret.shift(skip).rolling(lookback, min_periods=lookback // 2).sum()
+
+    signal  = (cum_ret + cum_ret.abs() * fip) / 2
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def high_52w(
+    prices: pd.DataFrame,
+    lookback: int = 252,
+    skip: int = 1,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    52-week high momentum (George & Hwang 2004).
+
+    Signal = price / rolling-maximum-price over the past year.
+    Stocks near their annual high are anchoring targets; investors
+    under-react to new positive news, creating momentum continuation.
+    """
+    p_lag  = prices.shift(skip)
+    p_high = p_lag.rolling(lookback, min_periods=lookback // 2).max()
+    signal = p_lag / p_high.replace(0, np.nan)
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def industry_reversal(
+    prices: pd.DataFrame,
+    lookback: int = 21,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Industry-adjusted short-term reversal (Hameed, Huang & Mian 2010).
+
+    Strips the sector-wide component from the lookback-day return before
+    negating. Sector-driven moves (fundamental information) are excluded;
+    only the idiosyncratic portion that tends to revert is kept.
+    """
+    ret = prices.shift(1) / prices.shift(lookback + 1) - 1
+
+    sector_map = pd.Series(GICS).reindex(prices.columns)
+    mkt_ret    = ret.mean(axis=1)
+
+    # Start from market mean; overwrite with sector mean per group
+    sector_ret = pd.DataFrame(
+        np.tile(mkt_ret.values[:, None], (1, len(prices.columns))),
+        index=prices.index, columns=prices.columns,
+    )
+    for sect in sector_map.dropna().unique():
+        cols = sector_map[sector_map == sect].index.intersection(prices.columns)
+        if len(cols) > 0:
+            mu = ret[cols].mean(axis=1).values[:, None]
+            sector_ret.loc[:, cols] = np.tile(mu, (1, len(cols)))
+
+    idio   = ret - sector_ret
+    signal = -idio
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def medium_reversal(
+    prices: pd.DataFrame,
+    lookback: int = 126,
+    skip: int = 21,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Medium-term mean reversion (6-month horizon, 1-month skip).
+
+    Negates the 6-month return (skipping the most recent month to avoid
+    overlap with short-term reversal). Sits between the 21-day reversal
+    and the 12-1m momentum window; tests whether medium-horizon returns
+    over-shoot fundamental value.
+    """
+    ret    = prices.shift(1 + skip) / prices.shift(lookback + 1 + skip) - 1
+    signal = -ret
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def earnings_yield_all(
+    prices: pd.DataFrame,
+    eps_fwd: pd.DataFrame,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Forward earnings yield for all stocks, sector-demeaned.
+
+    Purer earnings-based carry vs the composite carry signal (which mixes
+    FCF + buyback yield). Using forward EPS / price for every stock (not
+    just financials) gives a consistent cross-sectional comparison.
+    """
+    signal = (eps_fwd / prices.replace(0, np.nan)).copy()
+
+    sector_map = pd.Series(GICS).reindex(prices.columns)
+    for sect in sector_map.dropna().unique():
+        cols = sector_map[sector_map == sect].index.intersection(prices.columns).tolist()
+        if cols:
+            mu = signal[cols].mean(axis=1)
+            signal[cols] = signal[cols].sub(mu, axis=0)
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def payout_momentum(
+    prices: pd.DataFrame,
+    market_cap: pd.DataFrame,
+    lookback: int = 252,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Payout momentum: year-over-year change in net buyback yield.
+
+    Rising buyback yield signals management confidence in future cash flows
+    (Boudoukh, Michaely, Richardson & Roberts 2007). Increasing repurchase
+    activity predicts higher future returns in the cross-section.
+    """
+    adj_shares    = market_cap / prices.replace(0, np.nan)
+    buyback_yield = -np.log(adj_shares / adj_shares.shift(lookback))
+    signal        = buyback_yield - buyback_yield.shift(lookback)
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def residual_reversal(
+    prices: pd.DataFrame,
+    lookback: int = 21,
+    beta_lookback: int = 252,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Market-orthogonal short-term reversal (Blitz, Huij, Lansdorp & Verbeek 2013).
+
+    Strips the EW-market beta from the lookback-day cumulative return before
+    negating. Removes systematic factor reversals that contaminate the raw
+    signal, leaving a cleaner idiosyncratic mean-reversion bet.
+    """
+    log_ret = np.log(prices / prices.shift(1))
+    mkt_ret = log_ret.mean(axis=1)
+
+    cross    = log_ret.multiply(mkt_ret, axis=0)
+    roll_cov = (
+        cross.rolling(beta_lookback).mean()
+        .sub(log_ret.rolling(beta_lookback).mean()
+             .multiply(mkt_ret.rolling(beta_lookback).mean(), axis=0))
+    )
+    roll_var = (
+        mkt_ret.pow(2).rolling(beta_lookback).mean()
+        - mkt_ret.rolling(beta_lookback).mean().pow(2)
+    )
+    betas = roll_cov.div(roll_var.replace(0, np.nan), axis=0)
+
+    cum_stock = log_ret.shift(1).rolling(lookback).sum()
+    cum_mkt   = mkt_ret.shift(1).rolling(lookback).sum()
+
+    idio   = cum_stock.sub(betas.multiply(cum_mkt, axis=0))
+    signal = -idio
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def vol_scaled_reversal(
+    prices: pd.DataFrame,
+    lookback: int = 21,
+    vol_lookback: int = 63,
+    winsor_pct: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Volatility-scaled short-term reversal.
+
+    Divides the lookback-day return by the stock's rolling realized volatility
+    before negating. Equivalent to reversing a Sharpe-ratio-like measure: a
+    large return in a low-vol stock (more statistically unusual) generates a
+    stronger signal than the same return in a high-vol stock.
+    """
+    log_ret  = np.log(prices / prices.shift(1))
+    real_vol = log_ret.rolling(vol_lookback).std().replace(0, np.nan)
+    cum_ret  = log_ret.shift(1).rolling(lookback).sum()
+    signal   = -(cum_ret / real_vol)
+
+    q_lo = signal.quantile(winsor_pct, axis=1)
+    q_hi = signal.quantile(1 - winsor_pct, axis=1)
+    return signal.clip(lower=q_lo, upper=q_hi, axis=0)
+
+
+def threshold_mean_reversion(
+    prices: pd.DataFrame,
+    lookback: int = 21,
+    threshold: float = 1.0,
+) -> pd.DataFrame:
+    """
+    State-machine mean reversion: enter short when XS z-score > +threshold,
+    switch to long when z-score < -threshold, hold otherwise.
+
+    Unlike raw reversal signals this avoids fading small drifts — it only
+    takes a position after a statistically significant cross-sectional
+    dislocation, then holds until the opposite extreme is reached.
+    """
+    ret = prices.shift(1) / prices.shift(lookback + 1) - 1
+    mu  = ret.mean(axis=1)
+    std = ret.std(axis=1).replace(0, np.nan)
+    z   = ret.sub(mu, axis=0).div(std, axis=0)
+
+    # Mark threshold crossings; NaN means "no new trigger, hold previous state"
+    trigger = pd.DataFrame(np.nan, index=z.index, columns=z.columns)
+    trigger[z >  threshold] = -1.0   # large up move → short (expect reversal)
+    trigger[z < -threshold] = +1.0   # large down move → long (expect reversal)
+    return trigger.ffill().fillna(0.0)
+
+
 _SIGNAL_KINDS: dict[str, str] = {
-    "momentum":       "xs",
-    "tsmom":          "ts",
-    "mean_reversion": "xs",
-    "carry":          "xs",
+    # production
+    "momentum":           "xs",
+    "tsmom":              "ts",
+    "mean_reversion":     "xs",
+    "carry":              "xs",
+    # momentum extensions
+    "residual_momentum":  "xs",
+    "fip_momentum":       "xs",
+    "high_52w":           "xs",
+    # mean-reversion extensions
+    "industry_reversal":          "xs",
+    "medium_reversal":            "xs",
+    "residual_reversal":          "xs",
+    "vol_scaled_reversal":        "xs",
+    "threshold_mean_reversion":   "xs",
+    # carry extensions
+    "earnings_yield_all": "xs",
+    "payout_momentum":    "xs",
 }
 
 
@@ -218,12 +523,16 @@ def build_vf_data(
     cov_lookback: int = 504,
     vol_halflife: int = 21,
     cor_halflife: int = 126,
+    extra_signals: Optional[dict] = None,
 ) -> dict:
     """
     Compute raw signals and covariance matrices at every VF rebalance date.
 
     This is the slow step (~5 min). Cache the result and reuse with
     apply_vf_params() to test different VF configurations cheaply.
+
+    extra_signals: optional dict of {name: raw_signal_df} to merge with the
+                   4 production signals before running VF.
 
     Returns
     -------
@@ -237,10 +546,12 @@ def build_vf_data(
     from optimization import estimate_covariance
 
     raw_signals: dict[str, pd.DataFrame] = {
-        "momentum":       momentum(prices),
-        "tsmom":          tsmom(prices),
-        "mean_reversion": mean_reversion(prices),
-        "carry":          carry(prices, fundamentals),
+        "momentum":                 momentum(prices),
+        "tsmom":                    tsmom(prices),
+        "mean_reversion":           mean_reversion(prices),
+        "carry":                    carry(prices, fundamentals),
+        "threshold_mean_reversion": threshold_mean_reversion(prices),
+        **(extra_signals or {}),
     }
 
     all_dates   = returns.index
@@ -316,6 +627,11 @@ def apply_vf_params(
                 w = vf.generate_view()
             except Exception:
                 continue
+            # Store at the rebalance date AND hold dates so the backtest
+            # picks up new weights immediately (at rd) rather than one full
+            # cycle later (at next_rd).  Signal at rd uses prices through
+            # rd-1 (via .shift(1)), so there is no look-ahead.
+            positions[name].loc[rd, w.index] = w.values
             for d in hold_dates:
                 positions[name].loc[d, w.index] = w.values
 
