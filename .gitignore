@@ -12,3 +12,4 @@ build/
 script.py
 script1.py
 *.pdf
+equities/cache/
