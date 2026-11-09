@@ -363,7 +363,8 @@ def tc_sweep_rates(
     lookback: int = 252,
     min_obs: int = 63,
     vol_target: float = 0.10,
-) -> pd.DataFrame:
+    _collect_returns: bool = False,
+) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """
     TC sensitivity sweep for the rates blend, with market-specific half-spreads.
 
@@ -395,6 +396,9 @@ def tc_sweep_rates(
     -------
     pd.DataFrame with columns [Method, Scenario, Period, Sharpe, MDD_pct, TO].
     Method is "Fixed weights" or "Adaptive Ridge".
+    When _collect_returns=True (used internally by run_rates_tc), returns a
+    tuple (df, returns_df) where returns_df is a DataFrame with MultiIndex
+    columns (Method, Scenario) containing the IS+OOS combined daily return series.
     """
     if scenarios is None:
         scenarios = TC_SCENARIOS
@@ -506,6 +510,7 @@ def tc_sweep_rates(
 
     # ── Sweep ─────────────────────────────────────────────────────────────────
     records = []
+    _returns_dict: dict[tuple, pd.Series] = {}   # populated when _collect_returns=True
 
     for scenario_name, tc_per_mkt in scenarios.items():
         # TC-adjusted managed returns (shared by both methods)
@@ -547,6 +552,11 @@ def tc_sweep_rates(
                 "TO":       _blend_to(w, t0, t1),
             })
 
+        if _collect_returns:
+            _returns_dict[("Fixed weights", scenario_name)] = pd.concat(
+                [r_is_f, r_oos_f]
+            ).sort_index()
+
         # ── Method 2: Adaptive Ridge — re-fit under each TC scenario ──────────
         F_is_n, F_oos_n = vol_normalise(F_tc_is, F_tc_oos)
         F_full_n = pd.concat([F_is_n, F_oos_n]).sort_index()
@@ -571,6 +581,11 @@ def tc_sweep_rates(
                 "MDD_pct":  _mdd(r),
                 "TO":       _blend_to(w, t0, t1),
             })
+
+        if _collect_returns:
+            _returns_dict[("Adaptive Ridge", scenario_name)] = pd.concat(
+                [r_is_a, r_oos_a]
+            ).sort_index()
 
     df = pd.DataFrame(records)
 
@@ -614,7 +629,49 @@ def tc_sweep_rates(
         print(f"  {mkt:<18}{vals}")
     print("  " + "─" * (20 + col_w * len(scen_names)))
 
+    if _collect_returns:
+        returns_df = pd.DataFrame(_returns_dict)
+        returns_df.columns = pd.MultiIndex.from_tuples(
+            returns_df.columns, names=["Method", "Scenario"]
+        )
+        return df, returns_df
     return df
+
+
+def run_rates_tc(
+    scenarios: Optional[dict] = None,
+    signals_dir: Optional[str | Path] = None,
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    lookback: int = 252,
+    min_obs: int = 63,
+    vol_target: float = 0.10,
+) -> dict:
+    """
+    Full rates TC sweep: metrics table + daily return timeseries for all scenarios.
+
+    Identical to tc_sweep_rates() in computation and printed output, but also
+    captures the per-scenario combined daily return series (IS + OOS) for both
+    blend methods so they can be plotted or further analysed.
+
+    Returns
+    -------
+    dict with keys:
+        'metrics'   pd.DataFrame — [Method, Scenario, Period, Sharpe, MDD_pct, TO]
+        'returns'   pd.DataFrame — daily returns, MultiIndex columns (Method, Scenario)
+                    Each column is the IS + OOS combined series for that blend config.
+    """
+    df, returns_df = tc_sweep_rates(
+        scenarios=scenarios,
+        signals_dir=signals_dir,
+        is_end=is_end,
+        oos_start=oos_start,
+        lookback=lookback,
+        min_obs=min_obs,
+        vol_target=vol_target,
+        _collect_returns=True,
+    )
+    return {"metrics": df, "returns": returns_df}
 
 
 def run_rates_prod(

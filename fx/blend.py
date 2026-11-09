@@ -414,6 +414,251 @@ def run_fx_prod(
     return pd.concat([r_is, r_oos]).sort_index().rename("fx_combined")
 
 
+TC_SCENARIOS_FX: dict[str, float] = {
+    "best":  0.3,   # major G10 in tight conditions (EURUSD/USDJPY ~0.3 bp)
+    "base":  1.0,   # typical institutional across full 20-pair universe
+    "worst": 3.0,   # stress / flash crash / thin liquidity
+}
+
+
+def tc_sweep_fx(
+    scenarios: Optional[dict] = None,
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    lookback: int = 36,
+    min_obs: int = 24,
+    vol_target: float = 0.10,
+) -> pd.DataFrame:
+    """
+    TC sensitivity sweep for the FX blend, with a single average spread per scenario.
+
+    Runs two parallel sweeps (same logic as tc_sweep_rates in rates/blend.py):
+      Fixed weights  — Rolling Ridge fit ONCE on TC-free signals; only the TC
+                       deduction changes across scenarios.  Pure cost impact,
+                       Sharpe decreases monotonically with higher TC.
+      Adaptive Ridge — Rolling Ridge RE-FIT on TC-adjusted IS per scenario;
+                       blend weights shift away from high-TC signals as costs rise.
+
+    TC deducted from each signal's monthly managed return:
+      momentum / carry_xs  : |Δmonthly_pos|.sum(pairs) × (h_bp / 10_000)
+      mr_ns_loo            : daily |Δpos|.sum(pairs) × (h_bp / 10_000), summed to month
+                             (mr_ns_loo rebalances daily, so TC accumulates intra-month)
+
+    Parameters
+    ----------
+    scenarios   Dict mapping scenario label → avg G10 half_spread_bp (single spread
+                applied uniformly across all pairs).
+                Default: TC_SCENARIOS_FX (best=0.3 bp, base=1.0 bp, worst=3.0 bp).
+    signals_dir Directory containing the parquet files.  Default: fx/signals/.
+    is_end      Last IS date.  Default: "2020-12-31".
+    oos_start   First OOS date.  Default: "2021-01-01".
+    lookback    Rolling Ridge window in months.  Default: 36.
+    min_obs     Minimum observations before first weight estimate.  Default: 24.
+    vol_target  For MDD computation (scales NAV to target annual vol).
+
+    Returns
+    -------
+    pd.DataFrame with columns [Method, Scenario, Period, Sharpe, MDD_pct, TO].
+    Method is "Fixed weights" or "Adaptive Ridge".
+    """
+    if scenarios is None:
+        scenarios = TC_SCENARIOS_FX
+
+    sdir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    rx_m = pd.read_parquet(sdir / "returns.parquet")["rx_m"]
+    rx_d = pd.read_parquet(sdir / _RX_FILE)
+
+    pos_mom = pd.read_parquet(sdir / "signal_a_f9_h1.parquet")
+    pos_cxs = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
+    pos_mr  = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")  # daily
+
+    # ── Gross managed returns (TC-free, matches load_monthly_managed_returns) ─
+    pnl_mom = (pos_mom.shift(1) * rx_m.reindex(columns=pos_mom.columns)).sum(axis=1)
+    pnl_mr  = ((pos_mr * rx_d.reindex(columns=pos_mr.columns)).sum(axis=1)
+               .resample("BME").sum())
+    pnl_cxs = (pos_cxs.shift(1) * rx_m.reindex(columns=pos_cxs.columns)).sum(axis=1)
+
+    F_gross = pd.DataFrame({
+        "momentum":  pnl_mom,
+        "mr_ns_loo": pnl_mr,
+        "carry_xs":  pnl_cxs,
+    }).dropna().sort_index()
+
+    # ── Precompute monthly |Δpos| per signal (factor out of scenario loop) ────
+    # momentum / carry_xs: monthly rebalance → one TC event per month
+    chg_mom = pos_mom.diff().abs().sum(axis=1)
+    chg_cxs = pos_cxs.diff().abs().sum(axis=1)
+    # mr_ns_loo: daily rebalance → accumulate daily TC within each month
+    chg_mr  = pos_mr.diff().abs().sum(axis=1).resample("BME").sum()
+
+    pos_chg = {
+        "momentum":  chg_mom,
+        "mr_ns_loo": chg_mr,
+        "carry_xs":  chg_cxs,
+    }
+
+    # Monthly positions for blended-pair TO computation (mirrors run_fx_prod)
+    monthly_pos = {
+        "momentum":  pos_mom,
+        "mr_ns_loo": pos_mr.resample("BME").last(),
+        "carry_xs":  pos_cxs,
+    }
+    common_pairs = sorted(
+        set.intersection(*[set(p.columns) for p in monthly_pos.values()])
+    )
+
+    # ── Metric helpers (monthly frequency: annualise with √12) ───────────────
+
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 12 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(12))
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if r.empty:
+            return float("nan")
+        cum = (1 + r * vol_target).cumprod()
+        return float((cum / cum.cummax() - 1).min() * 100)
+
+    def _to(w_df: pd.DataFrame, sigma: pd.Series, t0, t1) -> float:
+        """Blended pair-level annualised one-way turnover, same as run_fx_prod."""
+        idx = w_df.dropna().index
+        idx = idx[(idx >= pd.Timestamp(t0)) & (idx <= pd.Timestamp(t1))]
+        if len(idx) == 0:
+            return float("nan")
+        w = w_df.loc[idx]
+        w = w.div(w.abs().sum(axis=1).replace(0.0, np.nan), axis=0)
+        pos = pd.DataFrame(0.0, index=idx, columns=common_pairs)
+        for k in w.columns:
+            if k not in monthly_pos or k not in sigma.index:
+                continue
+            pk = monthly_pos[k].reindex(index=idx, columns=common_pairs).fillna(0.0)
+            pos += pk.mul(w[k] / sigma[k], axis=0)
+        return float(pos.diff().abs().sum(axis=1).mean() * 12)
+
+    # ── TC-free baseline: fit Rolling Ridge ONCE for fixed-weight method ──────
+    F_free_is  = F_gross.loc[F_gross.index <= is_end]
+    F_free_oos = F_gross.loc[F_gross.index >= oos_start]
+
+    sigma_free = F_free_is.std() * np.sqrt(12)
+    sigma_free = sigma_free.replace(0.0, np.nan)
+    F_free_is_n  = F_free_is.div(sigma_free)
+    F_free_oos_n = F_free_oos.div(sigma_free)
+
+    model_free = RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
+    model_free.fit(F_free_is_n)
+    w_is_fixed  = model_free._weights_history
+    w_oos_fixed = model_free.predict_weights(F_free_oos_n)
+
+    # ── Sweep ─────────────────────────────────────────────────────────────────
+    records = []
+
+    for scenario_name, h_bp in scenarios.items():
+        h = h_bp / 10_000  # bp → decimal (same units as rx_m)
+
+        # TC-adjusted managed returns
+        series = {}
+        for sig in F_gross.columns:
+            tc_m = (pos_chg[sig] * h).reindex(F_gross.index).fillna(0.0)
+            series[sig] = F_gross[sig] - tc_m
+
+        F_tc = pd.DataFrame(series).dropna().sort_index()
+        F_tc_is  = F_tc.loc[F_tc.index <= is_end]
+        F_tc_oos = F_tc.loc[F_tc.index >= oos_start]
+
+        if len(F_tc_is) < min_obs or len(F_tc_oos) < 12:
+            continue
+
+        # ── Method 1: Fixed weights — TC-free Ridge, only deduct cost ─────────
+        F_tc_is_n  = F_tc_is.div(sigma_free)
+        F_tc_oos_n = F_tc_oos.div(sigma_free)
+        r_is_f  = combined_return_rolling(F_tc_is_n,  w_is_fixed.reindex(F_tc_is_n.index))
+        r_oos_f = combined_return_rolling(F_tc_oos_n, w_oos_fixed.reindex(F_tc_oos_n.index))
+
+        for period, r, w, t0, t1 in [
+            ("IS",  r_is_f,  w_is_fixed,  F_tc_is_n.index[0],  F_tc_is_n.index[-1]),
+            ("OOS", r_oos_f, w_oos_fixed, F_tc_oos_n.index[0], F_tc_oos_n.index[-1]),
+        ]:
+            records.append({
+                "Method":   "Fixed weights",
+                "Scenario": scenario_name,
+                "Period":   period,
+                "Sharpe":   _sharpe(r),
+                "MDD_pct":  _mdd(r),
+                "TO":       _to(w, sigma_free, t0, t1),
+            })
+
+        # ── Method 2: Adaptive Ridge — re-fit per TC scenario ─────────────────
+        sigma_tc = F_tc_is.std() * np.sqrt(12)
+        sigma_tc = sigma_tc.replace(0.0, np.nan)
+        F_tc_is_n2  = F_tc_is.div(sigma_tc)
+        F_tc_oos_n2 = F_tc_oos.div(sigma_tc)
+
+        model_tc = RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
+        model_tc.fit(F_tc_is_n2)
+        w_is_a  = model_tc._weights_history
+        w_oos_a = model_tc.predict_weights(F_tc_oos_n2)
+        r_is_a  = combined_return_rolling(F_tc_is_n2, w_is_a)
+        r_oos_a = combined_return_rolling(F_tc_oos_n2, w_oos_a)
+
+        for period, r, w, t0, t1 in [
+            ("IS",  r_is_a,  w_is_a,  F_tc_is_n2.index[0],  F_tc_is_n2.index[-1]),
+            ("OOS", r_oos_a, w_oos_a, F_tc_oos_n2.index[0], F_tc_oos_n2.index[-1]),
+        ]:
+            records.append({
+                "Method":   "Adaptive Ridge",
+                "Scenario": scenario_name,
+                "Period":   period,
+                "Sharpe":   _sharpe(r),
+                "MDD_pct":  _mdd(r),
+                "TO":       _to(w, sigma_tc, t0, t1),
+            })
+
+    df = pd.DataFrame(records)
+
+    # ── Print results ─────────────────────────────────────────────────────────
+    W = 80
+    for method in ["Fixed weights", "Adaptive Ridge"]:
+        sub = df[df["Method"] == method]
+        label = (
+            "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
+            if method == "Fixed weights"
+            else "ADAPTIVE RIDGE — Ridge re-fit per TC scenario"
+        )
+        print("\n" + "=" * W)
+        print(f"  FX  |  {label}")
+        print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  vol target={vol_target*100:.0f}%  |  monthly")
+        print("=" * W)
+        print(f"  {'Scenario':<12}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>8}")
+        print("  " + "─" * (W - 2))
+        prev_scen = None
+        for _, row in sub.iterrows():
+            if prev_scen is not None and row["Scenario"] != prev_scen:
+                print("  " + "─" * (W - 2))
+            prev_scen = row["Scenario"]
+            sr  = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])   else "   n/a"
+            mdd = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "    n/a"
+            to  = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])       else "   n/a"
+            print(f"  {row['Scenario']:<12}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>8}")
+        print("=" * W)
+
+    # ── TC table ──────────────────────────────────────────────────────────────
+    print(f"\n  TC assumptions (avg G10 half-spread, one-way, bp)")
+    print("  " + "─" * 42)
+    print(f"  {'Scenario':<12}  {'half-spread (bp)':>18}")
+    print("  " + "─" * 42)
+    for name, h in scenarios.items():
+        print(f"  {name:<12}  {h:>18.1f}")
+    print("  " + "─" * 42)
+
+    return df
+
+
 def compare_blend_methods(
     signals_dir: str | Path | None = None,
     lookback: int = 36,
