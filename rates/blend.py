@@ -73,6 +73,12 @@ SIGNAL_FILES: dict[str, str] = {
     "mean_reversion": "mean_reversion_pnl.parquet",
 }
 
+_POS_FILES: dict[str, str] = {
+    "momentum":       "momentum_a_daily.parquet",
+    "carry":          "carry_ois_par.parquet",
+    "mean_reversion": "mean_reversion.parquet",
+}
+
 IS_END    = "2018-12-31"
 OOS_START = "2019-01-01"
 
@@ -306,3 +312,144 @@ def run_rates_blend(
         print("Signal parquets found — skipping rebuild. Pass rebuild_signals=True to refresh.")
 
     return run_blend(lookback=lookback, min_obs=min_obs)
+
+
+def run_rates_prod(
+    signals_dir: Optional[str | Path] = None,
+    lookback: int = 252,
+    min_obs: int = 63,
+    print_results: bool = True,
+) -> pd.Series:
+    """
+    Production rates pipeline: blend signals, report metrics, return returns.
+
+    Runs the rolling OLS MSRR blend on all three production signals (momentum,
+    carry, mean_reversion), prints an IS / OOS summary table (Sharpe, MDD,
+    position-level turnover), and returns the full combined daily return series.
+
+    Parameters
+    ----------
+    signals_dir     Override the default rates/signals/ directory.
+    lookback        Rolling OLS window in trading days (default 252).
+    min_obs         Minimum observations before first blend weight (default 63).
+    print_results   Print the summary table (default True).
+
+    Returns
+    -------
+    pd.Series of daily combined portfolio returns (IS + OOS concatenated).
+    """
+    result = run_blend(signals_dir=signals_dir, lookback=lookback, min_obs=min_obs)
+
+    r_is   = result["r_is"]
+    r_oos  = result["r_oos"]
+    w_full = result["weights"]
+    F_is   = result["F_is"]
+    F_oos  = result["F_oos"]
+
+    r_full = pd.concat([r_is, r_oos]).sort_index()
+    r_full.name = "rates"
+
+    if not print_results:
+        return r_full
+
+    sig_dir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+
+    # ── metric helpers ────────────────────────────────────────────────────────
+
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 30 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(252))
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 2:
+            return float("nan")
+        cum = (1 + r).cumprod()
+        return float((cum / cum.cummax() - 1).min() * 100)
+
+    def _sig_to(pos_df: pd.DataFrame, start, end) -> float:
+        p = pos_df.loc[start:end].dropna(how="all")
+        if len(p) < 2:
+            return float("nan")
+        gross = p.abs().sum(axis=1).replace(0.0, np.nan).mean()
+        if gross < 1e-12 or np.isnan(gross):
+            return float("nan")
+        return float(p.diff().dropna(how="all").abs().sum(axis=1).mean() * 252 / gross)
+
+    # Load position parquets once
+    sig_pos: dict[str, pd.DataFrame] = {}
+    for name, fname in _POS_FILES.items():
+        path = sig_dir / fname
+        if path.exists():
+            sig_pos[name] = pd.read_parquet(path)
+
+    def _blend_to(w_df: pd.DataFrame, start, end) -> float:
+        """Time-averaged position-level TO weighted by rolling blend allocations."""
+        idx = w_df.dropna(how="any").index
+        idx = idx[(idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))]
+        if len(idx) == 0 or not sig_pos:
+            return float("nan")
+        w_period = w_df.loc[idx]
+        norms    = w_period.abs().sum(axis=1).replace(0.0, np.nan)
+        w_norm   = w_period.div(norms, axis=0)
+        sig_tos  = {k: _sig_to(sig_pos[k], start, end) for k in sig_pos}
+        weighted = w_norm.abs().mul(
+            pd.Series(sig_tos).reindex(w_norm.columns).fillna(0.0)
+        )
+        return float(weighted.sum(axis=1).mean())
+
+    # ── compute metrics ───────────────────────────────────────────────────────
+
+    w_is  = w_full.reindex(F_is.index)
+    w_oos = w_full.reindex(F_oos.index)
+
+    periods = {
+        ("IS",  f"IS  ({F_is.index[0].date()} → {F_is.index[-1].date()})"): (
+            r_is, w_is, F_is.index[0], F_is.index[-1]
+        ),
+        ("OOS", f"OOS ({F_oos.index[0].date()} → {F_oos.index[-1].date()})"): (
+            r_oos, w_oos, F_oos.index[0], F_oos.index[-1]
+        ),
+    }
+
+    rows = {}
+    for (short, long_label), (r, w, t0, t1) in periods.items():
+        rows[short] = {
+            "label":    long_label,
+            "sharpe":   _sharpe(r),
+            "mdd":      _mdd(r),
+            "turnover": _blend_to(w, t0, t1),
+            "w_avg":    w.dropna().mean(),
+        }
+
+    # ── print table ───────────────────────────────────────────────────────────
+
+    W = 68
+    print("=" * W)
+    print("  RATES PRODUCTION  (rolling OLS MSRR, lookback=252d)")
+    print("=" * W)
+    print(f"  {'Period':<42}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
+    print("  " + "─" * (W - 2))
+    for m in rows.values():
+        sr  = f"{m['sharpe']:+.2f}"   if not np.isnan(m["sharpe"])   else "   n/a"
+        mdd = f"{m['mdd']:.1f}%"      if not np.isnan(m["mdd"])      else "   n/a"
+        to  = f"{m['turnover']:.1f}x" if not np.isnan(m["turnover"]) else "   n/a"
+        print(f"  {m['label']:<42}  {sr:>7}  {mdd:>8}  {to:>7}")
+    print("=" * W)
+
+    # ── avg blend weights ─────────────────────────────────────────────────────
+
+    names = list(F_is.columns)
+    col_w = 16
+    print(f"\n  Avg blend weights  (rolling OLS)")
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'Period':<20}" + "".join(f"  {s:>{col_w}}" for s in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+    for period_short, m in rows.items():
+        w_str = "".join(f"  {m['w_avg'].get(s, 0.0):>+{col_w}.1%}" for s in names)
+        print(f"  {period_short:<20}{w_str}")
+    print("  " + "─" * (22 + col_w * len(names)))
+
+    return r_full
