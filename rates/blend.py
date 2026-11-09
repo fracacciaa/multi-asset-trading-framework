@@ -39,6 +39,9 @@ import pandas as pd
 from equities.blend import (                                        # noqa: F401
     BlendWeights,
     equal_weight,
+    inv_vol_blend,
+    erc_blend,
+    hrp_blend,
     sharpe_heuristic,
     msrr_ridge,
     msrr_lasso,
