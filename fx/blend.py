@@ -429,7 +429,8 @@ def tc_sweep_fx(
     lookback: int = 36,
     min_obs: int = 24,
     vol_target: float = 0.10,
-) -> pd.DataFrame:
+    _collect_returns: bool = False,
+) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """
     TC sensitivity sweep for the FX blend, with a single average spread per scenario.
 
@@ -461,6 +462,9 @@ def tc_sweep_fx(
     -------
     pd.DataFrame with columns [Method, Scenario, Period, Sharpe, MDD_pct, TO].
     Method is "Fixed weights" or "Adaptive Ridge".
+    When _collect_returns=True (used internally by run_fx_tc), returns a tuple
+    (df, returns_df) where returns_df is a DataFrame with MultiIndex columns
+    (Method, Scenario) containing the IS+OOS combined monthly return series.
     """
     if scenarios is None:
         scenarios = TC_SCENARIOS_FX
@@ -557,6 +561,7 @@ def tc_sweep_fx(
 
     # ── Sweep ─────────────────────────────────────────────────────────────────
     records = []
+    _returns_dict: dict[tuple, pd.Series] = {}   # populated when _collect_returns=True
 
     for scenario_name, h_bp in scenarios.items():
         h = h_bp / 10_000  # bp → decimal (same units as rx_m)
@@ -593,6 +598,11 @@ def tc_sweep_fx(
                 "TO":       _to(w, sigma_free, t0, t1),
             })
 
+        if _collect_returns:
+            _returns_dict[("Fixed weights", scenario_name)] = pd.concat(
+                [r_is_f, r_oos_f]
+            ).sort_index()
+
         # ── Method 2: Adaptive Ridge — re-fit per TC scenario ─────────────────
         sigma_tc = F_tc_is.std() * np.sqrt(12)
         sigma_tc = sigma_tc.replace(0.0, np.nan)
@@ -618,6 +628,11 @@ def tc_sweep_fx(
                 "MDD_pct":  _mdd(r),
                 "TO":       _to(w, sigma_tc, t0, t1),
             })
+
+        if _collect_returns:
+            _returns_dict[("Adaptive Ridge", scenario_name)] = pd.concat(
+                [r_is_a, r_oos_a]
+            ).sort_index()
 
     df = pd.DataFrame(records)
 
@@ -656,7 +671,49 @@ def tc_sweep_fx(
         print(f"  {name:<12}  {h:>18.1f}")
     print("  " + "─" * 42)
 
+    if _collect_returns:
+        returns_df = pd.DataFrame(_returns_dict)
+        returns_df.columns = pd.MultiIndex.from_tuples(
+            returns_df.columns, names=["Method", "Scenario"]
+        )
+        return df, returns_df
     return df
+
+
+def run_fx_tc(
+    scenarios: Optional[dict] = None,
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    lookback: int = 36,
+    min_obs: int = 24,
+    vol_target: float = 0.10,
+) -> dict:
+    """
+    Full FX TC sweep: metrics table + monthly return timeseries for all scenarios.
+
+    Identical to tc_sweep_fx() in computation and printed output, but also
+    captures the per-scenario combined monthly return series (IS + OOS) for both
+    blend methods so they can be plotted or further analysed.
+
+    Returns
+    -------
+    dict with keys:
+        'metrics'   pd.DataFrame — [Method, Scenario, Period, Sharpe, MDD_pct, TO]
+        'returns'   pd.DataFrame — monthly returns, MultiIndex columns (Method, Scenario)
+                    Each column is the IS + OOS combined series for that blend config.
+    """
+    df, returns_df = tc_sweep_fx(
+        scenarios=scenarios,
+        signals_dir=signals_dir,
+        is_end=is_end,
+        oos_start=oos_start,
+        lookback=lookback,
+        min_obs=min_obs,
+        vol_target=vol_target,
+        _collect_returns=True,
+    )
+    return {"metrics": df, "returns": returns_df}
 
 
 def compare_blend_methods(
