@@ -261,10 +261,10 @@ def run_fx_blend(
     min_obs: int = 24,
 ) -> dict:
     """
-    Canonical FX blend pipeline: monthly managed returns → rolling OLS MSRR.
+    Canonical FX blend pipeline: monthly managed returns → rolling Ridge MSRR.
 
     Loads the three production signal managed returns, vol-normalises to unit
-    annual vol using IS σ only (no look-ahead), fits a rolling OLS MSRR on IS
+    annual vol using IS σ only (no look-ahead), fits a rolling Ridge MSRR on IS
     data (lookback=36m), and predicts weights on OOS.
 
     Parameters
@@ -293,7 +293,7 @@ def run_fx_blend(
     F_is  = F_is_raw.div(sigma)
     F_oos = F_oos_raw.div(sigma)
 
-    model = RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)
+    model = RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
     model.fit(F_is)
     w_is  = model._weights_history
     w_oos = model.predict_weights(F_oos)
@@ -397,7 +397,7 @@ def run_fx_prod(
         oos_end   = result["F_oos"].index[-1].strftime("%Y-%m")
         print()
         print("=" * W)
-        print("  FX PRODUCTION  —  Rolling OLS MSRR  (lookback={:d}m, 3 signals)".format(lookback))
+        print("  FX PRODUCTION  —  Rolling Ridge MSRR  (lookback={:d}m, 3 signals)".format(lookback))
         print(f"  IS  : {is_start} → {is_end}   |   OOS : {OOS_START[:7]} → {oos_end}")
         print("=" * W)
         print(f"  {'':20}  {'Sharpe':>8}  {'MDD':>9}  {'Turnover':>10}")

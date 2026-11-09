@@ -240,28 +240,28 @@ def _expanding_ols_weights(F: pd.DataFrame, min_obs: int = 252) -> pd.DataFrame:
 def run_comm_blend(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
-    min_obs: int = 252,
+    lam: float = 0.01,
 ) -> dict:
     """
-    Canonical commodities blend pipeline: daily managed returns → rolling OLS.
+    Canonical commodities blend pipeline: daily managed returns → static Ridge MSRR.
 
     Vol-normalises to unit annual vol using IS σ only (no look-ahead), then fits
-    an expanding-window MSRR OLS blend where weights at day t are estimated on
-    all data strictly before t.
+    a static Ridge MSRR blend on IS data and applies the fixed weights to both IS
+    and OOS.
 
     Parameters
     ----------
     signals_dir   Directory with parquet files.  Default: commodities/signals/.
     is_end        Last IS date.  Default: IS_END ("2020-12-31").
-    min_obs       Minimum observations before computing blend weights.  Default: 252.
+    lam           Ridge regularisation.  Default: 0.01.
 
     Returns
     -------
     dict:
         F_is        vol-normalised IS managed returns  (T_is × 3)
         F_oos       vol-normalised OOS managed returns (T_oos × 3)
-        weights_is  pd.DataFrame (T_is × 3) expanding OLS weights, IS slice
-        weights_oos pd.DataFrame (T_oos × 3) expanding OLS weights, OOS slice
+        weights_is  pd.DataFrame (T_is × 3) constant Ridge weights, IS slice
+        weights_oos pd.DataFrame (T_oos × 3) constant Ridge weights, OOS slice
         r_is        combined IS return series
         r_oos       combined OOS return series
     """
@@ -274,21 +274,20 @@ def run_comm_blend(
     F_is  = F_is_raw.div(sigma)
     F_oos = F_oos_raw.div(sigma)
 
-    # Expanding OLS over the full history (IS then OOS) — fully causal
-    F_full = pd.concat([F_is, F_oos])
-    w_all  = _expanding_ols_weights(F_full, min_obs=min_obs)
+    # Static Ridge MSRR: fit on IS, apply constant weights to both periods
+    bw        = msrr_ridge(F_is, lam=lam)
+    w_static  = bw.weights / bw.weights.abs().sum()
+    w_is  = pd.DataFrame(
+        np.tile(w_static.reindex(F_is.columns).values,  (len(F_is),  1)),
+        index=F_is.index,  columns=F_is.columns,
+    )
+    w_oos = pd.DataFrame(
+        np.tile(w_static.reindex(F_oos.columns).values, (len(F_oos), 1)),
+        index=F_oos.index, columns=F_oos.columns,
+    )
 
-    # L1-normalise each row so total gross = 1 (matches _dyn_blend_ret convention)
-    norm  = w_all.abs().sum(axis=1).replace(0.0, np.nan)
-    w_all = w_all.div(norm, axis=0)
-
-    w_is  = w_all.loc[F_is.index].dropna()
-    w_oos = w_all.loc[F_oos.index].dropna()
-
-    r_is  = (F_is.loc[w_is.index]   * w_is).sum(axis=1)
-    r_oos = (F_oos.loc[w_oos.index] * w_oos).sum(axis=1)
-    r_is.name  = "comm_rolling_ols"
-    r_oos.name = "comm_rolling_ols"
+    r_is  = (F_is  * w_is).sum(axis=1).rename("comm_static_ridge")
+    r_oos = (F_oos * w_oos).sum(axis=1).rename("comm_static_ridge")
 
     return {
         "F_is":        F_is,
@@ -307,7 +306,7 @@ def run_commodities_blend(
     rebuild_signals: bool = False,
 ) -> dict:
     """
-    Full commodities pipeline: build signals → rolling OLS blend.
+    Full commodities pipeline: build signals → static Ridge MSRR blend.
 
     Step 1 — Signal pipeline (commodities/blend.build_signal_parquets):
         Computes vol-scaled managed returns for tsmom_252, xs_carry_enh, and
@@ -315,14 +314,14 @@ def run_commodities_blend(
         rebuild_signals=False and all three parquets already exist.
 
     Step 2 — Blend (run_comm_blend):
-        Loads the three parquets, vol-normalises on IS σ, fits an
-        expanding-window MSRR OLS blend (causal, daily rebalance).
+        Loads the three parquets, vol-normalises on IS σ, fits a static Ridge
+        MSRR blend on IS data and applies fixed weights to both IS and OOS.
 
     Parameters
     ----------
     signals_dir       Parquet directory.  Default: commodities/signals/.
     is_end            Last IS date.  Default: IS_END ("2020-12-31").
-    min_obs           Minimum obs before blend weights are non-NaN.  Default: 252.
+    min_obs           Unused (kept for interface compatibility).
     rebuild_signals   Force re-run of the signal pipeline.  Default: False.
 
     Returns
@@ -343,7 +342,7 @@ def run_commodities_blend(
     else:
         print("Signal parquets found — skipping rebuild. Pass rebuild_signals=True to refresh.")
 
-    return run_comm_blend(signals_dir=sig_dir, is_end=is_end, min_obs=min_obs)
+    return run_comm_blend(signals_dir=sig_dir, is_end=is_end)
 
 
 # ── Production entry point ────────────────────────────────────────────────────
@@ -452,7 +451,7 @@ def run_comm_prod(
     # ── 5. Print ──────────────────────────────────────────────────────────────
     W = 72
     print("=" * W)
-    print(f"  COMMODITIES PRODUCTION  —  Rolling OLS blend  (vol target={vol_target*100:.0f}%)")
+    print(f"  COMMODITIES PRODUCTION  —  Static Ridge MSRR  (vol target={vol_target*100:.0f}%)")
     print(f"  IS ≤ {is_end}   |   OOS > {is_end}")
     print("=" * W)
     print(f"  {'':20}  {'SR':>7}  {'MDD':>8}  {'TO (ann)':>9}")
@@ -490,7 +489,7 @@ def compare_blend_methods(
 
     Methods
     -------
-    Rolling OLS MSRR   fixed lookback=252d rolling window (note: production uses expanding OLS)
+    Rolling OLS MSRR   fixed lookback=252d rolling window
     Rolling Ridge MSRR same rolling window with L2 penalty (lam=ridge_lam)
     Static Ridge MSRR  IS-fit once with ridge, constant weights applied to full period
 
@@ -588,7 +587,7 @@ def compare_blend_methods(
     W = 72
     print("=" * W)
     print(f"  COMMODITIES BLEND COMPARISON  (vol target={vol_target*100:.0f}%, λ_ridge={ridge_lam})")
-    print(f"  note: Rolling OLS uses fixed lookback={lookback}d; production uses expanding OLS")
+    print(f"  note: TO = blend-weight turnover; instrument-level TO needs Bloomberg")
     print(f"  note: TO = blend-weight turnover (ann.); Static Ridge = n/a (0 by construction, instrument-level TO unavailable)")
     print("=" * W)
     print(f"  {'Method':<20}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")

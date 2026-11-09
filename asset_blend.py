@@ -191,6 +191,32 @@ def _tvw_turnover(w_df: pd.DataFrame, freq: int = 12) -> float:
     return float(w.diff().dropna(how="all").abs().sum(axis=1).mean() * freq)
 
 
+def _drift_to(w_df: pd.DataFrame, F: pd.DataFrame, freq: int = 12) -> float:
+    """
+    Drift-corrected annualised one-way turnover of blend weights.
+
+    At each step t, the portfolio drifts from last period's target weights
+    under that month's returns.  TO = L1 distance from drifted weights to
+    the new target, annualised.  Unlike _tvw_turnover, this is non-zero for
+    static allocations because returns pull the portfolio away from its fixed
+    target each month and a rebalance is needed to restore it.
+    """
+    idx = w_df.dropna(how="any").index.intersection(F.dropna(how="any").index)
+    if len(idx) < 2:
+        return float("nan")
+    w = w_df.loc[idx].values.astype(float)
+    r = F.loc[idx].values.astype(float)
+    to_vals = []
+    for i in range(1, len(idx)):
+        w_prev = w[i - 1]
+        gross  = (w_prev * (1.0 + r[i])).sum()
+        if abs(gross) < 1e-12:
+            continue
+        w_drift = w_prev * (1.0 + r[i]) / gross
+        to_vals.append(float(np.abs(w[i] - w_drift).sum()))
+    return float(np.mean(to_vals) * freq) if to_vals else float("nan")
+
+
 def _metrics(
     r: pd.Series,
     w_df: Optional[pd.DataFrame],
@@ -641,3 +667,128 @@ def run_asset_blend(
                 print(f"\n  [plot skipped: {e}]")
 
     return r_full
+
+
+def compare_blend_methods(
+    equities_r: Optional[pd.Series] = None,
+    rates_r:    Optional[pd.Series] = None,
+    fx_r:       Optional[pd.Series] = None,
+    comm_r:     Optional[pd.Series] = None,
+    is_end:     str   = IS_END,
+    lookback:   int   = 36,
+    min_obs:    int   = 24,
+    ridge_lam:  float = 0.01,
+    vol_target: float = 0.10,
+    verbose:    bool  = True,
+) -> pd.DataFrame:
+    """
+    Compare three cross-asset blend methods side-by-side: Sharpe, MDD, TO.
+
+    Methods
+    -------
+    Rolling OLS MSRR   rolling lookback=36m refit on full IS+OOS timeline
+    Rolling Ridge MSRR same rolling window with L2 penalty — PRODUCTION method
+    Static Ridge MSRR  IS-fit once with ridge, constant weights thereafter
+
+    Monthly frequency; Sharpe annualised with √12.
+    MDD at exactly vol_target (r scaled to vol_target annual vol).
+    TO = annualised asset-class weight turnover (static methods = 0.0x).
+
+    Returns
+    -------
+    pd.DataFrame with columns [Method, Period, Sharpe, MDD, TO].
+    """
+    if verbose:
+        print("\nLoading asset-class composite returns …")
+    F_all = load_asset_returns(equities_r, rates_r, fx_r, comm_r, verbose=verbose)
+
+    F_is_raw  = F_all.loc[F_all.index <= is_end]
+    F_oos_raw = F_all.loc[F_all.index >  is_end]
+
+    sigma  = F_is_raw.std() * np.sqrt(12)
+    sigma  = sigma.replace(0.0, np.nan)
+    F_is   = F_is_raw.div(sigma)
+    F_oos  = F_oos_raw.div(sigma)
+    F_full = pd.concat([F_is, F_oos]).sort_index()
+
+    def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
+        norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
+        return w_raw.div(norm, axis=0)
+
+    # ── Method 1: Rolling OLS ────────────────────────────────────────────────
+    w_ols = _normalise_w(
+        RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)._roll(F_full)
+    )
+
+    # ── Method 2: Rolling Ridge (PRODUCTION) ─────────────────────────────────
+    w_ridge = _normalise_w(
+        RollingMSRR(penalty="ridge", lam=ridge_lam,
+                    lookback=lookback, min_obs=min_obs)._roll(F_full)
+    )
+
+    # ── Method 3: Static Ridge (IS-fit) ──────────────────────────────────────
+    bw_static  = msrr_ridge(F_is, lam=ridge_lam)
+    w_static_s = bw_static.weights / bw_static.weights.abs().sum()
+    w_static = pd.DataFrame(
+        np.tile(w_static_s.reindex(F_full.columns).values, (len(F_full), 1)),
+        index=F_full.index,
+        columns=F_full.columns,
+    )
+
+    methods = {
+        "Rolling OLS":          w_ols,
+        "Rolling Ridge [prod]": w_ridge,
+        "Static Ridge":         w_static,
+    }
+
+    records = []
+    for method_name, w_full in methods.items():
+        for period, F, w in [
+            ("IS",  F_is,  w_full.reindex(F_is.index)),
+            ("OOS", F_oos, w_full.reindex(F_oos.index)),
+        ]:
+            r  = _apply_tvw(F, w)
+            to = _drift_to(w, F)
+            records.append({
+                "Method": method_name,
+                "Period": period,
+                "Sharpe": _sharpe(r),
+                "MDD":    _mdd(r, vol_target) * 100,
+                "TO":     to,
+            })
+
+    df = pd.DataFrame(records)
+
+    # ── Print table ──────────────────────────────────────────────────────────
+    W = 72
+    print()
+    print("=" * W)
+    print(f"  CROSS-ASSET BLEND COMPARISON  (vol target={vol_target*100:.0f}%, λ_ridge={ridge_lam})")
+    print(f"  IS : {F_is.index[0].strftime('%Y-%m')} → {is_end[:7]}   |"
+          f"   OOS: {is_end[:7]} → {F_oos.index[-1].strftime('%Y-%m')}")
+    print("=" * W)
+    print(f"  {'Method':<24}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
+    print("  " + "─" * (W - 2))
+    for _, row in df.iterrows():
+        sr  = f"{row['Sharpe']:+.2f}" if np.isfinite(row["Sharpe"]) else "   n/a"
+        mdd = f"{row['MDD']:.1f}%"    if np.isfinite(row["MDD"])    else "    n/a"
+        to  = f"{row['TO']:.2f}x"     if np.isfinite(row["TO"])     else "   n/a"
+        print(f"  {row['Method']:<24}  {row['Period']:<6}  {sr:>7}  {mdd:>8}  {to:>7}")
+        if row["Period"] == "OOS":
+            print("  " + "─" * (W - 2))
+    print("=" * W)
+
+    # ── Avg IS weights ────────────────────────────────────────────────────────
+    names = list(F_is.columns)
+    cw    = 13
+    print(f"\n  Avg IS weights")
+    print("  " + "─" * (26 + cw * len(names)))
+    print(f"  {'Method':<24}" + "".join(f"  {n:>{cw}}" for n in names))
+    print("  " + "─" * (26 + cw * len(names)))
+    for method_name, w_full in methods.items():
+        w_avg = w_full.reindex(F_is.index).dropna(how="any").mean()
+        row   = "".join(f"  {w_avg.get(n, 0.0):>{cw}.1%}" for n in names)
+        print(f"  {method_name:<24}{row}")
+    print("  " + "─" * (26 + cw * len(names)))
+
+    return df

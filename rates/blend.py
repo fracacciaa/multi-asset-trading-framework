@@ -5,15 +5,15 @@ Loads the three production PnL parquets, aggregates across markets, and
 exposes the same blend API as equities/blend.py (all algorithms are imported
 directly — no duplication).
 
-Production blend: rolling OLS MSRR (RollingMSRR, penalty="ols", lookback=252d).
-  Refit OLS weights at each step on the last 252 trading days.
+Production blend: rolling Ridge MSRR (RollingMSRR, penalty="ridge", lookback=252d).
+  Refit Ridge weights at each step on the last 252 trading days.
   Walk-forward on the full timeline (IS + OOS) so the OOS window includes
   the IS tail — no lookahead.
 
 Pipeline position:
     rates/signals/*_pnl.parquet  →  load_managed_returns()  →  F (T × 3)
     F  →  vol_normalise()  →  F_norm
-    F_norm  →  RollingMSRR(penalty="ols")  →  time-varying blend weights
+    F_norm  →  RollingMSRR(penalty="ridge")  →  time-varying blend weights
     blend weights  →  combined portfolio return
 
 Signals (production, from rates/signals/):
@@ -188,14 +188,23 @@ def fit_rolling_ols(
     lookback: int = 252,
     min_obs: int = 63,
 ) -> "RollingMSRR":
-    """
-    Build the production rolling OLS blend model.
+    """Build the rolling OLS blend model (kept for research use)."""
+    return RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)
 
-    Refit OLS MSRR weights at each step using the last `lookback` trading days.
+
+def fit_rolling_ridge(
+    lookback: int = 252,
+    min_obs: int = 63,
+    lam: float = 0.01,
+) -> "RollingMSRR":
+    """
+    Build the production rolling Ridge blend model.
+
+    Refit Ridge MSRR weights at each step using the last `lookback` trading days.
     Call model._roll(F_norm) on vol-normalised managed returns to get the
     time-varying weight DataFrame (T × K), then pass to rolling_combined_return().
     """
-    return RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)
+    return RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
 
 
 def vol_normalise(
@@ -241,7 +250,7 @@ def run_blend(
     F_is, F_oos = vol_normalise(F_is_raw, F_oos_raw)
     F_full = pd.concat([F_is, F_oos]).sort_index()
 
-    model   = fit_rolling_ols(lookback=lookback, min_obs=min_obs)
+    model   = fit_rolling_ridge(lookback=lookback, min_obs=min_obs)
     weights_raw = model._roll(F_full)
     # L1-normalise rows so weights reflect actual portfolio allocations
     _norm   = weights_raw.abs().sum(axis=1).replace(0.0, np.nan)
@@ -433,7 +442,7 @@ def run_rates_prod(
 
     W = 68
     print("=" * W)
-    print(f"  RATES PRODUCTION  (rolling OLS MSRR, lookback=252d, vol target={vol_target*100:.0f}%)")
+    print(f"  RATES PRODUCTION  (rolling Ridge MSRR, lookback=252d, vol target={vol_target*100:.0f}%)")
     print("=" * W)
     print(f"  {'Period':<42}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
     print("  " + "─" * (W - 2))
@@ -448,7 +457,7 @@ def run_rates_prod(
 
     names = list(F_is.columns)
     col_w = 16
-    print(f"\n  Avg blend weights  (rolling OLS)")
+    print(f"\n  Avg blend weights  (rolling Ridge)")
     print("  " + "─" * (22 + col_w * len(names)))
     print(f"  {'Period':<20}" + "".join(f"  {s:>{col_w}}" for s in names))
     print("  " + "─" * (22 + col_w * len(names)))
