@@ -11,3 +11,4 @@ build/
 *.iml
 script.py
 script1.py
+*.pdf
