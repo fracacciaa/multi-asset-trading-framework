@@ -66,7 +66,14 @@ from equities.blend import (                                        # noqa: F401
 
 # ── Commodities-specific constants ────────────────────────────────────────────
 
-IS_END = "2020-12-31"
+IS_END    = "2020-12-31"
+OOS_START = "2021-01-01"
+
+TC_SCENARIOS_COMM: dict[str, float] = {
+    "best":   2.0,   # bps/yr — est. 1 bp spread × ~2x annual instrument TO
+    "base":  12.0,   # bps/yr — est. 3 bp spread × ~4x annual instrument TO
+    "worst": 56.0,   # bps/yr — est. 7 bp spread × ~8x annual instrument TO
+}
 
 _SIGNALS_DIR = Path(__file__).parent / "signals"
 
@@ -474,6 +481,231 @@ def run_comm_prod(
 
 
 from equities.blend import RollingMSRR as _RollingMSRR   # noqa: E402
+
+
+def tc_sweep_comm(
+    scenarios: Optional[dict] = None,
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    lookback: int = 252,
+    min_obs: int = 252,
+    vol_target: float = 0.10,
+    lam: float = 0.01,
+    _collect_returns: bool = False,
+) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
+    """
+    TC sensitivity sweep for the commodities blend (two methods).
+
+    TC approximation: instrument-level position parquets are not available here
+    (only pre-computed signal PnL parquets), so TC is modelled as a fixed annual
+    drag applied equally to all signals.  Scenarios express estimated cost as
+    spread × annual instrument-level TO (see TC_SCENARIOS_COMM for defaults).
+
+    Method 1 — Fixed weights (Static Ridge): IS-fitted static Ridge weights held
+        constant across all scenarios; only the TC cost changes.  Shows pure TC impact.
+
+    Method 2 — Adaptive Rolling Ridge: Rolling Ridge re-fit per TC scenario on
+        TC-adjusted IS returns.  For commodities TC is uniform across signals, so
+        this mainly reflects the static vs rolling blend architecture difference.
+
+    Parameters
+    ----------
+    scenarios       dict mapping name → annual TC drag in bps.  Default: TC_SCENARIOS_COMM.
+    signals_dir     Path to signal parquets.  Default: commodities/signals/.
+    is_end          Last IS date (inclusive).  Default: IS_END.
+    oos_start       First OOS date (inclusive).  Default: OOS_START.
+    lookback        Rolling window for Adaptive Ridge.  Default: 252.
+    min_obs         Min observations before Rolling Ridge activates.  Default: 252.
+    vol_target      Used only for MDD computation.  Default: 0.10.
+    lam             Ridge penalty.  Default: 0.01.
+    _collect_returns  Internal flag: when True returns (df, returns_df) tuple.
+
+    Returns
+    -------
+    pd.DataFrame with columns [Method, Scenario, Period, Sharpe, MDD_pct, TO]
+    or (df, returns_df) when _collect_returns=True.
+    """
+    if scenarios is None:
+        scenarios = TC_SCENARIOS_COMM
+
+    F = load_managed_returns(signals_dir=signals_dir)
+
+    F_is_raw  = F.loc[F.index <= is_end]
+    F_oos_raw = F.loc[F.index >= oos_start]
+
+    # IS annualized vol — computed on TC-free raw returns, used for all scenarios
+    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = sigma.replace(0.0, np.nan)
+
+    # TC-free vol-normalised managed returns
+    F_is_free  = F_is_raw.div(sigma)
+    F_oos_free = F_oos_raw.div(sigma)
+
+    # Fit Static Ridge once on TC-free IS (fixed weights baseline)
+    bw_free  = msrr_ridge(F_is_free, lam=lam)
+    w_static = bw_free.weights / bw_free.weights.abs().sum()
+    w_is_fixed = pd.DataFrame(
+        np.tile(w_static.reindex(F_is_free.columns).values,  (len(F_is_free),  1)),
+        index=F_is_free.index,  columns=F_is_free.columns,
+    )
+    w_oos_fixed = pd.DataFrame(
+        np.tile(w_static.reindex(F_oos_free.columns).values, (len(F_oos_free), 1)),
+        index=F_oos_free.index, columns=F_oos_free.columns,
+    )
+
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 60 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(252))
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if r.empty:
+            return float("nan")
+        cum = (1 + r * vol_target).cumprod()
+        return float((cum / cum.cummax() - 1).min() * 100)
+
+    def _blend_to(w_df: pd.DataFrame) -> float:
+        w = w_df.dropna(how="any")
+        norm = w.abs().sum(axis=1).replace(0.0, np.nan)
+        w_n = w.div(norm, axis=0)
+        return float(w_n.diff().dropna(how="all").abs().sum(axis=1).mean() * 252)
+
+    def _norm_w(w_df: pd.DataFrame) -> pd.DataFrame:
+        norm = w_df.abs().sum(axis=1).replace(0.0, np.nan)
+        return w_df.div(norm, axis=0)
+
+    records = []
+    _returns_dict: dict[tuple, pd.Series] = {}
+
+    for scenario_name, h_bps in scenarios.items():
+        # Daily TC drag in raw managed-return units; annual cumulative = h_bps / 10_000
+        tc_daily = h_bps / (252.0 * 10_000.0)
+
+        F_is_tc  = F_is_raw  - tc_daily
+        F_oos_tc = F_oos_raw - tc_daily
+
+        # Normalise using the same TC-free IS sigma across all scenarios (no look-ahead)
+        F_is_n  = F_is_tc.div(sigma)
+        F_oos_n = F_oos_tc.div(sigma)
+
+        # ── Method 1: Fixed weights (Static Ridge) ────────────────────────────
+        r_is_f  = (F_is_n  * w_is_fixed).sum(axis=1)
+        r_oos_f = (F_oos_n * w_oos_fixed).sum(axis=1)
+
+        for period, r in [("IS", r_is_f), ("OOS", r_oos_f)]:
+            records.append({
+                "Method":   "Fixed weights",
+                "Scenario": scenario_name,
+                "Period":   period,
+                "Sharpe":   _sharpe(r),
+                "MDD_pct":  _mdd(r),
+                "TO":       float("nan"),  # static weights → 0 blend TO
+            })
+
+        if _collect_returns:
+            _returns_dict[("Fixed weights", scenario_name)] = (
+                pd.concat([r_is_f, r_oos_f]).sort_index()
+            )
+
+        # ── Method 2: Adaptive Rolling Ridge ─────────────────────────────────
+        model = _RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
+        model.fit(F_is_n)
+        w_is_a  = _norm_w(model._weights_history)
+        w_oos_a = _norm_w(model.predict_weights(F_oos_n))
+
+        valid_is  = w_is_a.dropna(how="all")
+        valid_oos = w_oos_a.dropna(how="all")
+        r_is_a  = (F_is_n.loc[valid_is.index]   * valid_is).sum(axis=1)
+        r_oos_a = (F_oos_n.loc[valid_oos.index] * valid_oos).sum(axis=1)
+
+        for period, r, w in [("IS", r_is_a, w_is_a), ("OOS", r_oos_a, w_oos_a)]:
+            records.append({
+                "Method":   "Adaptive Ridge",
+                "Scenario": scenario_name,
+                "Period":   period,
+                "Sharpe":   _sharpe(r),
+                "MDD_pct":  _mdd(r),
+                "TO":       _blend_to(w),
+            })
+
+        if _collect_returns:
+            _returns_dict[("Adaptive Ridge", scenario_name)] = (
+                pd.concat([r_is_a, r_oos_a]).sort_index()
+            )
+
+    df = pd.DataFrame(records)
+
+    # ── Print table ───────────────────────────────────────────────────────────
+    W = 82
+    for method in ["Fixed weights", "Adaptive Ridge"]:
+        sub = df[df["Method"] == method]
+        label = (
+            "FIXED WEIGHTS (Static Ridge, IS-fitted) — only TC cost deducted"
+            if method == "Fixed weights"
+            else "ADAPTIVE RIDGE (Rolling Ridge) — re-fit per TC scenario"
+        )
+        print("\n" + "=" * W)
+        print(f"  COMMODITIES TC SWEEP — {label}")
+        print(f"  IS ≤ {is_end}   |   OOS ≥ {oos_start}   |   λ={lam}")
+        print(f"  TC = estimated annual drag (bps/yr) = approx. instrument spread × annual TO")
+        print("=" * W)
+        print(
+            f"  {'Scenario':<10}  {'TC (bps/yr)':>12}  {'Period':<6}"
+            f"  {'Sharpe':>8}  {'MDD':>8}  {'Blend TO':>9}"
+        )
+        print("  " + "─" * (W - 2))
+        prev = None
+        for _, row in sub.iterrows():
+            if prev is not None and row["Scenario"] != prev:
+                print("  " + "─" * (W - 2))
+            prev = row["Scenario"]
+            tc_v = scenarios[row["Scenario"]]
+            sr   = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])  else "   n/a"
+            mdd  = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "   n/a"
+            to_s = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])      else "   n/a"
+            print(
+                f"  {row['Scenario']:<10}  {tc_v:>12.1f}  {row['Period']:<6}"
+                f"  {sr:>8}  {mdd:>8}  {to_s:>9}"
+            )
+        print("=" * W)
+
+    if _collect_returns:
+        returns_df = pd.DataFrame(_returns_dict)
+        returns_df.columns = pd.MultiIndex.from_tuples(
+            returns_df.columns, names=["Method", "Scenario"]
+        )
+        return df, returns_df
+    return df
+
+
+def run_comm_tc(
+    scenarios: Optional[dict] = None,
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    lookback: int = 252,
+    min_obs: int = 252,
+    vol_target: float = 0.10,
+    lam: float = 0.01,
+) -> dict:
+    """
+    Full commodities TC sweep: metrics table + daily return timeseries.
+
+    Returns
+    -------
+    dict:
+        'metrics'   pd.DataFrame — [Method, Scenario, Period, Sharpe, MDD_pct, TO]
+        'returns'   pd.DataFrame — daily returns, MultiIndex columns (Method, Scenario)
+    """
+    df, returns_df = tc_sweep_comm(
+        scenarios=scenarios, signals_dir=signals_dir, is_end=is_end,
+        oos_start=oos_start, lookback=lookback, min_obs=min_obs,
+        vol_target=vol_target, lam=lam, _collect_returns=True,
+    )
+    return {"metrics": df, "returns": returns_df}
 
 
 def compare_blend_methods(

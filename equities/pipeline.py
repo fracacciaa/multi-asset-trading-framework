@@ -702,7 +702,8 @@ def tc_sweep_eq(
     oos_start: str = OOS_START,
     rebuild: bool = False,
     lam: float = 0.01,
-) -> pd.DataFrame:
+    _collect_returns: bool = False,
+) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """
     TC sensitivity sweep for the equity msrr_ridge blend.
 
@@ -711,7 +712,8 @@ def tc_sweep_eq(
 
     Returns
     -------
-    pd.DataFrame with columns [TC_bps, Period, Sharpe, MDD_pct, TO].
+    pd.DataFrame with columns [TC_bps, Period, Sharpe, MDD_pct, TO]
+    or (df, returns_df) when _collect_returns=True.
     """
     from equities.data import fetch_prices
     from equities.blend import build_managed_returns, msrr_ridge, combine_signals
@@ -735,11 +737,19 @@ def tc_sweep_eq(
     sig_fn   = _make_signal_fn(combined)
 
     records = []
+    _returns_dict: dict[tuple, pd.Series] = {}
+
     for tc in tc_bps_list:
         bt_is  = run_backtest(ret_is,  sig_fn, rebalance_dates=vf_rebal_dates,
                               transaction_cost_bps=tc)
         bt_oos = run_backtest(ret_oos, sig_fn, rebalance_dates=vf_rebal_dates,
                               transaction_cost_bps=tc)
+
+        if _collect_returns:
+            _returns_dict[("Static Ridge [prod]", tc)] = pd.concat(
+                [bt_is["daily_return"], bt_oos["daily_return"]]
+            ).sort_index()
+
         for period, bt in [("IS", bt_is), ("OOS", bt_oos)]:
             s = _stats_from_bt(bt)
             records.append({
@@ -774,7 +784,37 @@ def tc_sweep_eq(
     print("=" * W)
     print("  MDD = NAV peak-to-trough (%). TO = ann. one-way position turnover.")
 
+    if _collect_returns:
+        returns_df = pd.DataFrame(_returns_dict)
+        returns_df.columns = pd.MultiIndex.from_tuples(
+            returns_df.columns, names=["Method", "TC_bps"]
+        )
+        return df, returns_df
     return df
+
+
+def run_eq_tc(
+    tc_bps_list: list = (0.25, 0.5, 1.0),
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    rebuild: bool = False,
+    lam: float = 0.01,
+) -> dict:
+    """
+    Full equities TC sweep: metrics table + daily return timeseries for all TC levels.
+
+    Returns
+    -------
+    dict:
+        'metrics'   pd.DataFrame — [TC_bps, Period, Sharpe, MDD_pct, TO]
+        'returns'   pd.DataFrame — daily returns, MultiIndex columns (Method, TC_bps)
+                    Method column is always 'Static Ridge [prod]'.
+    """
+    df, returns_df = tc_sweep_eq(
+        tc_bps_list=tc_bps_list, is_end=is_end, oos_start=oos_start,
+        rebuild=rebuild, lam=lam, _collect_returns=True,
+    )
+    return {"metrics": df, "returns": returns_df}
 
 
 # ── print helpers ─────────────────────────────────────────────────────────────
