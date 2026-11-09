@@ -76,7 +76,7 @@ SIGNAL_FILES: dict[str, str] = {
 # Production pipeline parameters (must match those used in build_signal_parquets).
 # Subset of backtest.PARAMS relevant to the managed-return computation.
 BLEND_PARAMS = dict(
-    asset_vol = 0.40,
+    asset_vol = 0.10,
     vol_com   = 60,
     rebal     = "W-FRI",
     lag       = 1,
@@ -341,3 +341,131 @@ def run_commodities_blend(
         print("Signal parquets found — skipping rebuild. Pass rebuild_signals=True to refresh.")
 
     return run_comm_blend(signals_dir=sig_dir, is_end=is_end, min_obs=min_obs)
+
+
+# ── Production entry point ────────────────────────────────────────────────────
+
+def run_comm_prod(
+    is_end: str = IS_END,
+    params: dict | None = None,
+    min_obs: int = 252,
+    rebuild_signals: bool = False,
+    vol_target: float = 0.10,
+) -> pd.Series:
+    """
+    Production commodities pipeline: 3 signals → rolling OLS blend.
+
+    Loads (or rebuilds) signal parquets, fits an expanding-window MSRR OLS
+    blend, prints IS / OOS Sharpe, MDD, and annual turnover, and returns the
+    full daily return series (IS concatenated with OOS).
+
+    Parameters
+    ----------
+    is_end            Last IS date.  Default: IS_END ("2020-12-31").
+    params            Pipeline parameters.  Default: commodities/backtest.PARAMS.
+    min_obs           Warmup before blend weights are non-NaN.  Default: 252.
+    rebuild_signals   Force rebuild of signal parquets.  Default: False.
+
+    Returns
+    -------
+    pd.Series — daily return series named "commodities", IS then OOS.
+    """
+    from commodities.backtest import (
+        PARAMS as _PARAMS, specific_contract_returns, _build_signals,
+        vol_scale, rebalance, book_scale,
+    )
+    from commodities.data import fetch_prices, fetch_term_structure, fetch_tickers
+
+    TD = 252
+    p  = params or _PARAMS
+
+    # ── 1. Blend ──────────────────────────────────────────────────────────────
+    res   = run_commodities_blend(is_end=is_end, min_obs=min_obs,
+                                  rebuild_signals=rebuild_signals)
+    r_is  = res["r_is"]
+    r_oos = res["r_oos"]
+    w_is  = res["weights_is"]   # T_is × 3  (L1-normalised blend weights)
+    w_oos = res["weights_oos"]  # T_oos × 3
+
+    # ── 2. Instrument-level weights for turnover ──────────────────────────────
+    prices   = fetch_prices()
+    ts_data  = fetch_term_structure()
+    tk       = fetch_tickers()
+    returns  = specific_contract_returns(ts_data, tk).reindex(columns=prices.columns)
+    raw_sigs = _build_signals(prices, ts_data, tk, p)
+
+    _name_map = {
+        "tsmom_252":         "tsmom_252",
+        "xs_carry_enh_f1f2": "xs_carry_enh",
+        "curvature":         "curvature",
+    }
+    w_k: dict[str, pd.DataFrame] = {}
+    for raw_key, blend_key in _name_map.items():
+        if raw_key not in raw_sigs:
+            continue
+        sig = raw_sigs[raw_key].reindex(index=returns.index, columns=returns.columns)
+        w   = vol_scale(sig, returns, target_vol=p["asset_vol"], com=p["vol_com"])
+        w   = rebalance(w, rule=p["rebal"])
+        w   = book_scale(w, returns, target_vol=p["book_vol"],
+                         cov_hl=p["cov_hl"], k_max=p["k_max"])
+        w_k[blend_key] = w
+
+    # ── 3. Blended instrument weights ─────────────────────────────────────────
+    names    = list(w_is.columns)
+    all_idx  = w_k[names[0]].index
+    all_cols = w_k[names[0]].columns
+    ts_cut   = pd.Timestamp(is_end)
+
+    alpha_full = pd.concat([w_is, w_oos]).sort_index()
+    a_df       = (alpha_full
+                  .reindex(all_idx).ffill().fillna(0.0))
+    norms      = a_df.abs().sum(axis=1).replace(0.0, np.nan)
+    a_norm     = a_df.div(norms, axis=0).fillna(0.0)
+
+    W_blend = pd.DataFrame(0.0, index=all_idx, columns=all_cols)
+    for k in names:
+        if k in w_k:
+            W_blend += (w_k[k]
+                        .reindex(index=all_idx, columns=all_cols)
+                        .fillna(0.0)
+                        .mul(a_norm[k], axis=0))
+
+    to_is  = float(W_blend.loc[W_blend.index <= ts_cut].diff().abs().sum(axis=1).mean() * TD)
+    to_oos = float(W_blend.loc[W_blend.index >  ts_cut].diff().abs().sum(axis=1).mean() * TD)
+
+    # ── 4. Performance metrics ────────────────────────────────────────────────
+    def _sr(r: pd.Series) -> float:
+        r = r.dropna()
+        return float(r.mean() / r.std() * np.sqrt(TD)) if len(r) > 60 else float("nan")
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if r.empty:
+            return float("nan")
+        r_scaled = r * vol_target
+        cum = (1 + r_scaled).cumprod()
+        return float((cum / cum.cummax() - 1).min())
+
+    # ── 5. Print ──────────────────────────────────────────────────────────────
+    W = 72
+    print("=" * W)
+    print(f"  COMMODITIES PRODUCTION  —  Rolling OLS blend  (vol target={vol_target*100:.0f}%)")
+    print(f"  IS ≤ {is_end}   |   OOS > {is_end}")
+    print("=" * W)
+    print(f"  {'':20}  {'SR':>7}  {'MDD':>8}  {'TO (ann)':>9}")
+    print(f"  {'─'*20}  {'─'*7}  {'─'*8}  {'─'*9}")
+    for label, r, to in [("IS", r_is, to_is), ("OOS", r_oos, to_oos)]:
+        sr  = _sr(r)
+        mdd = _mdd(r)
+        print(f"  {label:<20}  {sr:>+7.2f}  {mdd*100:>+7.1f}%  {to:>8.1f}x")
+    print("=" * W)
+    print()
+    print("  Avg blend weights (IS):")
+    for col in names:
+        print(f"    {col:<20}  {w_is[col].mean():>+.4f}")
+    print()
+
+    # ── 6. Return series ──────────────────────────────────────────────────────
+    r_full = pd.concat([r_is, r_oos]).sort_index()
+    r_full.name = "commodities"
+    return r_full

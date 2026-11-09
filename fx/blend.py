@@ -312,6 +312,7 @@ def run_fx_prod(
     lookback: int = 36,
     min_obs: int = 24,
     print_table: bool = True,
+    vol_target: float = 0.10,
 ) -> pd.Series:
     """
     FX production pipeline: blend 3 signals with rolling OLS MSRR, print
@@ -375,7 +376,8 @@ def run_fx_prod(
         r = r.dropna()
         if r.empty:
             return float("nan")
-        cum = (1 + r).cumprod()
+        r_scaled = r * vol_target
+        cum = (1 + r_scaled).cumprod()
         return float((cum / cum.cummax() - 1).min())
 
     def _turnover(pos: pd.DataFrame) -> float:
@@ -404,6 +406,6 @@ def run_fx_prod(
             print(f"  {split:<20}  {sr_s:>8}  {dd_s:>9}  {to_s:>10}")
         print("=" * W)
         print(f"  Signals: {names}")
-        print(f"  MDD = peak-to-trough NAV drawdown  |  TO = annual one-way (blended positions)\n")
+        print(f"  MDD = wealth drawdown at {vol_target*100:.0f}% vol target  |  TO = annual one-way (blended positions)\n")
 
     return pd.concat([r_is, r_oos]).sort_index().rename("fx_combined")

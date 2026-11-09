@@ -319,6 +319,7 @@ def run_rates_prod(
     lookback: int = 252,
     min_obs: int = 63,
     print_results: bool = True,
+    vol_target: float = 0.10,
 ) -> pd.Series:
     """
     Production rates pipeline: blend signals, report metrics, return returns.
@@ -366,7 +367,8 @@ def run_rates_prod(
         r = r.dropna()
         if len(r) < 2:
             return float("nan")
-        cum = (1 + r).cumprod()
+        r_scaled = r * vol_target
+        cum = (1 + r_scaled).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _sig_to(pos_df: pd.DataFrame, start, end) -> float:
@@ -428,7 +430,7 @@ def run_rates_prod(
 
     W = 68
     print("=" * W)
-    print("  RATES PRODUCTION  (rolling OLS MSRR, lookback=252d)")
+    print(f"  RATES PRODUCTION  (rolling OLS MSRR, lookback=252d, vol target={vol_target*100:.0f}%)")
     print("=" * W)
     print(f"  {'Period':<42}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
     print("  " + "─" * (W - 2))
