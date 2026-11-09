@@ -30,7 +30,7 @@ import pandas as pd
 IS_END    = "2020-12-31"
 OOS_START = "2021-01-01"
 
-PRODUCTION_SIGNALS: list[str] = ["carry", "tsmom", "threshold_mean_reversion", "earnings_yield_all"]
+PRODUCTION_SIGNALS: list[str] = ["tsmom", "threshold_mean_reversion", "earnings_yield_all"]
 
 RESEARCH_SIGNALS: list[str] = [
     # production baseline (all 4, including momentum)
