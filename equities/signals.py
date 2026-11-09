@@ -551,6 +551,7 @@ def build_vf_data(
         "mean_reversion":           mean_reversion(prices),
         "carry":                    carry(prices, fundamentals),
         "threshold_mean_reversion": threshold_mean_reversion(prices),
+        "earnings_yield_all":       earnings_yield_all(prices, fundamentals["eps_fwd"]),
         **(extra_signals or {}),
     }
 
