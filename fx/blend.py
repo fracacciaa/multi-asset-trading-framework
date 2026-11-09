@@ -302,4 +302,108 @@ def run_fx_blend(
         "F_oos":           F_oos,
         "r_is":            combined_return_rolling(F_is,  w_is),
         "r_oos":           combined_return_rolling(F_oos, w_oos),
+        "sigma":           sigma,
     }
+
+
+def run_fx_prod(
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    lookback: int = 36,
+    min_obs: int = 24,
+    print_table: bool = True,
+) -> pd.Series:
+    """
+    FX production pipeline: blend 3 signals with rolling OLS MSRR, print
+    IS / OOS Sharpe, MDD and turnover, and return the full combined return series.
+
+    Parameters
+    ----------
+    signals_dir   Directory containing the parquet files.  Default: fx/signals/.
+    is_end        Last date of the in-sample period.  Default: "2020-12-31".
+    lookback      Rolling window length in months.  Default: 36.
+    min_obs       Minimum observations before weights are produced.  Default: 24.
+    print_table   Whether to print the summary table.  Default: True.
+
+    Returns
+    -------
+    pd.Series of monthly combined returns (IS + OOS, vol-normalised).
+    """
+    sdir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+
+    result  = run_fx_blend(signals_dir=sdir, is_end=is_end,
+                           lookback=lookback, min_obs=min_obs)
+    r_is    = result["r_is"]
+    r_oos   = result["r_oos"]
+    w_is    = result["weights_history"]
+    w_oos   = result["weights_oos"]
+    sigma   = result["sigma"]
+    names   = list(result["F_is"].columns)
+
+    # ── monthly positions for position-level turnover ─────────────────────────
+    monthly_pos = {
+        "momentum":  pd.read_parquet(sdir / "signal_a_f9_h1.parquet"),
+        "mr_ns_loo": (pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+                      .resample("BME").last()),
+        "carry_xs":  pd.read_parquet(sdir / "view_xs_carry_m.parquet"),
+    }
+    common_pairs = sorted(set.intersection(*[set(p.columns) for p in monthly_pos.values()]))
+
+    def _blended_pos(w_df: pd.DataFrame) -> pd.DataFrame:
+        idx = w_df.dropna().index
+        w   = w_df.loc[idx]
+        w   = w.div(w.abs().sum(axis=1).replace(0.0, np.nan), axis=0)
+        pos = pd.DataFrame(0.0, index=idx, columns=common_pairs)
+        for k in names:
+            if k not in monthly_pos or k not in sigma.index:
+                continue
+            pk = monthly_pos[k].reindex(index=idx, columns=common_pairs).fillna(0.0)
+            pos += pk.mul(w[k] / sigma[k], axis=0)
+        return pos
+
+    pos_is  = _blended_pos(w_is)
+    pos_oos = _blended_pos(w_oos)
+
+    # ── metrics ───────────────────────────────────────────────────────────────
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 12 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(12))
+
+    def _mdd(r: pd.Series) -> float:
+        r = r.dropna()
+        if r.empty:
+            return float("nan")
+        cum = (1 + r).cumprod()
+        return float((cum / cum.cummax() - 1).min())
+
+    def _turnover(pos: pd.DataFrame) -> float:
+        return float(pos.diff().abs().sum(axis=1).mean() * 12)
+
+    metrics = {
+        "IS":  (_sharpe(r_is),  _mdd(r_is),  _turnover(pos_is)),
+        "OOS": (_sharpe(r_oos), _mdd(r_oos), _turnover(pos_oos)),
+    }
+
+    if print_table:
+        W = 72
+        is_start  = result["F_is"].index[0].strftime("%Y-%m")
+        oos_end   = result["F_oos"].index[-1].strftime("%Y-%m")
+        print()
+        print("=" * W)
+        print("  FX PRODUCTION  —  Rolling OLS MSRR  (lookback={:d}m, 3 signals)".format(lookback))
+        print(f"  IS  : {is_start} → {is_end}   |   OOS : {OOS_START[:7]} → {oos_end}")
+        print("=" * W)
+        print(f"  {'':20}  {'Sharpe':>8}  {'MDD':>9}  {'Turnover':>10}")
+        print("  " + "─" * (W - 2))
+        for split, (sr, dd, to) in metrics.items():
+            sr_s = f"{sr:+.2f}" if sr == sr else "   n/a"
+            dd_s = f"{dd*100:+.1f}%" if dd == dd else "    n/a"
+            to_s = f"{to:.1f}x"  if to == to else "   n/a"
+            print(f"  {split:<20}  {sr_s:>8}  {dd_s:>9}  {to_s:>10}")
+        print("=" * W)
+        print(f"  Signals: {names}")
+        print(f"  MDD = peak-to-trough NAV drawdown  |  TO = annual one-way (blended positions)\n")
+
+    return pd.concat([r_is, r_oos]).sort_index().rename("fx_combined")
