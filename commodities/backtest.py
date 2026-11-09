@@ -31,8 +31,6 @@ from commodities.signals import (
     xs_carry_enhanced,
     curve_curvature,
 )
-from commodities.mean_reversion.ns_proj import compute_pnl as _ns_compute_pnl
-
 TD = 252  # trading days per year
 
 PARAMS = dict(
@@ -40,7 +38,7 @@ PARAMS = dict(
     mode="sign",
     clip=2.0,
     vol_com=60,
-    asset_vol=0.40,
+    asset_vol=0.10,
     book_vol=0.10,
     cov_hl=252,
     rebal="W-FRI",
@@ -229,9 +227,12 @@ def sharpe(pnl: pd.Series, td: int = TD) -> float:
 
 
 def max_drawdown(pnl: pd.Series) -> float:
-    """Worst peak-to-trough on cumulative PnL."""
-    cum = pnl.cumsum()
-    return float((cum - cum.cummax()).min())
+    """Worst peak-to-trough on compounded wealth (bounded at -100%)."""
+    r = pnl.dropna()
+    if r.empty:
+        return np.nan
+    cum = (1 + r).cumprod()
+    return float((cum / cum.cummax() - 1).min())
 
 
 def calmar(pnl: pd.Series, td: int = TD) -> float:
@@ -306,56 +307,6 @@ def _build_signals(
     return sigs
 
 
-# ── Signal B runner (NS null-space, separate return series) ──────────────────
-
-def _run_ns_signal_b(
-    index: pd.Index,
-    start: Optional[str],
-    end: Optional[str],
-    p: dict,
-) -> dict:
-    """
-    Run Signal B (NS null-space butterfly) through a book-level vol-scaling pipeline.
-
-    Signal B uses null-space-weighted returns across F1–F4 (not front-month
-    returns), so per-instrument vol_scale is not applicable.  Per-commodity PnL
-    is summed net of 4-leg butterfly costs, then scaled to p["book_vol"] using a
-    lagged EWMA vol estimate.
-
-    NOTE: The reported Sharpe (~10–13) is NOT comparable to the directional signals.
-    The null-space butterfly daily vol is ~1/10th of front-month vol (NS explains
-    ~99% of curve variance), so the book-scaling step applies ~5–10x leverage to
-    reach the same vol target, making the SR numerically large but the strategy
-    non-scalable beyond a small fixed allocation.  Use this signal as a
-    relative-value overlay with a fixed notional budget, not as a vol-parity
-    allocation.
-    """
-    from commodities.mean_reversion.ns_proj import compute_positions as _ns_positions, TRADE_DEPTH
-
-    pnl_b = _ns_compute_pnl(start=start, end=end)
-    pos   = _ns_positions(start=start, end=end)
-
-    # 4-leg butterfly costs: cost per unit position change across all contracts
-    turnover_cost = pos.diff().abs() * TRADE_DEPTH * p["cost_bps"] * 1e-4
-    net_pnl_b = (pnl_b - turnover_cost).reindex(columns=pnl_b.columns)
-
-    port = net_pnl_b.sum(axis=1).reindex(index).fillna(0.0)
-
-    com = p["cov_hl"] / np.log(2)
-    vol = port.ewm(com=com, min_periods=120).std() * np.sqrt(TD)
-    vol = vol.replace(0, np.nan).clip(lower=1e-6)
-    k = (p["book_vol"] / vol).clip(0, p["k_max"]).shift(1)
-    port_scaled = port * k
-
-    pos_aligned = pos.reindex(index).fillna(0.0)
-    avg_turnover = pos_aligned.diff().abs().sum(axis=1).mean() * TD
-
-    row = evaluate(port_scaled)
-    row["avg_turnover_pa"] = float(avg_turnover)
-    row.update({f"sr_{yr}": v for yr, v in _subperiod_sharpes(port_scaled).items()})
-    return row
-
-
 # ── Main comparison runner ────────────────────────────────────────────────────
 
 def run_comparison(
@@ -412,8 +363,6 @@ def run_comparison(
         row["avg_turnover_pa"] = float(bt["turnover"].mean() * TD)
         row.update({f"sr_{yr}": v for yr, v in _subperiod_sharpes(pnl).items()})
         rows[label] = row
-
-    rows["ns_nullspace_b"] = _run_ns_signal_b(returns.index, start, end, p)
 
     result = pd.DataFrame(rows).T
     result.index.name = "signal"

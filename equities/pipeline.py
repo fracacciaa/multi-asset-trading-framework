@@ -632,6 +632,70 @@ def run_eq_blend(
     return combine_signals(positions, bw)
 
 
+def run_eq_prod(
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    rebuild: bool = False,
+    verbose: bool = True,
+    lam: float = 0.01,
+    tc_bps: float = 0.0,
+) -> pd.Series:
+    """
+    Production equities pipeline: msrr_ridge blend of PRODUCTION_SIGNALS → IS/OOS stats + return series.
+
+    Blend weights are estimated on IS managed returns only (no look-ahead).
+    Runs a full position-level backtest for IS and OOS and prints Sharpe, MDD,
+    and annualised turnover for each period.
+
+    Parameters
+    ----------
+    is_end    : last in-sample date (inclusive)
+    oos_start : first out-of-sample date (inclusive)
+    rebuild   : force rebuild of VF positions and vf_data caches
+    verbose   : print stats and blend weights
+    lam       : Ridge regularisation for msrr_ridge
+    tc_bps    : one-way transaction cost in basis points (0 = signal quality, >0 = realistic)
+
+    Returns
+    -------
+    pd.Series : daily portfolio returns, full history (IS + OOS), name="eq_prod".
+    """
+    from equities.data import fetch_prices
+    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+    from backtest import run_backtest
+
+    positions = _load_or_build_positions(rebuild, verbose)
+    positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
+
+    vf_data        = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
+    vf_rebal_dates = set(vf_data["rebal_dates"])
+
+    prices  = fetch_prices(tickers=None)
+    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    ret_is  = returns.loc[returns.index <= is_end]
+    ret_oos = returns.loc[returns.index >= oos_start]
+
+    pos_is = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
+    F_is   = build_managed_returns(pos_is, ret_is)
+
+    bw       = msrr_ridge(F_is, lam=lam)
+    combined = combine_signals(positions, bw)
+    sig_fn   = _make_signal_fn(combined)
+
+    bt_is  = run_backtest(ret_is,  sig_fn, rebalance_dates=vf_rebal_dates,
+                          transaction_cost_bps=tc_bps)
+    bt_oos = run_backtest(ret_oos, sig_fn, rebalance_dates=vf_rebal_dates,
+                          transaction_cost_bps=tc_bps)
+
+    if verbose:
+        _print_prod_table(bw, _stats_from_bt(bt_is), _stats_from_bt(bt_oos),
+                          is_end, oos_start, lam, tc_bps)
+
+    full_ret = pd.concat([bt_is["daily_return"], bt_oos["daily_return"]]).sort_index()
+    full_ret.name = "eq_prod"
+    return full_ret
+
+
 # ── print helpers ─────────────────────────────────────────────────────────────
 
 def _print_signals_table(result: dict, is_end: str, oos_start: str) -> None:
@@ -727,3 +791,31 @@ def _print_ablation_table(results: dict, is_end: str, oos_start: str) -> None:
         _block(sig, xs_configs)
     for sig in ts_signals:
         _block(sig, ts_configs)
+
+
+def _print_prod_table(
+    bw,
+    stats_is: dict,
+    stats_oos: dict,
+    is_end: str,
+    oos_start: str,
+    lam: float,
+    tc_bps: float,
+) -> None:
+    W = 62
+    print("\n" + "=" * W)
+    print("  EQUITIES PRODUCTION BLEND")
+    print(f"  Method  : msrr_ridge  λ={lam}  TC={tc_bps:.0f}bps")
+    print(f"  IS ≤ {is_end}   |   OOS ≥ {oos_start}")
+    print("=" * W)
+    print(f"  {'':22}  {'IS':>10}  {'OOS':>10}")
+    print("  " + "─" * (W - 2))
+    print(f"  {'Sharpe':22}  {stats_is['sharpe']:>+10.2f}  {stats_oos['sharpe']:>+10.2f}")
+    print(f"  {'Max Drawdown':22}  {stats_is['max_drawdown']*100:>9.1f}%  {stats_oos['max_drawdown']*100:>9.1f}%")
+    print(f"  {'Ann. Turnover':22}  {stats_is['ann_turnover']:>9.1f}x  {stats_oos['ann_turnover']:>9.1f}x")
+    print("=" * W)
+    print("\n  BLEND WEIGHTS (msrr_ridge, IS-fitted)")
+    print("  " + "─" * (W - 2))
+    for sig, w in bw.weights.items():
+        print(f"  {sig:<30}  {w:>+.4f}")
+    print("=" * W)

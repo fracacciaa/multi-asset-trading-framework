@@ -340,8 +340,8 @@ def compare_rv(
         sr  = float(oos.mean() / oos.std() * np.sqrt(252))
         m, v = oos.mean(), oos.std()
         skw  = float(((oos - m) ** 3).mean() / v ** 3) if v > 0 else 0.0
-        cum  = oos.cumsum()
-        mdd  = float((cum - cum.cummax()).min())
+        cum  = (1 + oos).cumprod()
+        mdd  = float((cum / cum.cummax() - 1).min())
         c_idx = oos.index.intersection(c_oos.index)
         corr  = float(np.corrcoef(oos.reindex(c_idx), c_oos.reindex(c_idx))[0, 1]) \
                 if len(c_idx) > 10 else np.nan

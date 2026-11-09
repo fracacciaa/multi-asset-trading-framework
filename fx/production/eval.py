@@ -91,11 +91,12 @@ def _turnover(w: pd.DataFrame, freq: str) -> float:
 
 
 def _mdd(pnl: pd.Series) -> float:
-    """Maximum drawdown of cumulative PnL (return units, negative number)."""
-    cum = pnl.dropna().cumsum()
-    if cum.empty:
+    """Maximum drawdown on compounded wealth (fraction, bounded at -1)."""
+    r_ = pnl.dropna()
+    if r_.empty:
         return np.nan
-    return float((cum - cum.cummax()).min())
+    cum = (1 + r_).cumprod()
+    return float((cum / cum.cummax() - 1).min())
 
 
 def run_fx_signals(

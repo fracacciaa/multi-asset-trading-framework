@@ -213,8 +213,8 @@ def _drawdown_in_period(pnl: pd.Series, start: str, end: str) -> float:
     sub = pnl.loc[start:end]
     if len(sub) == 0:
         return 0.0
-    cum = sub.cumsum()
-    return float((cum - cum.cummax()).min())
+    cum = (1 + sub).cumprod()
+    return float((cum / cum.cummax() - 1).min())
 
 
 def _compute_result(
@@ -240,8 +240,8 @@ def _compute_result(
     carry_ann = float(pnl_carry.reindex(total.index).mean() * ann)
     yldchg_ann = float(pnl_yldchg.reindex(total.index).mean() * ann)
 
-    cum = total.cumsum()
-    dd = cum - cum.cummax()
+    cum = (1 + total).cumprod()
+    dd = cum / cum.cummax() - 1
     max_dd = float(dd.min())
 
     dd_2013 = _drawdown_in_period(total, "2013-01-01", "2013-12-31")

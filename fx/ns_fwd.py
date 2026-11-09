@@ -293,8 +293,8 @@ def compare(
     corr = float(np.corrcoef(ns_pnl.reindex(idx), c_pnl.reindex(idx))[0, 1])
 
     def _maxdd(s: pd.Series) -> float:
-        cum = s.cumsum()
-        return float((cum - cum.cummax()).min())
+        cum = (1 + s).cumprod()
+        return float((cum / cum.cummax() - 1).min())
 
     def _skew(s: pd.Series) -> float:
         m, v = s.mean(), s.std()
@@ -634,8 +634,8 @@ def compare_all(
         sr  = float(oos_pnl.mean() / oos_pnl.std() * np.sqrt(252))
         m, v = oos_pnl.mean(), oos_pnl.std()
         skw  = float(((oos_pnl - m) ** 3).mean() / v ** 3) if v > 0 else 0.0
-        cum  = oos_pnl.cumsum()
-        mdd  = float((cum - cum.cummax()).min())
+        cum  = (1 + oos_pnl).cumprod()
+        mdd  = float((cum / cum.cummax() - 1).min())
         c_oos = c_pnl.loc[oos_start:] if oos_start else c_pnl
         idx   = oos_pnl.index.intersection(c_oos.index)
         corr  = float(np.corrcoef(oos_pnl.reindex(idx), c_oos.reindex(idx))[0, 1]) \
@@ -703,8 +703,8 @@ def compare_all(
         sr   = float(oos_pnl.mean() / oos_pnl.std() * np.sqrt(252))
         m, v = oos_pnl.mean(), oos_pnl.std()
         skw  = float(((oos_pnl - m) ** 3).mean() / v ** 3) if v > 0 else 0.0
-        cum  = oos_pnl.cumsum()
-        mdd  = float((cum - cum.cummax()).min())
+        cum  = (1 + oos_pnl).cumprod()
+        mdd  = float((cum / cum.cummax() - 1).min())
         c_oos = c_pnl.loc[oos_start:] if oos_start else c_pnl
         idx   = oos_pnl.index.intersection(c_oos.index)
         corr  = float(np.corrcoef(oos_pnl.reindex(idx), c_oos.reindex(idx))[0, 1]) \
