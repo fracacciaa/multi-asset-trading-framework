@@ -696,6 +696,87 @@ def run_eq_prod(
     return full_ret
 
 
+def tc_sweep_eq(
+    tc_bps_list: list = (0.25, 0.5, 1.0),
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    rebuild: bool = False,
+    lam: float = 0.01,
+) -> pd.DataFrame:
+    """
+    TC sensitivity sweep for the equity msrr_ridge blend.
+
+    Runs a position-level backtest for each TC level in tc_bps_list (one-way, bps).
+    Data and blend weights are built once; only the backtests differ.
+
+    Returns
+    -------
+    pd.DataFrame with columns [TC_bps, Period, Sharpe, MDD_pct, TO].
+    """
+    from equities.data import fetch_prices
+    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+    from backtest import run_backtest
+
+    positions = _load_or_build_positions(rebuild, verbose=False)
+    positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
+
+    vf_data        = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
+    vf_rebal_dates = set(vf_data["rebal_dates"])
+
+    prices  = fetch_prices(tickers=None)
+    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    ret_is  = returns.loc[returns.index <= is_end]
+    ret_oos = returns.loc[returns.index >= oos_start]
+
+    pos_is = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
+    F_is   = build_managed_returns(pos_is, ret_is)
+    bw     = msrr_ridge(F_is, lam=lam)
+    combined = combine_signals(positions, bw)
+    sig_fn   = _make_signal_fn(combined)
+
+    records = []
+    for tc in tc_bps_list:
+        bt_is  = run_backtest(ret_is,  sig_fn, rebalance_dates=vf_rebal_dates,
+                              transaction_cost_bps=tc)
+        bt_oos = run_backtest(ret_oos, sig_fn, rebalance_dates=vf_rebal_dates,
+                              transaction_cost_bps=tc)
+        for period, bt in [("IS", bt_is), ("OOS", bt_oos)]:
+            s = _stats_from_bt(bt)
+            records.append({
+                "TC_bps":  tc,
+                "Period":  period,
+                "Sharpe":  s["sharpe"],
+                "MDD_pct": s["max_drawdown"] * 100,
+                "TO":      s["ann_turnover"],
+            })
+
+    df = pd.DataFrame(records)
+
+    W = 68
+    print("\n" + "=" * W)
+    print("  EQUITIES TC SWEEP — msrr_ridge blend")
+    print(f"  IS ≤ {is_end}   |   OOS ≥ {oos_start}   |   λ={lam}")
+    print(f"  TC is one-way per side (bps)")
+    print("=" * W)
+    print(f"  {'TC (bps)':<10}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>8}")
+    print("  " + "─" * (W - 2))
+
+    prev_tc = None
+    for _, row in df.iterrows():
+        if prev_tc is not None and row["TC_bps"] != prev_tc:
+            print("  " + "─" * (W - 2))
+        prev_tc = row["TC_bps"]
+        sr  = f"{row['Sharpe']:+.2f}"  if not np.isnan(row["Sharpe"])  else "   n/a"
+        mdd = f"{row['MDD_pct']:.1f}%" if not np.isnan(row["MDD_pct"]) else "    n/a"
+        to  = f"{row['TO']:.1f}x"      if not np.isnan(row["TO"])      else "   n/a"
+        print(f"  {row['TC_bps']:<10.2f}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>8}")
+
+    print("=" * W)
+    print("  MDD = NAV peak-to-trough (%). TO = ann. one-way position turnover.")
+
+    return df
+
+
 # ── print helpers ─────────────────────────────────────────────────────────────
 
 def _print_signals_table(result: dict, is_end: str, oos_start: str) -> None:

@@ -49,17 +49,25 @@ def ex_ante_vol(r_daily_bp: pd.Series) -> pd.Series:
 
 # ── Panel builder ────────────────────────────────────────────────────────────
 
+SIGMA_FLOOR_BP: float = 25.0  # min annualised CM-return vol (bp); prevents unbounded positions
+                               # e.g. Japan 2Y during BoJ QQE had ~5 bp/yr → pos >800
+
+
 def build_signal_a_daily(
     panels_by_market: dict[str, dict[str, pd.DataFrame]],
     tenors: Optional[list[float]] = None,
     k: int = DAILY_K,
+    sigma_floor_bp: float = SIGMA_FLOOR_BP,
 ) -> pd.DataFrame:
     """
     Daily TSMOM: formation window and vol-scaling at daily frequency.
 
     Formation: rolling k-day sum of ret_d (daily CM returns in bp).
     Vol:       ex_ante_vol() kept daily — no month-end resampling.
-    Position:  sign(past_k_days) × (TARGET_VOL_BP / sigma_daily)
+    Position:  sign(past_k_days) × (TARGET_VOL_BP / max(sigma_daily, sigma_floor_bp))
+
+    sigma_floor_bp prevents unbounded positions when a central bank pegs rates
+    and realized vol collapses (e.g. Japan 2Y during BoJ QQE 2012-2018).
 
     Same sign convention and position units as build_signal_a().
     Positive = long duration (receive fixed).
@@ -84,9 +92,8 @@ def build_signal_a_daily(
             if len(common) < k + 5:
                 continue
 
-            pos = np.sign(past.loc[common]) * (
-                TARGET_VOL_BP / sigma_daily.loc[common].replace(0, np.nan)
-            )
+            sigma_clipped = sigma_daily.loc[common].clip(lower=sigma_floor_bp)
+            pos = np.sign(past.loc[common]) * (TARGET_VOL_BP / sigma_clipped)
             cols[(market, tau)] = pos
 
     if not cols:
