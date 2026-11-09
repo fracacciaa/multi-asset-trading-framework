@@ -8,6 +8,10 @@ run_eq_signals()
     4. Report IS / OOS: Sharpe, max drawdown, annualized turnover
     Production signal set: PRODUCTION_SIGNALS
 
+run_eq_blend()
+    Production blend: fit msrr_ridge on IS managed returns, return
+    combined position DataFrame (date × ticker) for downstream use.
+
 try_eq_blend()
     Try all blend methods on PRODUCTION_SIGNALS managed returns.
     Reports IS / OOS: Sharpe, MDD, blend-weight turnover.
@@ -586,6 +590,46 @@ def try_eq_blend(
         _print_blend_table(result, is_end, oos_start)
 
     return result
+
+
+def run_eq_blend(
+    is_end: str = IS_END,
+    rebuild: bool = False,
+    verbose: bool = True,
+    lam: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Production equities blend: fit msrr_ridge on IS managed returns, return
+    combined position DataFrame (date × ticker) ready for downstream use.
+
+    Blend weights are estimated on IS data only (no look-ahead). The returned
+    positions can be passed directly to run_backtest or combine_signals.
+
+    Returns
+    -------
+    pd.DataFrame : date × ticker blended position weights.
+    """
+    from equities.data import fetch_prices
+    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+
+    positions = _load_or_build_positions(rebuild, verbose)
+    positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
+
+    prices  = fetch_prices(tickers=None)
+    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    ret_is  = returns.loc[returns.index <= is_end]
+
+    pos_is = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
+    F_is   = build_managed_returns(pos_is, ret_is)
+
+    bw = msrr_ridge(F_is, lam=lam)
+
+    if verbose:
+        print(f"msrr_ridge blend weights (lam={lam}):")
+        for sig, w in bw.weights.items():
+            print(f"  {sig:<30} {w:+.4f}")
+
+    return combine_signals(positions, bw)
 
 
 # ── print helpers ─────────────────────────────────────────────────────────────
