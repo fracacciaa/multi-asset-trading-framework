@@ -70,6 +70,15 @@ OOS_START = "2021-01-01"
 
 ASSET_CLASSES = ["equities", "rates", "fx", "commodities"]
 
+# Maps each cross-asset scenario to per-asset-class TC scenario labels / bp levels.
+# Rates / FX / commodities use their own "best"/"base"/"worst" labels.
+# Equities uses numeric one-way TC bps (no named scenarios in tc_sweep_eq).
+TC_SCENARIOS_ASSETS: dict[str, dict] = {
+    "best":  {"rates": "best",  "fx": "best",  "commodities": "best",  "equities": 0.25},
+    "base":  {"rates": "base",  "fx": "base",  "commodities": "base",  "equities": 0.50},
+    "worst": {"rates": "worst", "fx": "worst", "commodities": "worst", "equities": 1.00},
+}
+
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
@@ -792,3 +801,218 @@ def compare_blend_methods(
     print("  " + "─" * (26 + cw * len(names)))
 
     return df
+
+
+def run_assets_tc(
+    scenarios: Optional[dict] = None,
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    lookback: int = 36,
+    min_obs: int = 24,
+    vol_target: float = 0.10,
+    lam: float = 0.01,
+) -> dict:
+    """
+    Full cross-asset TC sweep: metrics table + monthly return timeseries.
+
+    For each TC scenario (best / base / worst), feeds the TC-adjusted "Fixed
+    weights" composite return from each asset class into the cross-asset blend
+    layer and evaluates two blend methods:
+
+      Fixed weights  — Rolling Ridge fit ONCE on TC-free cross-asset returns;
+                       only the per-asset TC deduction changes across scenarios.
+                       Shows pure TC impact propagated from asset-class level.
+      Adaptive Ridge — Rolling Ridge RE-FIT on TC-adjusted cross-asset returns
+                       per scenario; allocator can shift away from high-TC assets.
+
+    Per-asset TC uses the "Fixed weights" method from each asset class's sweep:
+      rates       : TC_SCENARIOS  (market-specific OIS spreads)
+      fx          : TC_SCENARIOS_FX  (pair-specific forward spreads)
+      commodities : TC_SCENARIOS_COMM  (estimated spread × TO drag)
+      equities    : tc_bps mapped to 0.25 / 0.50 / 1.00 for best/base/worst
+
+    Parameters
+    ----------
+    scenarios   Dict mapping label → {asset_class: scenario_key}.
+                Default: TC_SCENARIOS_ASSETS.
+    is_end      Last IS date (inclusive).  Default: "2020-12-31".
+    oos_start   First OOS date (inclusive).  Default: "2021-01-01".
+    lookback    Rolling Ridge window in months.  Default: 36.
+    min_obs     Minimum months before first weight estimate.  Default: 24.
+    vol_target  For MDD computation.  Default: 0.10.
+    lam         Ridge penalty.  Default: 0.01.
+
+    Returns
+    -------
+    dict:
+        'metrics'   pd.DataFrame — [Method, Scenario, Period, Sharpe, MDD_pct, TO]
+        'returns'   pd.DataFrame — monthly returns, MultiIndex columns (Method, Scenario)
+    """
+    import contextlib
+    import io as _io
+
+    if scenarios is None:
+        scenarios = TC_SCENARIOS_ASSETS
+
+    from rates.blend       import tc_sweep_rates
+    from fx.blend          import tc_sweep_fx
+    from commodities.blend import tc_sweep_comm
+    from equities.pipeline import tc_sweep_eq
+
+    # ── 1. Run per-asset TC sweeps, suppress their print output ──────────────
+    print("Running per-asset TC sweeps …")
+    with contextlib.redirect_stdout(_io.StringIO()):
+        _, rates_ret = tc_sweep_rates(_collect_returns=True)
+        _, fx_ret    = tc_sweep_fx(_collect_returns=True)
+        _, comm_ret  = tc_sweep_comm(_collect_returns=True)
+        _, eq_ret    = tc_sweep_eq(_collect_returns=True)
+
+    # ── 2. TC-free cross-asset returns for Fixed weights baseline ─────────────
+    print("Building TC-free cross-asset baseline …")
+    F_free_all     = load_asset_returns(verbose=False)
+    F_free_is_raw  = F_free_all.loc[F_free_all.index <= is_end]
+    F_free_oos_raw = F_free_all.loc[F_free_all.index >= oos_start]
+
+    sigma_free = F_free_is_raw.std() * np.sqrt(12)
+    sigma_free = sigma_free.replace(0.0, np.nan)
+    F_free_is  = F_free_is_raw.div(sigma_free)
+    F_free_oos = F_free_oos_raw.div(sigma_free)
+
+    # Fit Rolling Ridge ONCE on TC-free IS (fixed-weight cross-asset method)
+    model_free = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
+    model_free.fit(F_free_is)
+    w_is_fixed  = model_free._weights_history
+    w_oos_fixed = model_free.predict_weights(F_free_oos)
+
+    # ── 3. TC scenario sweep ──────────────────────────────────────────────────
+    records: list = []
+    _returns_dict: dict[tuple, pd.Series] = {}
+
+    for scenario_name, asset_scens in scenarios.items():
+        # Pull "Fixed weights" TC-adjusted return series from each asset class
+        r_rates = rates_ret[("Fixed weights", asset_scens["rates"])]
+        r_fx    = fx_ret   [("Fixed weights", asset_scens["fx"])]
+        r_comm  = comm_ret [("Fixed weights", asset_scens["commodities"])]
+        r_eq    = eq_ret   [("Static Ridge [prod]", asset_scens["equities"])]
+
+        # Build monthly TC-adjusted F matrix (same structure as load_asset_returns)
+        F_tc_all = pd.DataFrame({
+            "equities":    _to_monthly(r_eq,    "equities"),
+            "rates":       _to_monthly(r_rates, "rates"),
+            "fx":          _to_monthly(r_fx,    "fx"),
+            "commodities": _to_monthly(r_comm,  "commodities"),
+        }).sort_index().dropna(how="any")
+
+        F_tc_is_raw  = F_tc_all.loc[F_tc_all.index <= is_end]
+        F_tc_oos_raw = F_tc_all.loc[F_tc_all.index >= oos_start]
+
+        if len(F_tc_is_raw) < min_obs or F_tc_oos_raw.empty:
+            continue
+
+        # ── Method 1: Fixed weights ───────────────────────────────────────────
+        # Normalise using TC-free IS sigma (no look-ahead, no re-fitting)
+        F_tc_is_n  = F_tc_is_raw.div(sigma_free)
+        F_tc_oos_n = F_tc_oos_raw.div(sigma_free)
+
+        r_is_f  = _apply_tvw(F_tc_is_n,  w_is_fixed.reindex(F_tc_is_n.index))
+        r_oos_f = _apply_tvw(F_tc_oos_n, w_oos_fixed.reindex(F_tc_oos_n.index))
+
+        for period, r, w in [
+            ("IS",  r_is_f,  w_is_fixed),
+            ("OOS", r_oos_f, w_oos_fixed),
+        ]:
+            records.append({
+                "Method":   "Fixed weights",
+                "Scenario": scenario_name,
+                "Period":   period,
+                "Sharpe":   _sharpe(r),
+                "MDD_pct":  _mdd(r, vol_target) * 100,
+                "TO":       _tvw_turnover(w.dropna()),
+            })
+
+        _returns_dict[("Fixed weights", scenario_name)] = (
+            pd.concat([r_is_f, r_oos_f]).sort_index()
+        )
+
+        # ── Method 2: Adaptive Ridge ──────────────────────────────────────────
+        # Re-normalise and re-fit per scenario
+        sigma_tc = F_tc_is_raw.std() * np.sqrt(12)
+        sigma_tc = sigma_tc.replace(0.0, np.nan)
+        F_tc_is_n2  = F_tc_is_raw.div(sigma_tc)
+        F_tc_oos_n2 = F_tc_oos_raw.div(sigma_tc)
+
+        model_tc = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
+        model_tc.fit(F_tc_is_n2)
+        w_is_a  = model_tc._weights_history
+        w_oos_a = model_tc.predict_weights(F_tc_oos_n2)
+
+        r_is_a  = _apply_tvw(F_tc_is_n2,  w_is_a)
+        r_oos_a = _apply_tvw(F_tc_oos_n2, w_oos_a)
+
+        for period, r, w in [
+            ("IS",  r_is_a,  w_is_a),
+            ("OOS", r_oos_a, w_oos_a),
+        ]:
+            records.append({
+                "Method":   "Adaptive Ridge",
+                "Scenario": scenario_name,
+                "Period":   period,
+                "Sharpe":   _sharpe(r),
+                "MDD_pct":  _mdd(r, vol_target) * 100,
+                "TO":       _tvw_turnover(w.dropna()),
+            })
+
+        _returns_dict[("Adaptive Ridge", scenario_name)] = (
+            pd.concat([r_is_a, r_oos_a]).sort_index()
+        )
+
+    df = pd.DataFrame(records)
+
+    # ── 4. Print results ──────────────────────────────────────────────────────
+    W = 80
+    for method in ["Fixed weights", "Adaptive Ridge"]:
+        sub = df[df["Method"] == method]
+        label = (
+            "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
+            if method == "Fixed weights"
+            else "ADAPTIVE RIDGE — Ridge re-fit per TC scenario"
+        )
+        print("\n" + "=" * W)
+        print(f"  MULTI-ASSET TC SWEEP — {label}")
+        print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  lookback={lookback}m  |  λ={lam}")
+        print("=" * W)
+        print(f"  {'Scenario':<12}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>7}")
+        print("  " + "─" * (W - 2))
+        prev = None
+        for _, row in sub.iterrows():
+            if prev is not None and row["Scenario"] != prev:
+                print("  " + "─" * (W - 2))
+            prev = row["Scenario"]
+            sr  = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])  else "   n/a"
+            mdd = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "   n/a"
+            to  = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])      else "   n/a"
+            print(f"  {row['Scenario']:<12}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>7}")
+        print("=" * W)
+
+    # ── Scenario mapping table ────────────────────────────────────────────────
+    scen_names = list(scenarios.keys())
+    col_w = 12
+    print(f"\n  Per-asset TC scenario mapping")
+    print("  " + "─" * (22 + col_w * len(scen_names)))
+    print(f"  {'Asset class':<20}" + "".join(f"  {s:>{col_w}}" for s in scen_names))
+    print("  " + "─" * (22 + col_w * len(scen_names)))
+    for ac in ["rates", "fx", "commodities", "equities"]:
+        row = f"  {ac:<20}"
+        for sn in scen_names:
+            v = scenarios[sn][ac]
+            label = f"{v:.2f} bp" if isinstance(v, float) else str(v)
+            row += f"  {label:>{col_w}}"
+        print(row)
+    print("  " + "─" * (22 + col_w * len(scen_names)))
+
+    # ── Build and return ──────────────────────────────────────────────────────
+    returns_df = pd.DataFrame(_returns_dict)
+    returns_df.columns = pd.MultiIndex.from_tuples(
+        returns_df.columns, names=["Method", "Scenario"]
+    )
+    return {"metrics": df, "returns": returns_df}
