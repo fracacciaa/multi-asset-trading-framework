@@ -414,10 +414,43 @@ def run_fx_prod(
     return pd.concat([r_is, r_oos]).sort_index().rename("fx_combined")
 
 
-TC_SCENARIOS_FX: dict[str, float] = {
-    "best":  0.3,   # major G10 in tight conditions (EURUSD/USDJPY ~0.3 bp)
-    "base":  1.0,   # typical institutional across full 20-pair universe
-    "worst": 3.0,   # stress / flash crash / thin liquidity
+# FX forward half-spreads, one-way, bps.
+# Forward markets are less liquid than exchange-traded rate futures;
+# spreads reflect the spot + forward-points bid-ask combined.
+# EM pairs (USDTRY, USDZAR, USDMXN, etc.) are substantially wider.
+_TC_DEFAULT_FX: float = 5.0   # fallback for pairs not explicitly listed
+
+TC_SCENARIOS_FX: dict[str, dict[str, float]] = {
+    "best": {
+        # G10 / developed
+        "EURUSD": 0.5,  "USDJPY": 0.5,  "GBPUSD": 1.0,  "AUDUSD": 1.0,
+        "USDCAD": 1.0,  "USDCHF": 1.0,  "NZDUSD": 1.5,  "USDDKK": 1.0,
+        "USDNOK": 2.0,  "USDSEK": 2.0,  "USDSGD": 2.0,
+        # EM
+        "USDMXN": 3.0,  "USDPLN": 3.0,  "USDCZK": 3.0,  "USDHUF": 3.0,
+        "USDKRW": 4.0,  "USDCNY": 3.0,  "USDTHB": 4.0,  "USDTRY": 8.0,
+        "USDZAR": 4.0,
+    },
+    "base": {
+        # G10 / developed
+        "EURUSD": 1.5,  "USDJPY": 1.5,  "GBPUSD": 2.5,  "AUDUSD": 2.5,
+        "USDCAD": 2.5,  "USDCHF": 2.5,  "NZDUSD": 3.5,  "USDDKK": 2.0,
+        "USDNOK": 4.0,  "USDSEK": 4.0,  "USDSGD": 5.0,
+        # EM
+        "USDMXN": 7.0,  "USDPLN": 7.0,  "USDCZK": 7.0,  "USDHUF": 7.0,
+        "USDKRW": 10.0, "USDCNY": 7.0,  "USDTHB": 10.0, "USDTRY": 20.0,
+        "USDZAR": 8.0,
+    },
+    "worst": {
+        # G10 / developed
+        "EURUSD": 5.0,  "USDJPY": 5.0,  "GBPUSD": 8.0,  "AUDUSD": 8.0,
+        "USDCAD": 8.0,  "USDCHF": 8.0,  "NZDUSD": 10.0, "USDDKK": 6.0,
+        "USDNOK": 12.0, "USDSEK": 12.0, "USDSGD": 12.0,
+        # EM
+        "USDMXN": 20.0, "USDPLN": 20.0, "USDCZK": 20.0, "USDHUF": 20.0,
+        "USDKRW": 25.0, "USDCNY": 20.0, "USDTHB": 25.0, "USDTRY": 50.0,
+        "USDZAR": 20.0,
+    },
 }
 
 
@@ -432,7 +465,7 @@ def tc_sweep_fx(
     _collect_returns: bool = False,
 ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """
-    TC sensitivity sweep for the FX blend, with a single average spread per scenario.
+    TC sensitivity sweep for the FX blend with market-specific forward spreads.
 
     Runs two parallel sweeps (same logic as tc_sweep_rates in rates/blend.py):
       Fixed weights  — Rolling Ridge fit ONCE on TC-free signals; only the TC
@@ -442,15 +475,15 @@ def tc_sweep_fx(
                        blend weights shift away from high-TC signals as costs rise.
 
     TC deducted from each signal's monthly managed return:
-      momentum / carry_xs  : |Δmonthly_pos|.sum(pairs) × (h_bp / 10_000)
-      mr_ns_loo            : daily |Δpos|.sum(pairs) × (h_bp / 10_000), summed to month
+      momentum / carry_xs  : Σ_pair |Δpos_pair| × (h_pair_bp / 10_000)
+      mr_ns_loo            : Σ_pair daily |Δpos_pair| × (h_pair_bp / 10_000), summed to month
                              (mr_ns_loo rebalances daily, so TC accumulates intra-month)
 
     Parameters
     ----------
-    scenarios   Dict mapping scenario label → avg G10 half_spread_bp (single spread
-                applied uniformly across all pairs).
-                Default: TC_SCENARIOS_FX (best=0.3 bp, base=1.0 bp, worst=3.0 bp).
+    scenarios   Dict mapping scenario label → {pair: half_spread_bp}.
+                Default: TC_SCENARIOS_FX (pair-specific G10/EM spreads).
+                Pairs not in the dict use _TC_DEFAULT_FX (5 bp).
     signals_dir Directory containing the parquet files.  Default: fx/signals/.
     is_end      Last IS date.  Default: "2020-12-31".
     oos_start   First OOS date.  Default: "2021-01-01".
@@ -491,18 +524,12 @@ def tc_sweep_fx(
         "carry_xs":  pnl_cxs,
     }).dropna().sort_index()
 
-    # ── Precompute monthly |Δpos| per signal (factor out of scenario loop) ────
-    # momentum / carry_xs: monthly rebalance → one TC event per month
-    chg_mom = pos_mom.diff().abs().sum(axis=1)
-    chg_cxs = pos_cxs.diff().abs().sum(axis=1)
-    # mr_ns_loo: daily rebalance → accumulate daily TC within each month
-    chg_mr  = pos_mr.diff().abs().sum(axis=1).resample("BME").sum()
-
-    pos_chg = {
-        "momentum":  chg_mom,
-        "mr_ns_loo": chg_mr,
-        "carry_xs":  chg_cxs,
-    }
+    # ── Precompute per-pair |Δpos| (factor out of scenario loop) ─────────────
+    # momentum / carry_xs: monthly rebalance → one TC event per month per pair
+    dpos_mom = pos_mom.diff().abs()      # monthly, per pair
+    dpos_cxs = pos_cxs.diff().abs()      # monthly, per pair
+    # mr_ns_loo: daily rebalance → accumulate daily TC within each month, per pair
+    dpos_mr_m = pos_mr.diff().abs().resample("BME").sum()  # monthly, per pair
 
     # Monthly positions for blended-pair TO computation (mirrors run_fx_prod)
     monthly_pos = {
@@ -563,14 +590,20 @@ def tc_sweep_fx(
     records = []
     _returns_dict: dict[tuple, pd.Series] = {}   # populated when _collect_returns=True
 
-    for scenario_name, h_bp in scenarios.items():
-        h = h_bp / 10_000  # bp → decimal (same units as rx_m)
+    for scenario_name, spreads in scenarios.items():
+        def _tc_series(dpos_df: pd.DataFrame) -> pd.Series:
+            """Monthly TC series: Σ_pair |Δpos_pair| × h_pair (decimal)."""
+            h_vec = pd.Series(
+                {p: spreads.get(p, _TC_DEFAULT_FX) / 10_000 for p in dpos_df.columns}
+            )
+            return (dpos_df * h_vec).sum(axis=1)
 
         # TC-adjusted managed returns
-        series = {}
-        for sig in F_gross.columns:
-            tc_m = (pos_chg[sig] * h).reindex(F_gross.index).fillna(0.0)
-            series[sig] = F_gross[sig] - tc_m
+        series = {
+            "momentum":  F_gross["momentum"]  - _tc_series(dpos_mom).reindex(F_gross.index).fillna(0.0),
+            "mr_ns_loo": F_gross["mr_ns_loo"] - _tc_series(dpos_mr_m).reindex(F_gross.index).fillna(0.0),
+            "carry_xs":  F_gross["carry_xs"]  - _tc_series(dpos_cxs).reindex(F_gross.index).fillna(0.0),
+        }
 
         F_tc = pd.DataFrame(series).dropna().sort_index()
         F_tc_is  = F_tc.loc[F_tc.index <= is_end]
@@ -663,13 +696,22 @@ def tc_sweep_fx(
         print("=" * W)
 
     # ── TC table ──────────────────────────────────────────────────────────────
-    print(f"\n  TC assumptions (avg G10 half-spread, one-way, bp)")
-    print("  " + "─" * 42)
-    print(f"  {'Scenario':<12}  {'half-spread (bp)':>18}")
-    print("  " + "─" * 42)
-    for name, h in scenarios.items():
-        print(f"  {name:<12}  {h:>18.1f}")
-    print("  " + "─" * 42)
+    all_pairs = sorted({p for s in scenarios.values() for p in s})
+    scen_names = list(scenarios.keys())
+    col_w = 8
+    hdr_w = 10
+    total_w = hdr_w + col_w * len(scen_names) + 2
+    print(f"\n  TC assumptions (FX forward half-spread, one-way, bp)")
+    print("  " + "─" * total_w)
+    print(f"  {'Pair':<{hdr_w}}" + "".join(f"  {s:>{col_w}}" for s in scen_names))
+    print("  " + "─" * total_w)
+    for pair in all_pairs:
+        row = f"  {pair:<{hdr_w}}"
+        for sn in scen_names:
+            h = scenarios[sn].get(pair, _TC_DEFAULT_FX)
+            row += f"  {h:>{col_w}.1f}"
+        print(row)
+    print("  " + "─" * total_w)
 
     if _collect_returns:
         returns_df = pd.DataFrame(_returns_dict)
@@ -695,6 +737,9 @@ def run_fx_tc(
     Identical to tc_sweep_fx() in computation and printed output, but also
     captures the per-scenario combined monthly return series (IS + OOS) for both
     blend methods so they can be plotted or further analysed.
+
+    TC uses pair-specific FX forward spreads (see TC_SCENARIOS_FX).  Pairs not
+    listed in a scenario fall back to _TC_DEFAULT_FX (5 bp).
 
     Returns
     -------
