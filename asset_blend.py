@@ -854,9 +854,9 @@ def run_assets_tc(
     if scenarios is None:
         scenarios = TC_SCENARIOS_ASSETS
 
-    from rates.blend       import tc_sweep_rates
-    from fx.blend          import tc_sweep_fx
-    from commodities.blend import tc_sweep_comm
+    from rates.blend       import tc_sweep_rates, TC_SCENARIOS       as _TC_RATES
+    from fx.blend          import tc_sweep_fx,    TC_SCENARIOS_FX    as _TC_FX
+    from commodities.blend import tc_sweep_comm,  TC_SCENARIOS_COMM  as _TC_COMM
     from equities.pipeline import tc_sweep_eq
 
     # ── 1. Run per-asset TC sweeps, suppress their print output ──────────────
@@ -884,6 +884,11 @@ def run_assets_tc(
     w_is_fixed  = model_free._weights_history
     w_oos_fixed = model_free.predict_weights(F_free_oos)
 
+    def _norm_w(w_df: pd.DataFrame) -> pd.DataFrame:
+        """L1-normalise weights row-wise (mirrors _apply_tvw logic)."""
+        n = w_df.abs().sum(axis=1).replace(0.0, np.nan)
+        return w_df.div(n, axis=0)
+
     # ── 3. TC scenario sweep ──────────────────────────────────────────────────
     records: list = []
     _returns_dict: dict[tuple, pd.Series] = {}
@@ -909,6 +914,18 @@ def run_assets_tc(
         if len(F_tc_is_raw) < min_obs or F_tc_oos_raw.empty:
             continue
 
+        # Average one-way spread per asset class for this scenario (bps).
+        # Rates and FX: mean of instrument/pair-specific spreads.
+        # Commodities: bps/yr drag ÷ est. 4× annual TO ≈ per-trade spread.
+        # Equities: numeric tc_bps level (already one-way bp).
+        h_bp = {
+            "rates":       float(np.mean(list(_TC_RATES[asset_scens["rates"]].values()))),
+            "fx":          float(np.mean(list(_TC_FX[asset_scens["fx"]].values()))),
+            "commodities": _TC_COMM[asset_scens["commodities"]] / 4.0,
+            "equities":    float(asset_scens["equities"]),
+        }
+        h_vec = pd.Series({k: v / 10_000.0 for k, v in h_bp.items()})
+
         # ── Method 1: Fixed weights ───────────────────────────────────────────
         # Normalise using TC-free IS sigma (no look-ahead, no re-fitting)
         F_tc_is_n  = F_tc_is_raw.div(sigma_free)
@@ -916,6 +933,17 @@ def run_assets_tc(
 
         r_is_f  = _apply_tvw(F_tc_is_n,  w_is_fixed.reindex(F_tc_is_n.index))
         r_oos_f = _apply_tvw(F_tc_oos_n, w_oos_fixed.reindex(F_tc_oos_n.index))
+
+        # Deduct cross-asset rebalancing TC: cost of scaling sleeve k by |Δw_k|
+        w_f_comb = pd.concat([
+            _norm_w(w_is_fixed.reindex(r_is_f.index).dropna(how="any")),
+            _norm_w(w_oos_fixed.reindex(r_oos_f.index).dropna(how="any")),
+        ]).sort_index()
+        tc_cross_f = (w_f_comb.diff().abs().fillna(0.0) * h_vec).sum(axis=1)
+        r_net_f    = pd.concat([r_is_f, r_oos_f]).sort_index() - tc_cross_f.reindex(
+            pd.concat([r_is_f, r_oos_f]).index).fillna(0.0)
+        r_is_f  = r_net_f.loc[r_net_f.index <= is_end]
+        r_oos_f = r_net_f.loc[r_net_f.index >= oos_start]
 
         for period, r, w in [
             ("IS",  r_is_f,  w_is_fixed),
@@ -948,6 +976,17 @@ def run_assets_tc(
 
         r_is_a  = _apply_tvw(F_tc_is_n2,  w_is_a)
         r_oos_a = _apply_tvw(F_tc_oos_n2, w_oos_a)
+
+        # Deduct cross-asset rebalancing TC for adaptive weights
+        w_a_comb = pd.concat([
+            _norm_w(w_is_a.dropna(how="any")),
+            _norm_w(w_oos_a.dropna(how="any")),
+        ]).sort_index()
+        tc_cross_a = (w_a_comb.diff().abs().fillna(0.0) * h_vec).sum(axis=1)
+        r_net_a    = pd.concat([r_is_a, r_oos_a]).sort_index() - tc_cross_a.reindex(
+            pd.concat([r_is_a, r_oos_a]).index).fillna(0.0)
+        r_is_a  = r_net_a.loc[r_net_a.index <= is_end]
+        r_oos_a = r_net_a.loc[r_net_a.index >= oos_start]
 
         for period, r, w in [
             ("IS",  r_is_a,  w_is_a),
