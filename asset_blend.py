@@ -473,6 +473,188 @@ def _print_table(
     print()
 
 
+# ── Position-level turnover ────────────────────────────────────────────────────
+
+def _build_position_turnover_series() -> pd.DataFrame:
+    """
+    Compute monthly rolling-annualised instrument-level one-way turnover for each
+    asset class.
+
+    Equities   : blended VF ticker positions → daily |Δpos|/gross → 12m rolling × 252
+    Rates      : position parquets, blend-weight averaged → same
+    FX         : monthly momentum/carry positions (× 12) + daily MR positions (× 252),
+                 blend-weight averaged → monthly
+    Commodities: vol-scaled weekly-rebalanced positions rebuilt from raw signals
+                 → daily |Δpos|/gross → 12m rolling × 252
+
+    Returns pd.DataFrame, monthly BME index, columns = ASSET_CLASSES.
+    """
+    import contextlib, io as _io
+    from pathlib import Path as _Path
+
+    def _daily_ann_to(pos: pd.DataFrame, roll: int = 252, min_p: int = 63) -> pd.Series:
+        gross = pos.abs().sum(axis=1).replace(0.0, np.nan)
+        delta = pos.diff().abs().sum(axis=1)
+        return (delta / gross).rolling(roll, min_periods=min_p).mean() * 252
+
+    def _monthly_ann_to(pos: pd.DataFrame) -> pd.Series:
+        gross = pos.abs().sum(axis=1).replace(0.0, np.nan)
+        delta = pos.diff().abs().sum(axis=1)
+        return (delta / gross) * 12  # already monthly, × 12 annualises
+
+    # ── Equities ──────────────────────────────────────────────────────────────
+    with contextlib.redirect_stdout(_io.StringIO()):
+        from equities.pipeline import (
+            _load_or_build_positions, PRODUCTION_SIGNALS, IS_END as _EQ_IS
+        )
+        from equities.data import fetch_prices as _fetch_eq
+        from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+
+        _eq_pos = _load_or_build_positions(rebuild=False, verbose=False)
+        _eq_pos = {k: v for k, v in _eq_pos.items() if k in PRODUCTION_SIGNALS}
+        _eq_px  = _fetch_eq(tickers=None)
+        _eq_ret = _eq_px.pct_change(fill_method=None).dropna(how="all")
+        _ret_is_eq = _eq_ret.loc[_eq_ret.index <= _EQ_IS]
+        _pos_is_eq = {k: v.loc[v.index <= _EQ_IS] for k, v in _eq_pos.items()}
+        _F_is_eq   = build_managed_returns(_pos_is_eq, _ret_is_eq)
+        _bw_eq     = msrr_ridge(_F_is_eq, lam=0.01)
+        _comb_eq   = combine_signals(_eq_pos, _bw_eq)
+
+    to_eq = _daily_ann_to(_comb_eq).resample("BME").last().rename("equities")
+
+    # ── Rates ─────────────────────────────────────────────────────────────────
+    from rates.blend import (
+        run_blend as _run_rates_blend,
+        _POS_FILES as _R_POS_FILES,
+        _SIGNALS_DIR as _R_SDIR,
+    )
+    with contextlib.redirect_stdout(_io.StringIO()):
+        _rates_res = _run_rates_blend()
+
+    _w_rates = _rates_res["weights"]
+    _wn_rates = _w_rates.abs().div(
+        _w_rates.abs().sum(axis=1).replace(0.0, np.nan), axis=0
+    )
+    _to_rates = pd.Series(0.0, index=_wn_rates.index)
+    for _rname, _rfname in _R_POS_FILES.items():
+        _rpath = _R_SDIR / _rfname
+        if not _rpath.exists() or _rname not in _wn_rates.columns:
+            continue
+        _rpos  = pd.read_parquet(_rpath)
+        _gross = _rpos.abs().sum(axis=1).replace(0.0, np.nan)
+        _delta = _rpos.diff().abs().sum(axis=1)
+        _to_sig = (_delta / _gross).reindex(_wn_rates.index).fillna(0.0)
+        _to_rates += _wn_rates[_rname].fillna(0.0) * _to_sig
+
+    to_rates = (
+        _to_rates.rolling(252, min_periods=63).mean() * 252
+    ).resample("BME").last().rename("rates")
+
+    # ── FX ────────────────────────────────────────────────────────────────────
+    _FX_SDIR = _Path(__file__).parent / "fx" / "signals"
+    from fx.blend import run_fx_blend as _run_fx_blend
+    with contextlib.redirect_stdout(_io.StringIO()):
+        _fx_res = _run_fx_blend()
+
+    _w_fx = pd.concat(
+        [_fx_res["weights_history"], _fx_res["weights_oos"]]
+    ).sort_index().dropna(how="all")
+    _wn_fx = _w_fx.abs().div(
+        _w_fx.abs().sum(axis=1).replace(0.0, np.nan), axis=0
+    )
+
+    _w_mom_m  = pd.read_parquet(_FX_SDIR / "signal_a_f9_h1.parquet")
+    _w_cxs_m  = pd.read_parquet(_FX_SDIR / "view_xs_carry_m.parquet")
+    _pos_mr_d = pd.read_parquet(_FX_SDIR / "mr_ns_loo_positions.parquet")
+
+    _to_mom_m = _monthly_ann_to(_w_mom_m).resample("BME").last()
+    _to_cxs_m = _monthly_ann_to(_w_cxs_m).resample("BME").last()
+    _to_mr_m  = (
+        _daily_ann_to(_pos_mr_d).resample("BME").last()
+    )
+
+    _fx_sigs = {
+        "momentum":  _to_mom_m,
+        "carry_xs":  _to_cxs_m,
+        "mr_ns_loo": _to_mr_m,
+    }
+    _to_fx = pd.Series(0.0, index=_wn_fx.index)
+    for _fsig, _fto in _fx_sigs.items():
+        if _fsig in _wn_fx.columns:
+            _to_fx += _wn_fx[_fsig].fillna(0.0) * _fto.reindex(_wn_fx.index).fillna(0.0)
+
+    to_fx = _to_fx.rename("fx")
+
+    # ── Commodities ───────────────────────────────────────────────────────────
+    from commodities.backtest import (
+        PARAMS as _CP,
+        specific_contract_returns as _spec_rets,
+        _build_signals as _cbuild,
+        vol_scale as _cvs,
+        rebalance as _creb,
+        book_scale as _cbook,
+    )
+    from commodities.data import (
+        fetch_prices as _fetch_comm,
+        fetch_term_structure as _fetch_ts,
+        fetch_tickers as _fetch_tk,
+    )
+    from commodities.blend import run_comm_blend as _run_comm_blend
+
+    with contextlib.redirect_stdout(_io.StringIO()):
+        _comm_res = _run_comm_blend()
+
+    _px_c   = _fetch_comm()
+    _ts_c   = _fetch_ts()
+    _tk_c   = _fetch_tk()
+    _ret_c  = _spec_rets(_ts_c, _tk_c).reindex(columns=_px_c.columns)
+    _rsigs  = _cbuild(_px_c, _ts_c, _tk_c, _CP)
+
+    _cname_map = {
+        "tsmom_252":         "tsmom_252",
+        "xs_carry_enh_f1f2": "xs_carry_enh",
+        "curvature":         "curvature",
+    }
+    _w_k_c: dict[str, pd.DataFrame] = {}
+    for _rk, _bk in _cname_map.items():
+        if _rk not in _rsigs:
+            continue
+        _sig_c = _rsigs[_rk].reindex(index=_ret_c.index, columns=_ret_c.columns)
+        _w_c   = _cvs(_sig_c, _ret_c, target_vol=_CP["asset_vol"], com=_CP["vol_com"])
+        _w_c   = _creb(_w_c, rule=_CP["rebal"])
+        _w_c   = _cbook(_w_c, _ret_c, target_vol=_CP["book_vol"],
+                        cov_hl=_CP["cov_hl"], k_max=_CP["k_max"])
+        _w_k_c[_bk] = _w_c
+
+    _w_is_c   = _comm_res["weights_is"]
+    _w_oos_c  = _comm_res["weights_oos"]
+    _alpha_c  = pd.concat([_w_is_c, _w_oos_c]).sort_index()
+    _all_idx  = _w_k_c[list(_w_k_c)[0]].index
+    _all_cols = _w_k_c[list(_w_k_c)[0]].columns
+
+    _a_df   = _alpha_c.reindex(_all_idx).ffill().fillna(0.0)
+    _norms  = _a_df.abs().sum(axis=1).replace(0.0, np.nan)
+    _a_norm = _a_df.div(_norms, axis=0).fillna(0.0)
+
+    _W_comm = pd.DataFrame(0.0, index=_all_idx, columns=_all_cols)
+    for _ck in _a_norm.columns:
+        if _ck in _w_k_c:
+            _W_comm += (
+                _w_k_c[_ck]
+                .reindex(index=_all_idx, columns=_all_cols).fillna(0.0)
+                .mul(_a_norm[_ck], axis=0)
+            )
+
+    to_comm = _daily_ann_to(_W_comm).resample("BME").last().rename("commodities")
+
+    return pd.DataFrame({
+        "equities":    to_eq,
+        "rates":       to_rates,
+        "fx":          to_fx,
+        "commodities": to_comm,
+    }).sort_index()
+
+
 # ── Production entry point ─────────────────────────────────────────────────────
 
 def run_asset_blend(
@@ -597,6 +779,10 @@ def run_asset_blend(
             import matplotlib.pyplot as plt
             import matplotlib.dates as mdates
 
+            if verbose:
+                print("\n  Computing position-level turnover …")
+            to_df = _build_position_turnover_series()
+
             # Scale full series to vol_target annual vol (using IS vol)
             ann_vol = r_is.std() * np.sqrt(12)
             scale   = vol_target / ann_vol if ann_vol > 1e-12 else 1.0
@@ -625,8 +811,8 @@ def run_asset_blend(
             ax1.set_title(
                 f"Multi-Asset Blend  —  Rolling MSRR Ridge  "
                 f"(lookback={lookback}m, λ={lam})\n"
-                f"IS Sharpe {is_sr:+.2f}  MDD {is_mdd*100:+.1f}%  TO {is_to:.1f}x    "
-                f"OOS Sharpe {oos_sr:+.2f}  MDD {oos_mdd*100:+.1f}%  TO {oos_to:.1f}x",
+                f"IS Sharpe {is_sr:+.2f}  MDD {is_mdd*100:+.1f}%    "
+                f"OOS Sharpe {oos_sr:+.2f}  MDD {oos_mdd*100:+.1f}%",
                 fontsize=10,
             )
             ax1.text(
@@ -640,24 +826,27 @@ def run_asset_blend(
             ax1.yaxis.grid(True, ls=":", lw=0.5, color="#cccccc")
             ax1.set_axisbelow(True)
 
-            # ── Bottom panel: time-varying weights ────────────────────────────
-            w_plot = w_all.dropna()
-            for n in names:
-                ax2.plot(
-                    w_plot.index, w_plot[n].values,
-                    color=colors.get(n, "black"), lw=1.4, label=n,
-                )
-            ax2.axhline(0, color="black", lw=0.6, ls="-")
-            ax2.axvline(is_split, color="gray", lw=1.0, ls="--")
+            # ── Bottom panel: instrument-level position turnover ──────────────
+            to_plot = to_df.dropna(how="all")
+            _to_ymin = max(0.0, to_plot.stack().quantile(0.02) * 0.9)
+            _to_ymax = to_plot.stack().quantile(0.98) * 1.1
+
             ax2.fill_betweenx(
-                [w_plot.values.min() - 0.05, w_plot.values.max() + 0.05],
-                w_plot.index[0], is_split,
+                [_to_ymin, _to_ymax],
+                to_plot.index[0], is_split,
                 color="#f5f5f5", zorder=0,
             )
-            ax2.set_ylabel("Blend weight", fontsize=10)
-            ax2.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, _: f"{x:.0%}")
-            )
+            for n in ASSET_CLASSES:
+                if n not in to_plot.columns:
+                    continue
+                _s = to_plot[n].dropna()
+                ax2.plot(
+                    _s.index, _s.values,
+                    color=colors.get(n, "black"), lw=1.4, label=n,
+                )
+            ax2.axvline(is_split, color="gray", lw=1.0, ls="--")
+            ax2.set_ylabel("Ann. position turnover (×)", fontsize=10)
+            ax2.set_ylim(bottom=_to_ymin, top=_to_ymax)
             ax2.legend(loc="upper right", fontsize=8, ncol=2)
             ax2.yaxis.grid(True, ls=":", lw=0.5, color="#cccccc")
             ax2.set_axisbelow(True)
@@ -668,7 +857,7 @@ def run_asset_blend(
             out_path = Path(__file__).parent / "asset_blend_composite.png"
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
             if verbose:
-                print(f"\n  Chart saved → {out_path}")
+                print(f"  Chart saved → {out_path}")
             plt.show()
 
         except Exception as e:
