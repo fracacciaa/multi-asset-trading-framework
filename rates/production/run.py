@@ -31,7 +31,9 @@ import numpy as np
 import pandas as pd
 
 from rates.production.nelson_siegel import extract_factors_all_markets
-from rates.production.mean_reversion.signal import mean_reversion_rv, mean_reversion_pnl
+from rates.production.mean_reversion.signal import (
+    mean_reversion_rv, mean_reversion_pnl, mean_reversion_dv01_pos,
+)
 from rates.production.momentum.returns import build_all_return_panels
 from rates.production.momentum.signal_a import build_signal_a_daily
 from rates.production.momentum.signal_a import DM_MARKETS as MOM_MARKETS
@@ -190,10 +192,15 @@ def run(
                                zero_curves=zero_curves)
     _save("mean_reversion.parquet", mr_sig)
 
-    _log("Mean reversion PnL: per-tenor pos(t-1) × −Δresid(t)...")
+    _log("Mean reversion PnL: DV01-scaled pos(t-1) × (−Δy(t)) + carry...")
     mr_pnl = mean_reversion_pnl(markets=markets, start=start, end=end,
                                 zero_curves=zero_curves)
     _save("mean_reversion_pnl.parquet", mr_pnl)
+
+    _log("Mean reversion DV01 positions: z × DV01 per tenor (for TC)...")
+    mr_dv01_pos = mean_reversion_dv01_pos(markets=markets, start=start, end=end,
+                                          zero_curves=zero_curves)
+    _save("mean_reversion_dv01_pos.parquet", mr_dv01_pos)
 
     # ── Manifest ───────────────────────────────────────────────────────────────
     manifest = {
@@ -214,7 +221,8 @@ def run(
             "carry_ois_par":          "date × (market,tenor) MultiIndex cols; within-curve carry OIS positions — signal only",
             "carry_ois_par_pnl":      "date × market; §6.2 pos × daily mark-to-market — use for Sharpe (daily, √252)",
             "mean_reversion":         "date × market; factor-neutral NS residual z-score — signal only",
-            "mean_reversion_pnl":     "date × market; per-tenor pos(t-1)×(−Δresid(t)) summed — use for Sharpe (daily, √252)",
+            "mean_reversion_pnl":      "date × market; w×DV01×(−Δy)+carry in bp — use for Sharpe (daily, √252)",
+            "mean_reversion_dv01_pos": "date × (market,tenor); w×DV01 per tenor — use for TC gross turnover (bp)",
             "momentum_a_daily":       "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
             "momentum_a_daily_pnl":   "date × market; daily pos(t-1)×ret_d(t) summed — use for Sharpe (daily, √252)",
             "rx_m":                   "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
@@ -238,8 +246,9 @@ def run(
         "carry_ois_par":        carry_pos,
         "carry_ois_par_pnl":    carry_pnl,
         "mean_reversion":       mr_sig,
-        "mean_reversion_pnl":   mr_pnl,
-        "momentum_a_daily":     mom_a_daily,
+        "mean_reversion_pnl":      mr_pnl,
+        "mean_reversion_dv01_pos": mr_dv01_pos,
+        "momentum_a_daily":        mom_a_daily,
         "momentum_a_daily_pnl": mom_a_daily_pnl,
         "rx_m":                 rx_m_all,
         "ret_d":                ret_d_all,
