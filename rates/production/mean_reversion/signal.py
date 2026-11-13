@@ -40,6 +40,30 @@ RV_DY_ABS_CAP         = 0.25  # 25bp hard cap on per-tenor daily yield changes u
                                # OIS showing 500-840bp overnight "moves") without touching
                                # the signal z-scores
 
+# Markets excluded from the mean-reversion sleeve only (momentum and carry are
+# unaffected).  Attribution of the all-tenor sleeve, 9 DM markets:
+#   New Zealand  IS SR -0.18, OOS SR -0.41, OOS MDD -43.7%, and the only market
+#                with a negative cumulative contribution (-10.2% of sleeve P&L).
+#                51.5% of the IS drawdown.  Excludable on IS evidence alone.
+#   Japan        IS SR +0.27, OOS SR -0.07, OOS MDD -29.3%, 4.7% of sleeve P&L.
+#                Marginal contributor that adds drawdown; note the IS Sharpe was
+#                positive, so this exclusion is partly OOS-informed.
+# Effect (IS/OOS Sharpe): +0.31/+0.78 for all 9 -> +0.42/+0.81 for these 7.
+# This does NOT reduce drawdown (-25.6%/-21.3% -> -26.9%/-21.2%): the drawdowns
+# are driven by EUR and Switzerland, which this exclusion does not touch.
+RV_EXCLUDE_MARKETS    = ("New Zealand", "Japan")
+
+
+def _rv_markets(markets: Optional[list[str]]) -> list[str]:
+    """Default market list for the MR sleeve, with RV_EXCLUDE_MARKETS removed.
+
+    An explicit `markets` argument is honoured as given, so callers can still
+    evaluate the excluded markets deliberately.
+    """
+    if markets is not None:
+        return list(markets)
+    return [m for m in OIS_MARKETS if m not in RV_EXCLUDE_MARKETS]
+
 
 def _dv01_mat(z_arr: np.ndarray, tenors: np.ndarray) -> np.ndarray:
     """DV01 matrix (T, N) from yield array (T, N) in %."""
@@ -143,8 +167,7 @@ def mean_reversion_rv(
     NS lambda calibrated once on data ≤ RV_TRAIN_END (held fixed OOS).
     Positive → curve cheap on average → long duration.
     """
-    if markets is None:
-        markets = OIS_MARKETS
+    markets = _rv_markets(markets)
     if lambdas is None:
         lambdas = calibrate_lambda(markets=markets, end=RV_TRAIN_END)
 
@@ -261,8 +284,7 @@ def mean_reversion_pnl(
             Built per market from the par curve when not supplied.
     NS lambda calibrated once on data ≤ RV_TRAIN_END (held fixed OOS).
     """
-    if markets is None:
-        markets = OIS_MARKETS
+    markets = _rv_markets(markets)
     if lambdas is None:
         lambdas = calibrate_lambda(markets=markets, end=RV_TRAIN_END)
 
@@ -324,8 +346,7 @@ def mean_reversion_dv01_pos(
 
     TC formula: |Δ(w × DV01)| × h_bp  → cost in bp  (consistent with pnl in bp).
     """
-    if markets is None:
-        markets = OIS_MARKETS
+    markets = _rv_markets(markets)
     if lambdas is None:
         lambdas = calibrate_lambda(markets=markets, end=RV_TRAIN_END)
 

@@ -19,7 +19,9 @@ Pipeline position:
 Signals (production, from rates/signals/):
     momentum        momentum_a_daily_pnl.parquet   daily TSMOM (9 markets)
     carry           carry_ois_par_pnl.parquet       within-curve OIS carry (9 markets)
-    mean_reversion  mean_reversion_pnl.parquet      factor-neutral NS residuals (11 markets)
+    mean_reversion  mean_reversion_pnl.parquet      factor-neutral NS residuals
+                                                    (9 markets; New Zealand and Japan
+                                                    excluded, see RV_EXCLUDE_MARKETS)
 
 Each PnL parquet is date × market (bp, daily); load_managed_returns sums
 each signal across the common market intersection to produce a single
