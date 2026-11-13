@@ -17,11 +17,10 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pandas as pd
-from asset_blend import run_asset_blend
+from asset_blend import run_asset_tc
 
 if __name__ == "__main__":
-    r = run_asset_blend(verbose=True, plot=True)
-    print(f"\nFinal portfolio: {len(r)} monthly observations, "
+    r = run_asset_tc(verbose=True, plot=True)
+    print(f"\nProduction return (base TC, Adaptive Ridge): "
+          f"{len(r)} monthly observations, "
           f"{r.index[0].strftime('%Y-%m')} → {r.index[-1].strftime('%Y-%m')}")
-    print(f"Annualised vol (OOS): "
-          f"{r.loc[r.index > '2020-12-31'].std() * (12**0.5):.1%}")

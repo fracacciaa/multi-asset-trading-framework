@@ -200,6 +200,31 @@ def _tvw_turnover(w_df: pd.DataFrame, freq: int = 12) -> float:
     return float(w.diff().dropna(how="all").abs().sum(axis=1).mean() * freq)
 
 
+def _portfolio_to(
+    w_df: pd.DataFrame,
+    to_df: pd.DataFrame,
+    idx: pd.Index,
+) -> float:
+    """
+    Total portfolio instrument-level turnover: blend-weight-averaged per-asset TOs.
+
+    to_df is annualised (output of _build_position_turnover_series).
+    Returns NaN if there is insufficient overlap.
+    """
+    w_period = w_df.reindex(idx).dropna(how="any")
+    if len(w_period) < 2:
+        return float("nan")
+    to_period = to_df.reindex(w_period.index)
+    w_avg = w_period.mean()
+    total = w_avg.abs().sum()
+    if total < 1e-12:
+        return float("nan")
+    w_norm = w_avg.abs() / total
+    to_avg = to_period.mean()          # skipna=True — ignores early NaN rows
+    cols = w_norm.index.intersection(to_avg.index)
+    return float((w_norm[cols] * to_avg[cols]).sum())
+
+
 def _drift_to(w_df: pd.DataFrame, F: pd.DataFrame, freq: int = 12) -> float:
     """
     Drift-corrected annualised one-way turnover of blend weights.
@@ -559,31 +584,38 @@ def _build_position_turnover_series() -> pd.DataFrame:
     _w_fx = pd.concat(
         [_fx_res["weights_history"], _fx_res["weights_oos"]]
     ).sort_index().dropna(how="all")
+    _sigma_fx = _fx_res["sigma"]
     _wn_fx = _w_fx.abs().div(
         _w_fx.abs().sum(axis=1).replace(0.0, np.nan), axis=0
     )
 
-    _w_mom_m  = pd.read_parquet(_FX_SDIR / "signal_a_f9_h1.parquet")
-    _w_cxs_m  = pd.read_parquet(_FX_SDIR / "view_xs_carry_m.parquet")
-    _pos_mr_d = pd.read_parquet(_FX_SDIR / "mr_ns_loo_positions.parquet")
-
-    _to_mom_m = _monthly_ann_to(_w_mom_m).resample("BME").last()
-    _to_cxs_m = _monthly_ann_to(_w_cxs_m).resample("BME").last()
-    _to_mr_m  = (
-        _daily_ann_to(_pos_mr_d).resample("BME").last()
+    # Build blended pair-level positions, then compute TO on the combined
+    # portfolio (mirrors tc_sweep_fx._to / run_fx_prod._blended_pos).
+    _fx_monthly_pos = {
+        "momentum":  pd.read_parquet(_FX_SDIR / "signal_a_f9_h1.parquet"),
+        "mr_ns_loo": (pd.read_parquet(_FX_SDIR / "mr_ns_loo_positions.parquet")
+                      .resample("BME").last()),
+        "carry_xs":  pd.read_parquet(_FX_SDIR / "view_xs_carry_m.parquet"),
+    }
+    _fx_common_pairs = sorted(
+        set.intersection(*[set(p.columns) for p in _fx_monthly_pos.values()])
     )
 
-    _fx_sigs = {
-        "momentum":  _to_mom_m,
-        "carry_xs":  _to_cxs_m,
-        "mr_ns_loo": _to_mr_m,
-    }
-    _to_fx = pd.Series(0.0, index=_wn_fx.index)
-    for _fsig, _fto in _fx_sigs.items():
-        if _fsig in _wn_fx.columns:
-            _to_fx += _wn_fx[_fsig].fillna(0.0) * _fto.reindex(_wn_fx.index).fillna(0.0)
+    _fx_idx = _wn_fx.dropna(how="any").index
+    _fx_pos = pd.DataFrame(0.0, index=_fx_idx, columns=_fx_common_pairs)
+    for _fk in _wn_fx.columns:
+        if _fk not in _fx_monthly_pos or _fk not in _sigma_fx.index:
+            continue
+        _pk = _fx_monthly_pos[_fk].reindex(
+            index=_fx_idx, columns=_fx_common_pairs
+        ).fillna(0.0)
+        _fx_pos += _pk.mul(_wn_fx[_fk] / _sigma_fx[_fk], axis=0)
 
-    to_fx = _to_fx.rename("fx")
+    _fx_gross = _fx_pos.abs().sum(axis=1).replace(0.0, np.nan)
+    _fx_delta = _fx_pos.diff().abs().sum(axis=1)
+    to_fx = (
+        (_fx_delta / _fx_gross).rolling(12, min_periods=6).mean() * 12
+    ).rename("fx")
 
     # ── Commodities ───────────────────────────────────────────────────────────
     from commodities.backtest import (
@@ -647,12 +679,18 @@ def _build_position_turnover_series() -> pd.DataFrame:
 
     to_comm = _daily_ann_to(_W_comm).resample("BME").last().rename("commodities")
 
-    return pd.DataFrame({
+    to_df = pd.DataFrame({
         "equities":    to_eq,
         "rates":       to_rates,
         "fx":          to_fx,
         "commodities": to_comm,
     }).sort_index()
+
+    _cache_dir = _Path(__file__).parent / "cache"
+    _cache_dir.mkdir(exist_ok=True)
+    to_df.to_parquet(_cache_dir / "position_turnover.parquet")
+
+    return to_df
 
 
 # ── Production entry point ─────────────────────────────────────────────────────
@@ -1056,6 +1094,11 @@ def run_assets_tc(
         _, comm_ret  = tc_sweep_comm(_collect_returns=True)
         _, eq_ret    = tc_sweep_eq(_collect_returns=True)
 
+    # ── 1b. Instrument-level position turnover (computed once, reused) ────────
+    print("Computing instrument-level turnover …")
+    with contextlib.redirect_stdout(_io.StringIO()):
+        to_df = _build_position_turnover_series()
+
     # ── 2. TC-free cross-asset returns for Fixed weights baseline ─────────────
     print("Building TC-free cross-asset baseline …")
     F_free_all     = load_asset_returns(verbose=False)
@@ -1067,11 +1110,15 @@ def run_assets_tc(
     F_free_is  = F_free_is_raw.div(sigma_free)
     F_free_oos = F_free_oos_raw.div(sigma_free)
 
-    # Fit Rolling Ridge ONCE on TC-free IS (fixed-weight cross-asset method)
-    model_free = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
-    model_free.fit(F_free_is)
-    w_is_fixed  = model_free._weights_history
-    w_oos_fixed = model_free.predict_weights(F_free_oos)
+    # Walk-forward Rolling Ridge on full gross IS+OOS timeline.
+    # predict_weights(_oos_only) would restart the lookback window from scratch,
+    # losing IS history and producing NaN for the first min_obs OOS months.
+    # Using _roll(full) carries IS data into OOS, matching run_asset_blend().
+    model_free  = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
+    F_free_full = pd.concat([F_free_is, F_free_oos]).sort_index()
+    w_free_all  = model_free._roll(F_free_full)
+    w_is_fixed  = w_free_all.reindex(F_free_is.index)
+    w_oos_fixed = w_free_all.reindex(F_free_oos.index)
 
     def _norm_w(w_df: pd.DataFrame) -> pd.DataFrame:
         """L1-normalise weights row-wise (mirrors _apply_tvw logic)."""
@@ -1144,7 +1191,7 @@ def run_assets_tc(
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
                 "MDD_pct":  _mdd(r, vol_target) * 100,
-                "TO":       _tvw_turnover(w.dropna()),
+                "TO":       _portfolio_to(w, to_df, r.index),
             })
 
         _returns_dict[("Fixed weights", scenario_name)] = (
@@ -1158,10 +1205,11 @@ def run_assets_tc(
         F_tc_is_n2  = F_tc_is_raw.div(sigma_tc)
         F_tc_oos_n2 = F_tc_oos_raw.div(sigma_tc)
 
-        model_tc = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
-        model_tc.fit(F_tc_is_n2)
-        w_is_a  = model_tc._weights_history
-        w_oos_a = model_tc.predict_weights(F_tc_oos_n2)
+        model_tc     = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
+        F_tc_full_n2 = pd.concat([F_tc_is_n2, F_tc_oos_n2]).sort_index()
+        w_all_a      = model_tc._roll(F_tc_full_n2)
+        w_is_a       = w_all_a.reindex(F_tc_is_n2.index)
+        w_oos_a      = w_all_a.reindex(F_tc_oos_n2.index)
 
         r_is_a  = _apply_tvw(F_tc_is_n2,  w_is_a)
         r_oos_a = _apply_tvw(F_tc_oos_n2, w_oos_a)
@@ -1187,7 +1235,7 @@ def run_assets_tc(
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
                 "MDD_pct":  _mdd(r, vol_target) * 100,
-                "TO":       _tvw_turnover(w.dropna()),
+                "TO":       _portfolio_to(w, to_df, r.index),
             })
 
         _returns_dict[("Adaptive Ridge", scenario_name)] = (
@@ -1243,4 +1291,272 @@ def run_assets_tc(
     returns_df.columns = pd.MultiIndex.from_tuples(
         returns_df.columns, names=["Method", "Scenario"]
     )
-    return {"metrics": df, "returns": returns_df}
+    return {
+        "metrics":     df,
+        "returns":     returns_df,
+        "to_df":       to_df,
+        "w_is_fixed":  w_is_fixed,
+        "w_oos_fixed": w_oos_fixed,
+    }
+
+
+# ── Production TC entry point ──────────────────────────────────────────────────
+
+def run_asset_tc(
+    scenarios: Optional[dict] = None,
+    is_end:     str   = IS_END,
+    oos_start:  str   = OOS_START,
+    lookback:   int   = 36,
+    min_obs:    int   = 24,
+    vol_target: float = 0.10,
+    lam:        float = 0.01,
+    plot:       bool  = True,
+    verbose:    bool  = True,
+) -> pd.Series:
+    """
+    Production cross-asset TC analysis: gross vs net-of-TC metrics + chart.
+
+    Builds the TC-free gross portfolio (Rolling Ridge MSRR), runs run_assets_tc()
+    for all TC scenarios, then prints a combined IS / OOS summary table and
+    optionally plots the cumulative return under gross, best, base, and worst
+    TC scenarios.
+
+    Two methods are compared, mirroring run_assets_tc():
+      Fixed weights  — Rolling Ridge fit once on gross returns; only the
+                       per-asset cost propagates into the return.
+      Adaptive Ridge — Rolling Ridge refit on TC-adjusted returns per scenario;
+                       the allocator shifts weight away from costly assets.
+
+    The printed table adds a "gross" row to both methods as the TC = 0 baseline.
+    The chart shows the Adaptive Ridge lines (gross + 3 scenarios) since that is
+    the production method.
+
+    Parameters
+    ----------
+    scenarios   Dict mapping label → {asset_class: scenario_key}.
+                Default: TC_SCENARIOS_ASSETS (best / base / worst).
+    is_end      Last IS date.  Default: "2020-12-31".
+    oos_start   First OOS date.  Default: "2021-01-01".
+    lookback    Rolling Ridge window in months.  Default: 36.
+    min_obs     Minimum months before first weight estimate.  Default: 24.
+    vol_target  For MDD scaling and plot.  Default: 0.10.
+    lam         Ridge regularisation.  Default: 0.01.
+    plot        Save and show the cumulative-return chart.  Default: True.
+    verbose     Print the summary table.  Default: True.
+
+    Returns
+    -------
+    pd.Series — base-scenario Adaptive Ridge net-of-TC monthly return series,
+    name = "asset_blend_net".
+    """
+    import contextlib, io as _io
+
+    if scenarios is None:
+        scenarios = TC_SCENARIOS_ASSETS
+
+    # ── 1. Gross baseline (TC = 0, Rolling Ridge) ─────────────────────────────
+    if verbose:
+        print("Building gross (TC-free) baseline …")
+    with contextlib.redirect_stdout(_io.StringIO()):
+        r_gross = run_asset_blend(
+            is_end=is_end, lookback=lookback, min_obs=min_obs,
+            lam=lam, vol_target=vol_target, plot=False, verbose=False,
+        )
+
+    r_gross_is  = r_gross.loc[r_gross.index <= is_end]
+    r_gross_oos = r_gross.loc[r_gross.index >= oos_start]
+
+    # ── 2. TC sweep ───────────────────────────────────────────────────────────
+    if verbose:
+        print("Running TC sweep …")
+    with contextlib.redirect_stdout(_io.StringIO()):
+        tc_res = run_assets_tc(
+            scenarios=scenarios, is_end=is_end, oos_start=oos_start,
+            lookback=lookback, min_obs=min_obs, vol_target=vol_target, lam=lam,
+        )
+
+    metrics_df  = tc_res["metrics"]
+    returns_df  = tc_res["returns"]
+    to_df       = tc_res["to_df"]
+    w_is_fixed  = tc_res["w_is_fixed"]
+    w_oos_fixed = tc_res["w_oos_fixed"]
+
+    # ── 3. Build gross metrics row ────────────────────────────────────────────
+    # Gross uses the same Rolling Ridge blend weights as the Fixed-weights baseline.
+    gross_rows = []
+    for period, r, w in [
+        ("IS",  r_gross_is,  w_is_fixed),
+        ("OOS", r_gross_oos, w_oos_fixed),
+    ]:
+        gross_to = _portfolio_to(w, to_df, r.index)
+        for method in ["Fixed weights", "Adaptive Ridge"]:
+            gross_rows.append({
+                "Method":   method,
+                "Scenario": "gross",
+                "Period":   period,
+                "Sharpe":   _sharpe(r),
+                "MDD_pct":  _mdd(r, vol_target) * 100,
+                "TO":       gross_to,
+            })
+
+    gross_df  = pd.DataFrame(gross_rows)
+    all_metrics = pd.concat([gross_df, metrics_df], ignore_index=True)
+
+    # ── 4. Print combined table ───────────────────────────────────────────────
+    if verbose:
+        scen_order = ["gross"] + list(scenarios.keys())
+        W = 80
+        for method in ["Fixed weights", "Adaptive Ridge"]:
+            label = (
+                "FIXED WEIGHTS — TC-free Ridge fit; only cost propagated"
+                if method == "Fixed weights"
+                else "ADAPTIVE RIDGE — Ridge refit per TC scenario  [production]"
+            )
+            sub = all_metrics[all_metrics["Method"] == method]
+            print("\n" + "=" * W)
+            print(f"  CROSS-ASSET TC ANALYSIS — {label}")
+            print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}"
+                  f"  |  lookback={lookback}m  |  λ={lam}")
+            print("=" * W)
+            print(f"  {'Scenario':<16}  {'Period':<6}"
+                  f"  {'Sharpe':>8}  {'MDD':>8}  {'TO':>7}")
+            print("  " + "─" * (W - 2))
+            prev = None
+            for scen in scen_order:
+                rows = sub[sub["Scenario"] == scen]
+                if rows.empty:
+                    continue
+                if prev is not None:
+                    print("  " + "─" * (W - 2))
+                prev = scen
+                for _, row in rows.iterrows():
+                    tag = " [prod]" if scen == "base" else ""
+                    label_scen = f"{scen}{tag}"
+                    sr  = f"{row['Sharpe']:+.2f}"  if np.isfinite(row["Sharpe"])  else "   n/a"
+                    mdd = f"{row['MDD_pct']:.1f}%"  if np.isfinite(row["MDD_pct"]) else "   n/a"
+                    to  = f"{row['TO']:.2f}x"       if np.isfinite(row["TO"])      else "    —"
+                    print(f"  {label_scen:<16}  {row['Period']:<6}"
+                          f"  {sr:>8}  {mdd:>8}  {to:>7}")
+            print("=" * W)
+
+        # Sharpe degradation summary
+        print()
+        print("  Sharpe degradation  (Adaptive Ridge, OOS)")
+        print("  " + "─" * 44)
+        gross_oos_sr = all_metrics.loc[
+            (all_metrics["Method"] == "Adaptive Ridge") &
+            (all_metrics["Scenario"] == "gross") &
+            (all_metrics["Period"] == "OOS"), "Sharpe"
+        ].values[0]
+        for scen in list(scenarios.keys()):
+            net_sr = all_metrics.loc[
+                (all_metrics["Method"] == "Adaptive Ridge") &
+                (all_metrics["Scenario"] == scen) &
+                (all_metrics["Period"] == "OOS"), "Sharpe"
+            ]
+            if net_sr.empty:
+                continue
+            tag = " ← production" if scen == "base" else ""
+            diff = net_sr.values[0] - gross_oos_sr
+            print(f"  {scen:<8}  {net_sr.values[0]:+.2f}  "
+                  f"(Δ {diff:+.2f} vs gross){tag}")
+        print("  " + "─" * 44)
+
+    # ── 5. Plot ───────────────────────────────────────────────────────────────
+    if plot:
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+
+            is_split = pd.Timestamp(is_end)
+            scen_styles = {
+                "gross": ("#1a237e", 2.0, "-",  "gross (no TC)"),
+                "best":  ("#43a047", 1.4, "--", "best TC"),
+                "base":  ("#e65100", 1.8, "-",  "base TC  [production]"),
+                "worst": ("#b71c1c", 1.4, ":",  "worst TC"),
+            }
+
+            fig, ax = plt.subplots(figsize=(12, 6))
+
+            all_cums = []
+            for scen, (color, lw, ls, label_s) in scen_styles.items():
+                if scen == "gross":
+                    r_s = r_gross
+                else:
+                    key = ("Adaptive Ridge", scen)
+                    if key not in returns_df.columns:
+                        continue
+                    r_s = returns_df[key].dropna()
+
+                # Scale each series by its own IS vol so all lines target the
+                # same annual vol.  Using a single gross IS scale distorts TC
+                # scenario lines (their IS vol differs from gross IS vol).
+                r_s_is   = r_s.loc[r_s.index <= is_end]
+                ann_vol_s = r_s_is.std() * np.sqrt(12)
+                scale_s   = vol_target / ann_vol_s if ann_vol_s > 1e-12 else 1.0
+
+                r_scaled = r_s * scale_s
+                cum = (1 + r_scaled).cumprod()
+                all_cums.append(cum)
+                ax.plot(cum.index, cum.values,
+                        color=color, lw=lw, ls=ls, label=label_s, zorder=2)
+
+            # IS shading
+            if all_cums:
+                y_min = min(c.min() for c in all_cums) * 0.95
+                y_max = max(c.max() for c in all_cums) * 1.05
+                ax.fill_betweenx([y_min, y_max], all_cums[0].index[0], is_split,
+                                 color="#f5f5f5", zorder=0)
+                ax.set_ylim(y_min, y_max)
+
+            ax.axvline(is_split, color="gray", lw=1.0, ls="--", zorder=1)
+            ax.text(0.02, 0.97, "IS",  transform=ax.transAxes,
+                    fontsize=9, color="gray", va="top")
+            ax.text(0.72, 0.97, "OOS", transform=ax.transAxes,
+                    fontsize=9, color="gray", va="top")
+
+            # Annotate OOS Sharpe for each scenario on the right margin
+            for scen, (color, _, _, _) in scen_styles.items():
+                row = all_metrics.loc[
+                    (all_metrics["Method"] == "Adaptive Ridge") &
+                    (all_metrics["Scenario"] == scen) &
+                    (all_metrics["Period"] == "OOS")
+                ]
+                if not row.empty and np.isfinite(row["Sharpe"].values[0]):
+                    ax.annotate(
+                        f"SR {row['Sharpe'].values[0]:+.2f}",
+                        xy=(1.0, 0.0), xycoords="axes fraction",
+                        xytext=(5, list(scen_styles).index(scen) * 14),
+                        textcoords="offset points",
+                        fontsize=7.5, color=color, ha="left",
+                    )
+
+            ax.set_ylabel("Wealth index", fontsize=10)
+            ax.set_title(
+                f"Cross-Asset Blend — TC Sensitivity  "
+                f"(Adaptive Ridge, lookback={lookback}m, λ={lam}, "
+                f"vol target={vol_target*100:.0f}%)",
+                fontsize=10,
+            )
+            ax.legend(loc="upper left", fontsize=8)
+            ax.yaxis.grid(True, ls=":", lw=0.5, color="#cccccc")
+            ax.set_axisbelow(True)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+            ax.xaxis.set_major_locator(mdates.YearLocator(2))
+
+            fig.tight_layout()
+            out_path = Path(__file__).parent / "asset_tc_composite.png"
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            if verbose:
+                print(f"\n  Chart saved → {out_path}")
+            plt.show()
+
+        except Exception as e:
+            if verbose:
+                print(f"\n  [plot skipped: {e}]")
+
+    # ── 6. Return base-scenario Adaptive Ridge series ─────────────────────────
+    base_key = ("Adaptive Ridge", "base")
+    r_base = returns_df[base_key].dropna() if base_key in returns_df.columns else r_gross
+    r_base.name = "asset_blend_net"
+    return r_base
