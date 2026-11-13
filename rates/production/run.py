@@ -192,9 +192,9 @@ def run(
                                zero_curves=zero_curves)
     _save("mean_reversion.parquet", mr_sig)
 
-    _log("Mean reversion PnL: DV01-scaled pos(t-1) × (−Δy(t)) + carry...")
+    _log("Mean reversion PnL: w(t-1) × ret_d(t), actual CM swap return...")
     mr_pnl = mean_reversion_pnl(markets=markets, start=start, end=end,
-                                zero_curves=zero_curves)
+                                zero_curves=zero_curves, ret_d=ret_d_all)
     _save("mean_reversion_pnl.parquet", mr_pnl)
 
     _log("Mean reversion DV01 positions: z × DV01 per tenor (for TC)...")
@@ -221,7 +221,7 @@ def run(
             "carry_ois_par":          "date × (market,tenor) MultiIndex cols; within-curve carry OIS positions — signal only",
             "carry_ois_par_pnl":      "date × market; §6.2 pos × daily mark-to-market — use for Sharpe (daily, √252)",
             "mean_reversion":         "date × market; factor-neutral NS residual z-score — signal only",
-            "mean_reversion_pnl":      "date × market; w×DV01×(−Δy)+carry in bp — use for Sharpe (daily, √252)",
+            "mean_reversion_pnl":      "date × market; w(t-1)×ret_d(t) summed, bp — use for Sharpe (daily, √252)",
             "mean_reversion_dv01_pos": "date × (market,tenor); w×DV01 per tenor — use for TC gross turnover (bp)",
             "momentum_a_daily":       "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
             "momentum_a_daily_pnl":   "date × market; daily pos(t-1)×ret_d(t) summed — use for Sharpe (daily, √252)",
@@ -232,7 +232,9 @@ def run(
             "Always use the *_pnl files. "
             "sr = pnl[market].dropna().mean() / pnl[market].dropna().std() * sqrt(252). "
             "carry_ois_par_pnl: §6.2 income+roll-down, DV01-neutral 5Y+10Y cross-section, daily rebalance. "
-            "mean_reversion_pnl: per-tenor z-score × (−Δresid), summed. "
+            "mean_reversion_pnl: per-tenor factor-neutral score(t-1) × actual CM swap "
+            "return ret_d(t), summed. ret_d already contains carry, roll and duration, "
+            "so no DV01 multiplier and no separate carry leg. "
             "momentum_a_daily_pnl: per-tenor vol-scaled positions × daily CM returns, summed."
         ),
     }

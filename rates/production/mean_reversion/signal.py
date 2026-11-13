@@ -160,30 +160,42 @@ def mean_reversion_rv(
     return df
 
 
+def _gross_cap_scale(
+    w_df: pd.DataFrame,
+    dv01_df: pd.DataFrame,
+    cap_end: str = RV_TRAIN_END,
+) -> pd.Series:
+    """
+    Per-date scale factor keeping daily gross DV01 notional (Σ_τ |w×DV01|)
+    below the IS 99th-percentile cap.  Caps multi-tenor stress-event blowups
+    where many individually z-capped tenors align simultaneously.
+
+    Returned as a per-date Series so the same scaling can be applied to the
+    unit-notional weights (for P&L) and to the DV01-scaled weights (for TC),
+    keeping the two consistent.  Uniform across tenors, so the factor-neutral
+    hedge structure is preserved.
+    """
+    gross = (w_df * dv01_df).abs().sum(axis=1)
+    is_gross = gross[gross.index <= cap_end]
+    ref = is_gross if len(is_gross) >= 30 else gross
+    cap = float(ref.quantile(RV_GROSS_CAP_PCTILE))
+    if cap <= 0:
+        return pd.Series(1.0, index=w_df.index)
+    return (cap / gross).clip(upper=1.0)
+
+
 def _capped_dv01_pos(
     w_df: pd.DataFrame,
     dv01_df: pd.DataFrame,
     cap_end: str = RV_TRAIN_END,
 ) -> pd.DataFrame:
     """
-    Scale positions so daily gross notional (Σ_τ |w×DV01|) never exceeds the
-    IS 99th-percentile cap.  Caps multi-tenor stress-event blowups where many
-    individually z-capped tenors align simultaneously.
-
-    Scale factor = min(1, cap / gross)  — applied uniformly across tenors so
-    the factor-neutral hedge structure is preserved.
+    DV01-scaled, gross-capped positions.  Used for transaction costs only:
+    a swap half-spread is a yield spread, so converting it into P&L units
+    requires the DV01.  The P&L itself must NOT use these (see
+    mean_reversion_pnl — ret_d already contains the duration term).
     """
-    pos   = w_df * dv01_df
-    gross = pos.abs().sum(axis=1)
-    is_gross = gross[gross.index <= cap_end]
-    if len(is_gross) >= 30:
-        cap = float(is_gross.quantile(RV_GROSS_CAP_PCTILE))
-    else:
-        cap = float(gross.quantile(RV_GROSS_CAP_PCTILE))
-    if cap <= 0:
-        return pos
-    scale = (cap / gross).clip(upper=1.0)
-    return pos.mul(scale, axis=0)
+    return (w_df * dv01_df).mul(_gross_cap_scale(w_df, dv01_df, cap_end), axis=0)
 
 
 def _factor_neutral_positions(
@@ -214,34 +226,39 @@ def mean_reversion_pnl(
     end: Optional[str] = None,
     lambdas: Optional[dict] = None,
     zero_curves: Optional[dict] = None,
+    ret_d: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    Per-market daily P&L of the DV01-weighted factor-neutral mean-reversion position.
+    Per-market daily P&L: yesterday's factor-neutral residual score times the
+    actual return of the instrument at that tenor today.
 
-    Position w(t-1, τ) is z_df re-projected onto the complement of the DV01-weighted
-    NS factor space at t-1 (vol-normalising s_perp breaks factor-neutrality; this
-    restores it so the hedge is frozen at t-1's loadings).
+        pnl(t, market) = Σ_τ  w(t-1, τ) × ret_d(t, (market, τ))        [bp]
 
-    For each tenor and day:
-      pos(t-1, τ)       = w(t-1, τ) × DV01(t-1, τ)
-      pnl_mtm(t, τ)     = pos(t-1, τ) × (−Δy(t, τ))               [actual yield move]
-      pnl_carry(t, τ)   = pos(t-1, τ) × (y(t-1,τ) − y_fund(t-1)) / 252
+    w(t-1, τ) is the unit-notional factor-neutral position: z_df re-projected
+    onto the complement of the DV01-weighted NS factor space, so the level,
+    slope and curvature hedge is frozen at t-1's loadings, then gross-capped at
+    the IS 99th percentile of DV01 notional.
 
-    Per-market P&L (bp) = [Σ_τ (pnl_mtm + pnl_carry)] × 100
+    ret_d is the constant-maturity receiver-swap return from
+    momentum.returns.cm_return_bp, which already contains carry, roll-down and
+    the duration-scaled price term:
 
-    DV01(τ,t) = τ × exp(−y(t,τ)/100 × τ)  — sensitivity per 1% yield move.
-    y_fund    = shortest bootstrapped zero-curve tenor (overnight proxy), computed
-                from the zero curve directly (no carry parquet).
-    Carry adds the yield spread over funding; note cheap tenors may earn less carry
-    (opposite sign to the signal), which will reduce Sharpe relative to the gross.
+        ret_d = (s - rf)·dt  +  dur·(s - s_aged)  -  dur·(s_next - s)
 
-    Two-layer outlier control applied per market:
-    1. Gross notional cap: Σ_τ|w×DV01| ≤ IS 99th pctile.  Preserves the
-       factor-neutral hedge structure while limiting multi-tenor alignment.
-    2. Per-tenor Δy hard cap at ±25bp: removes data-gap spikes (NZ and China
-       OIS show 274-840bp one-day "moves" that are impossible in reality).
+    Two consequences, both of which earlier versions got wrong:
+      * do NOT multiply w by DV01 here — ret_d already carries the duration
+        term, so w × DV01 × ret_d counts duration twice;
+      * do NOT add a separate carry leg — ret_d already includes it.
 
-    Units: bp per unit of aggregate z-score exposure.
+    The score is built on the bootstrapped zero curve while ret_d is built from
+    par swap rates, so the two do not share a quote-error realisation.  That
+    matters: a P&L formed as score(t-1) × (−Δy(t)) on the *same* series is a
+    non-negative quadratic form y(t-1)ᵀPy(t-1) and scores a large positive
+    Sharpe on pure noise.  Regression test: phase-scramble w and confirm the
+    Sharpe collapses to zero.
+
+    ret_d : optional pre-built panel with (market, tenor) MultiIndex columns.
+            Built per market from the par curve when not supplied.
     NS lambda calibrated once on data ≤ RV_TRAIN_END (held fixed OOS).
     """
     if markets is None:
@@ -251,16 +268,28 @@ def mean_reversion_pnl(
 
     mkt_series: dict[str, pd.Series] = {}
     for market in markets:
-        z_df, _, zc_obs, avail, zc_full, ns_load = _market_z_scores(
+        z_df, _, zc_obs, avail, _, ns_load = _market_z_scores(
             market, lambdas, start, end, zero_curves
         )
         if z_df.empty:
             continue
 
-        z_arr    = z_df.values.astype(float)
-        dv01_arr = _dv01_mat(zc_obs.values.astype(float), avail)   # (T, N)
+        if ret_d is not None:
+            if market not in ret_d.columns.get_level_values(0):
+                continue
+            r_mkt = ret_d[market]
+        else:
+            from rates.production.momentum.returns import build_return_panels
+            r_mkt = build_return_panels(market, start=start, end=end,
+                                        tenors=list(avail))["ret_d"]
 
-        # Re-project z onto the complement of DV01-weighted NS factor space
+        tenors = [t for t in avail if t in r_mkt.columns]
+        if len(tenors) < 3:
+            continue
+
+        z_arr    = z_df.values.astype(float)
+        dv01_arr = _dv01_mat(zc_obs.values.astype(float), avail)
+
         has_nan = ~np.all(np.isfinite(z_arr), axis=1)
         z_safe  = np.where(has_nan[:, None], 0.0, z_arr)
         w_arr   = _factor_neutral_positions(z_safe, dv01_arr, ns_load)
@@ -268,26 +297,11 @@ def mean_reversion_pnl(
 
         w_df    = pd.DataFrame(w_arr, index=z_df.index, columns=avail)
         dv01_df = pd.DataFrame(dv01_arr, index=zc_obs.index, columns=avail)
+        w_df    = w_df.mul(_gross_cap_scale(w_df, dv01_df), axis=0)
 
-        # Actual yield changes from the zero curve (not residual diffs).
-        # Hard cap at ±25bp per tenor: removes data-gap spikes (NZ/China OIS show
-        # 274-840bp one-day "moves" that are impossible in real markets).
-        delta_y = zc_obs.diff().clip(-RV_DY_ABS_CAP, RV_DY_ABS_CAP)
-
-        # Income carry from the zero curve: (y − y_fund) / 252
-        # y_fund = shortest bootstrapped tenor (overnight proxy)
-        fund_tenor = min(zc_full.columns)
-        funding    = zc_full[fund_tenor].reindex(zc_obs.index)
-        carry_spread = zc_obs.sub(funding, axis=0) / 252.0  # % per day
-
-        # DV01-scaled lagged position (gross notional capped at IS 99th pctile)
-        pos_capped = _capped_dv01_pos(w_df, dv01_df)
-        pos_lagged = pos_capped.shift(1)
-
-        # P&L in bp (×100 converts DV01-code × % → bp)
-        pnl_mtm   = (pos_lagged * (-delta_y)).sum(axis=1)
-        pnl_carry = (pos_lagged * carry_spread.shift(1)).sum(axis=1)
-        mkt_series[market] = (pnl_mtm + pnl_carry) * 100.0
+        idx = w_df.index.intersection(r_mkt.index)
+        mkt_series[market] = (w_df.loc[idx, tenors].shift(1)
+                              * r_mkt.loc[idx, tenors]).sum(axis=1)
 
     df = pd.concat(mkt_series.values(), axis=1, keys=mkt_series.keys())
     df.index.name = "date"
