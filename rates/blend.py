@@ -79,7 +79,7 @@ SIGNAL_FILES: dict[str, str] = {
 _POS_FILES: dict[str, str] = {
     "momentum":       "momentum_a_daily.parquet",
     "carry":          "carry_ois_par.parquet",
-    "mean_reversion": "mean_reversion.parquet",
+    "mean_reversion": "mean_reversion_dv01_pos.parquet",
 }
 
 IS_END    = "2018-12-31"
@@ -383,7 +383,7 @@ def tc_sweep_rates(
     TC is deducted in native signal units per signal type:
       carry          : |Δpos_dv01_m| × h_bp_m          (DV01-normalized, PnL in bp)
       momentum       : |Δpos_m| × h_bp_m × eff_dur      (vol-scaled pos, PnL in bp)
-      mean_reversion : |Δz_m|  × h_bp_m / 100           (z-score pos, PnL in %)
+      mean_reversion : |Δ(z×DV01)_m| × h_bp_m / 100    (DV01-scaled pos, PnL in year·%)
 
     Parameters
     ----------
@@ -450,8 +450,8 @@ def tc_sweep_rates(
                 tc_cost = daily_abs_chg * h
             elif signal == "momentum":
                 tc_cost = daily_abs_chg * h * _MOM_EFF_DUR
-            else:   # mean_reversion: PnL is in % (yield in %), divide by 100
-                tc_cost = daily_abs_chg * h / 100.0
+            else:   # mean_reversion: w×DV01 positions, PnL in bp — same formula as carry
+                tc_cost = daily_abs_chg * h
             pnl_adj[mkt] = pnl_adj[mkt] - tc_cost.reindex(pnl_adj.index).fillna(0.0)
         return pnl_adj
 
@@ -484,14 +484,23 @@ def tc_sweep_rates(
         idx = idx[(idx >= pd.Timestamp(t0)) & (idx <= pd.Timestamp(t1))]
         if len(idx) == 0 or not pos_frames:
             return float("nan")
-        w_period = w_df.loc[idx]
-        norms = w_period.abs().sum(axis=1).replace(0.0, np.nan)
-        w_norm = w_period.div(norms, axis=0)
-        sig_tos = {k: _sig_to_local(pos_frames[k], t0, t1) for k in pos_frames}
-        weighted = w_norm.abs().mul(
-            pd.Series(sig_tos).reindex(w_norm.columns).fillna(0.0)
-        )
-        return float(weighted.sum(axis=1).mean())
+        w = w_df.loc[idx]
+        norms = w.abs().sum(axis=1).replace(0.0, np.nan)
+        w = w.div(norms, axis=0)
+        total_delta = np.zeros(len(idx))
+        total_gross = np.zeros(len(idx))
+        for k in w.columns:
+            if k not in pos_frames or k not in sigma_free.index or np.isnan(sigma_free[k]):
+                continue
+            pk = pos_frames[k].reindex(index=idx).fillna(0.0).values
+            wk = w[k].values[:, None]
+            scaled = pk * wk / float(sigma_free[k])
+            total_gross += np.abs(scaled).sum(axis=1)
+            total_delta[1:] += np.abs(np.diff(scaled, axis=0)).sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            to_arr = np.where(total_gross > 1e-12, total_delta / total_gross, np.nan)
+        valid = to_arr[~np.isnan(to_arr)]
+        return float(valid.mean() * 252) if len(valid) > 0 else float("nan")
 
     # ── TC-free baseline: fit Rolling Ridge ONCE for fixed-weight method ──────
     F_free = pd.DataFrame(
@@ -747,20 +756,34 @@ def run_rates_prod(
         if path.exists():
             sig_pos[name] = pd.read_parquet(path)
 
+    # IS sigma for blended-position TO
+    _F_raw_to = load_managed_returns(signals_dir=sig_dir)
+    sigma_blend = _F_raw_to.loc[_F_raw_to.index <= IS_END].std() * np.sqrt(252)
+    sigma_blend = sigma_blend.replace(0.0, np.nan)
+
     def _blend_to(w_df: pd.DataFrame, start, end) -> float:
-        """Time-averaged position-level TO weighted by rolling blend allocations."""
+        """Blended instrument-level annualised one-way turnover."""
         idx = w_df.dropna(how="any").index
         idx = idx[(idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))]
         if len(idx) == 0 or not sig_pos:
             return float("nan")
-        w_period = w_df.loc[idx]
-        norms    = w_period.abs().sum(axis=1).replace(0.0, np.nan)
-        w_norm   = w_period.div(norms, axis=0)
-        sig_tos  = {k: _sig_to(sig_pos[k], start, end) for k in sig_pos}
-        weighted = w_norm.abs().mul(
-            pd.Series(sig_tos).reindex(w_norm.columns).fillna(0.0)
-        )
-        return float(weighted.sum(axis=1).mean())
+        w = w_df.loc[idx]
+        norms = w.abs().sum(axis=1).replace(0.0, np.nan)
+        w = w.div(norms, axis=0)
+        total_delta = np.zeros(len(idx))
+        total_gross = np.zeros(len(idx))
+        for k in w.columns:
+            if k not in sig_pos or k not in sigma_blend.index or np.isnan(sigma_blend[k]):
+                continue
+            pk = sig_pos[k].reindex(index=idx).fillna(0.0).values
+            wk = w[k].values[:, None]
+            scaled = pk * wk / float(sigma_blend[k])
+            total_gross += np.abs(scaled).sum(axis=1)
+            total_delta[1:] += np.abs(np.diff(scaled, axis=0)).sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            to_arr = np.where(total_gross > 1e-12, total_delta / total_gross, np.nan)
+        valid = to_arr[~np.isnan(to_arr)]
+        return float(valid.mean() * 252) if len(valid) > 0 else float("nan")
 
     # ── compute metrics ───────────────────────────────────────────────────────
 
@@ -869,28 +892,31 @@ def compare_blend_methods(
         if path.exists():
             sig_pos[name] = pd.read_parquet(path)
 
-    def _sig_to(pos_df: pd.DataFrame, start, end) -> float:
-        p = pos_df.loc[start:end].dropna(how="all")
-        if len(p) < 2:
-            return float("nan")
-        gross = p.abs().sum(axis=1).replace(0.0, np.nan).mean()
-        if gross < 1e-12 or np.isnan(gross):
-            return float("nan")
-        return float(p.diff().dropna(how="all").abs().sum(axis=1).mean() * 252 / gross)
+    sigma_cmp = F_is_raw.std() * np.sqrt(252)
+    sigma_cmp = sigma_cmp.replace(0.0, np.nan)
 
     def _blend_to(w_df: pd.DataFrame, start, end) -> float:
         idx = w_df.dropna(how="any").index
         idx = idx[(idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))]
         if len(idx) == 0 or not sig_pos:
             return float("nan")
-        w_period = w_df.loc[idx]
-        norms    = w_period.abs().sum(axis=1).replace(0.0, np.nan)
-        w_norm   = w_period.div(norms, axis=0)
-        sig_tos  = {k: _sig_to(sig_pos[k], start, end) for k in sig_pos}
-        weighted = w_norm.abs().mul(
-            pd.Series(sig_tos).reindex(w_norm.columns).fillna(0.0)
-        )
-        return float(weighted.sum(axis=1).mean())
+        w = w_df.loc[idx]
+        norms = w.abs().sum(axis=1).replace(0.0, np.nan)
+        w = w.div(norms, axis=0)
+        total_delta = np.zeros(len(idx))
+        total_gross = np.zeros(len(idx))
+        for k in w.columns:
+            if k not in sig_pos or k not in sigma_cmp.index or np.isnan(sigma_cmp[k]):
+                continue
+            pk = sig_pos[k].reindex(index=idx).fillna(0.0).values
+            wk = w[k].values[:, None]
+            scaled = pk * wk / float(sigma_cmp[k])
+            total_gross += np.abs(scaled).sum(axis=1)
+            total_delta[1:] += np.abs(np.diff(scaled, axis=0)).sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            to_arr = np.where(total_gross > 1e-12, total_delta / total_gross, np.nan)
+        valid = to_arr[~np.isnan(to_arr)]
+        return float(valid.mean() * 252) if len(valid) > 0 else float("nan")
 
     # ── Method 1: Rolling OLS ────────────────────────────────────────────────
     w_ols = _normalise_w(

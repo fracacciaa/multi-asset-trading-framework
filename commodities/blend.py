@@ -439,8 +439,13 @@ def run_comm_prod(
                         .fillna(0.0)
                         .mul(a_norm[k], axis=0))
 
-    to_is  = float(W_blend.loc[W_blend.index <= ts_cut].diff().abs().sum(axis=1).mean() * TD)
-    to_oos = float(W_blend.loc[W_blend.index >  ts_cut].diff().abs().sum(axis=1).mean() * TD)
+    def _inst_to(w: pd.DataFrame, freq: int) -> float:
+        gross = w.abs().sum(axis=1).replace(0.0, np.nan)
+        delta = w.diff().abs().sum(axis=1)
+        return float((delta / gross).dropna().mean() * freq)
+
+    to_is  = _inst_to(W_blend.loc[W_blend.index <= ts_cut], TD)
+    to_oos = _inst_to(W_blend.loc[W_blend.index >  ts_cut], TD)
 
     # ── 4. Performance metrics ────────────────────────────────────────────────
     def _sr(r: pd.Series) -> float:

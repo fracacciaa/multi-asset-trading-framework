@@ -384,7 +384,9 @@ def run_fx_prod(
         return float((cum / cum.cummax() - 1).min())
 
     def _turnover(pos: pd.DataFrame) -> float:
-        return float(pos.diff().abs().sum(axis=1).mean() * 12)
+        gross = pos.abs().sum(axis=1).replace(0.0, np.nan)
+        delta = pos.diff().abs().sum(axis=1)
+        return float((delta / gross).dropna().mean() * 12)
 
     metrics = {
         "IS":  (_sharpe(r_is),  _mdd(r_is),  _turnover(pos_is)),
@@ -570,7 +572,9 @@ def tc_sweep_fx(
                 continue
             pk = monthly_pos[k].reindex(index=idx, columns=common_pairs).fillna(0.0)
             pos += pk.mul(w[k] / sigma[k], axis=0)
-        return float(pos.diff().abs().sum(axis=1).mean() * 12)
+        gross = pos.abs().sum(axis=1).replace(0.0, np.nan)
+        delta = pos.diff().abs().sum(axis=1)
+        return float((delta / gross).dropna().mean() * 12)
 
     # ── TC-free baseline: fit Rolling Ridge ONCE for fixed-weight method ──────
     F_free_is  = F_gross.loc[F_gross.index <= is_end]
@@ -832,7 +836,9 @@ def compare_blend_methods(
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _turnover(pos: pd.DataFrame) -> float:
-        return float(pos.diff().abs().sum(axis=1).mean() * 12)
+        gross = pos.abs().sum(axis=1).replace(0.0, np.nan)
+        delta = pos.diff().abs().sum(axis=1)
+        return float((delta / gross).dropna().mean() * 12)
 
     def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
         norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
