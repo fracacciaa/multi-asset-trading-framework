@@ -180,16 +180,54 @@ def _sharpe(r: pd.Series, freq: int = 12) -> float:
     return float(r.mean() / r.std() * np.sqrt(freq))
 
 
-def _mdd(r: pd.Series, vol_target: float = 0.10, freq: int = 12) -> float:
+def _mdd(
+    r: pd.Series,
+    vol_target: float = 0.10,
+    freq: int = 12,
+    sizing_vol: Optional[float] = None,
+) -> float:
+    """
+    Max drawdown of `r` levered so the IN-SAMPLE book runs at `vol_target`.
+
+    sizing_vol : annualised vol used to set leverage, i.e. the IS realised vol
+        of this same composite.  Pass it for every period, IS and OOS alike, so
+        both are measured at the leverage the strategy was actually sized to.
+
+    Two wrong conventions this replaces, both of which were in the codebase:
+
+    1. Rescaling by r's OWN realised vol per period (this function, previously).
+       Peeks, and biases in whichever direction vol drifted: it understates when
+       OOS vol exceeds IS vol and overstates when it falls short.  On the
+       cross-asset composite, IS vol 0.61 against OOS 0.37, it reported OOS
+       -1.09% where the IS-sized figure is -0.66%.
+
+    2. Plain `r * vol_target` with no sizing_vol (the nine per-asset helpers in
+       rates/fx/commodities blend.py).  No peek, but `r` is a weighted blend of
+       unit-vol sleeves, so diversification leaves it below unit vol: the
+       cross-asset composite runs at 6.1% vol, not 10%, and the drawdown is
+       understated accordingly.
+
+    With sizing_vol omitted the behaviour falls back to (2) rather than (1), so
+    a caller that has not been updated under-levers instead of peeking.
+
+    `freq` is accepted for signature compatibility and is unused.
+    """
     r = r.dropna()
     if r.empty:
         return float("nan")
-    ann_vol = r.std() * np.sqrt(freq)
-    if ann_vol < 1e-12:
-        return float("nan")
-    r_scaled = r * (vol_target / ann_vol)
-    cum = (1 + r_scaled).cumprod()
+    scale = vol_target
+    if sizing_vol is not None and np.isfinite(sizing_vol) and sizing_vol > 1e-12:
+        scale = vol_target / sizing_vol
+    cum = (1 + r * scale).cumprod()
     return float((cum / cum.cummax() - 1).min())
+
+
+def _sizing_vol(r_is: pd.Series, freq: int = 12) -> float:
+    """IS annualised vol of a composite return, for _mdd's sizing_vol."""
+    r_is = r_is.dropna()
+    if len(r_is) < 2:
+        return float("nan")
+    return float(r_is.std() * np.sqrt(freq))
 
 
 def _tvw_turnover(w_df: pd.DataFrame, freq: int = 12) -> float:
@@ -257,10 +295,11 @@ def _metrics(
     is_tvw: bool,
     vol_target: float = 0.10,
     freq: int = 12,
+    sizing_vol: Optional[float] = None,
 ) -> dict:
     return {
         "sharpe":   _sharpe(r, freq),
-        "mdd":      _mdd(r, vol_target, freq),
+        "mdd":      _mdd(r, vol_target, freq, sizing_vol),
         "turnover": _tvw_turnover(w_df, freq) if (is_tvw and w_df is not None) else 0.0,
         "n_months": int(r.dropna().shape[0]),
     }
@@ -374,8 +413,10 @@ def try_asset_blend(
         total  = w_norm.abs().sum()
         w_norm = w_norm / total if total > 1e-12 else w_norm
         result[mname] = {
-            "is":         _metrics(r_is,  None, False, vol_target),
-            "oos":        _metrics(r_oos, None, False, vol_target),
+            "is":         _metrics(r_is,  None, False, vol_target,
+                                   sizing_vol=_sizing_vol(r_is)),
+            "oos":        _metrics(r_oos, None, False, vol_target,
+                                   sizing_vol=_sizing_vol(r_is)),
             "type":       "static",
             "weights_is": w_norm,
         }
@@ -386,8 +427,10 @@ def try_asset_blend(
         w_is_slice  = w_df.reindex(F_is.index).dropna()
         w_oos_slice = w_df.reindex(F_oos.index).dropna()
         result[mname] = {
-            "is":         _metrics(r_is,  w_is_slice,  True, vol_target),
-            "oos":        _metrics(r_oos, w_oos_slice, True, vol_target),
+            "is":         _metrics(r_is,  w_is_slice,  True, vol_target,
+                                   sizing_vol=_sizing_vol(r_is)),
+            "oos":        _metrics(r_oos, w_oos_slice, True, vol_target,
+                                   sizing_vol=_sizing_vol(r_is)),
             "type":       "dynamic",
             "weights_is": w_is_slice.mean() if not w_is_slice.empty else pd.Series(dtype=float),
         }
@@ -756,12 +799,14 @@ def run_asset_blend(
 
     # ── 4. Metrics ────────────────────────────────────────────────────────────
 
+    sizing = _sizing_vol(r_is)          # IS vol sets the leverage for both periods
+
     is_sr  = _sharpe(r_is)
-    is_mdd = _mdd(r_is, vol_target)
+    is_mdd = _mdd(r_is, vol_target, sizing_vol=sizing)
     is_to  = _tvw_turnover(w_is.dropna())
 
     oos_sr  = _sharpe(r_oos)
-    oos_mdd = _mdd(r_oos, vol_target)
+    oos_mdd = _mdd(r_oos, vol_target, sizing_vol=sizing)
     oos_to  = _tvw_turnover(w_oos.dropna())
 
     w_is_avg  = w_is.dropna().mean()
@@ -964,6 +1009,7 @@ def compare_blend_methods(
 
     records = []
     for method_name, w_full in methods.items():
+        sizing = _sizing_vol(_apply_tvw(F_is, w_full.reindex(F_is.index)))
         for period, F, w in [
             ("IS",  F_is,  w_full.reindex(F_is.index)),
             ("OOS", F_oos, w_full.reindex(F_oos.index)),
@@ -974,7 +1020,7 @@ def compare_blend_methods(
                 "Method": method_name,
                 "Period": period,
                 "Sharpe": _sharpe(r),
-                "MDD":    _mdd(r, vol_target) * 100,
+                "MDD":    _mdd(r, vol_target, sizing_vol=sizing) * 100,
                 "TO":     to,
             })
 
@@ -1166,6 +1212,7 @@ def run_assets_tc(
         r_is_f  = r_net_f.loc[r_net_f.index <= is_end]
         r_oos_f = r_net_f.loc[r_net_f.index >= oos_start]
 
+        sizing = _sizing_vol(r_is_f)
         for period, r, w in [
             ("IS",  r_is_f,  w_is_fixed),
             ("OOS", r_oos_f, w_oos_fixed),
@@ -1175,7 +1222,7 @@ def run_assets_tc(
                 "Scenario": scenario_name,
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r, vol_target) * 100,
+                "MDD_pct":  _mdd(r, vol_target, sizing_vol=sizing) * 100,
                 "TO":       _portfolio_to(w, to_df, r.index),
             })
 
@@ -1210,6 +1257,7 @@ def run_assets_tc(
         r_is_a  = r_net_a.loc[r_net_a.index <= is_end]
         r_oos_a = r_net_a.loc[r_net_a.index >= oos_start]
 
+        sizing = _sizing_vol(r_is_a)
         for period, r, w in [
             ("IS",  r_is_a,  w_is_a),
             ("OOS", r_oos_a, w_oos_a),
@@ -1219,7 +1267,7 @@ def run_assets_tc(
                 "Scenario": scenario_name,
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r, vol_target) * 100,
+                "MDD_pct":  _mdd(r, vol_target, sizing_vol=sizing) * 100,
                 "TO":       _portfolio_to(w, to_df, r.index),
             })
 
@@ -1369,6 +1417,7 @@ def run_asset_tc(
     # ── 3. Build gross metrics row ────────────────────────────────────────────
     # Gross uses the same Rolling Ridge blend weights as the Fixed-weights baseline.
     gross_rows = []
+    sizing = _sizing_vol(r_gross_is)
     for period, r, w in [
         ("IS",  r_gross_is,  w_is_fixed),
         ("OOS", r_gross_oos, w_oos_fixed),
@@ -1380,7 +1429,7 @@ def run_asset_tc(
                 "Scenario": "gross",
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r, vol_target) * 100,
+                "MDD_pct":  _mdd(r, vol_target, sizing_vol=sizing) * 100,
                 "TO":       gross_to,
             })
 
