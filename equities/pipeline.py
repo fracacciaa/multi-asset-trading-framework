@@ -74,6 +74,10 @@ _VF_DATA_CACHE          = os.path.join(os.path.dirname(__file__), "cache", "vf_d
 _VF_DATA_RESEARCH_CACHE = os.path.join(os.path.dirname(__file__), "cache", "vf_data_research.pkl")
 _VF_POSITIONS_CACHE     = os.path.join(os.path.dirname(__file__), "cache", "vf_positions.pkl")
 
+_SIGNALS_DIR = os.path.join(os.path.dirname(__file__), "signals")
+_EQ_RETURNS_PARQUET   = os.path.join(_SIGNALS_DIR, "eq_prod_returns.parquet")
+_COMBINED_POS_PARQUET = os.path.join(_SIGNALS_DIR, "combined_positions.parquet")
+
 _XS_ABLATIONS: dict[str, dict] = {
     "baseline":   {},
     "no_grinold": {"use_grinold": False},
@@ -418,6 +422,32 @@ def _print_research_table(result: dict, is_end: str, oos_start: str) -> None:
 
 
 # ── positions cache helper ────────────────────────────────────────────────────
+
+
+def load_eq_returns(signals_dir: str | None = None) -> pd.Series:
+    """
+    Load the pre-computed IS+OOS equities production return series from parquet.
+
+    Mirrors load_managed_returns() in rates/fx/commodities — no Bloomberg required.
+    Regenerate with: python -m equities.export_signals
+    """
+    path = os.path.join(signals_dir or _SIGNALS_DIR, "eq_prod_returns.parquet")
+    df = pd.read_parquet(path)
+    s = df.iloc[:, 0]
+    s.name = "eq_prod"
+    return s
+
+
+def load_combined_positions(signals_dir: str | None = None) -> pd.DataFrame:
+    """
+    Load the pre-computed blended instrument-level positions from parquet.
+
+    Used by asset_blend._build_position_turnover_series() for equities TO.
+    Regenerate with: python -m equities.export_signals
+    """
+    path = os.path.join(signals_dir or _SIGNALS_DIR, "combined_positions.parquet")
+    return pd.read_parquet(path)
+
 
 def _load_or_build_positions(rebuild: bool = False, verbose: bool = True) -> dict:
     os.makedirs(os.path.dirname(_VF_POSITIONS_CACHE), exist_ok=True)

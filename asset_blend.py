@@ -115,10 +115,10 @@ def load_asset_returns(
     Only months where all four series have data are returned (inner join).
     """
     if equities_r is None:
-        from equities.pipeline import run_eq_prod
+        from equities.pipeline import load_eq_returns
         if verbose:
-            print("  building equities composite return …")
-        equities_r = run_eq_prod(verbose=False)
+            print("  loading equities composite return …")
+        equities_r = load_eq_returns()
 
     if rates_r is None:
         from rates.blend import run_blend
@@ -528,23 +528,8 @@ def _build_position_turnover_series() -> pd.DataFrame:
         return (delta / gross) * 12  # already monthly, × 12 annualises
 
     # ── Equities ──────────────────────────────────────────────────────────────
-    with contextlib.redirect_stdout(_io.StringIO()):
-        from equities.pipeline import (
-            _load_or_build_positions, PRODUCTION_SIGNALS, IS_END as _EQ_IS
-        )
-        from equities.data import fetch_prices as _fetch_eq
-        from equities.blend import build_managed_returns, msrr_ridge, combine_signals
-
-        _eq_pos = _load_or_build_positions(rebuild=False, verbose=False)
-        _eq_pos = {k: v for k, v in _eq_pos.items() if k in PRODUCTION_SIGNALS}
-        _eq_px  = _fetch_eq(tickers=None)
-        _eq_ret = _eq_px.pct_change(fill_method=None).dropna(how="all")
-        _ret_is_eq = _eq_ret.loc[_eq_ret.index <= _EQ_IS]
-        _pos_is_eq = {k: v.loc[v.index <= _EQ_IS] for k, v in _eq_pos.items()}
-        _F_is_eq   = build_managed_returns(_pos_is_eq, _ret_is_eq)
-        _bw_eq     = msrr_ridge(_F_is_eq, lam=0.01)
-        _comb_eq   = combine_signals(_eq_pos, _bw_eq)
-
+    from equities.pipeline import load_combined_positions as _load_eq_pos
+    _comb_eq = _load_eq_pos()
     to_eq = _daily_ann_to(_comb_eq).resample("BME").last().rename("equities")
 
     # ── Rates ─────────────────────────────────────────────────────────────────
