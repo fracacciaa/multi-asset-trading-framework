@@ -121,24 +121,36 @@ CROSS_MARKET_BLEND: dict[str, str] = {
     "carry":          "static_ridge",
     "mean_reversion": "rolling_ridge",
 }
-_CROSS_MARKET_LAM:      float = 0.01
-_CROSS_MARKET_LOOKBACK: int   = 252
-_CROSS_MARKET_MIN_OBS:  int   = 63
+_CROSS_MARKET_LAM:          float = 0.01
+_CROSS_MARKET_LOOKBACK:     int   = 252
+_CROSS_MARKET_MIN_OBS:      int   = 63
+_CROSS_MARKET_MIN_MKT_DAYS: int   = 756   # min IS days a market needs to be included in static-ridge fit (≈3yr)
 
 
 def _mkt_blend_static_ridge(
     pnl_df: pd.DataFrame,
     is_end: str,
     lam: float = _CROSS_MARKET_LAM,
+    min_mkt_days: int = _CROSS_MARKET_MIN_MKT_DAYS,
 ) -> pd.Series:
     """
     Vol-normalise per market using IS σ, fit Static Ridge once on IS data,
     apply frozen weights to the full period.  Falls back to plain sum on
     insufficient IS data.
+
+    Only markets with at least `min_mkt_days` valid IS observations are
+    included in the training set, avoiding degenerate IS windows when a
+    late-starting market collapses the common-date intersection.
     """
     pnl = pnl_df.sort_index()
-    is_data = pnl.loc[pnl.index <= is_end].dropna(how="any")
-    if len(is_data) < _CROSS_MARKET_MIN_OBS or is_data.shape[1] < 2:
+    is_raw = pnl.loc[pnl.index <= is_end]
+    # Restrict training to markets that have enough IS coverage
+    is_counts = is_raw.notna().sum()
+    eligible  = is_counts[is_counts >= min_mkt_days].index.tolist()
+    if len(eligible) < 2:
+        return pnl.sum(axis=1)
+    is_data = is_raw[eligible].dropna(how="any")
+    if len(is_data) < _CROSS_MARKET_MIN_OBS:
         return pnl.sum(axis=1)
     sigma_is = is_data.std() * np.sqrt(252)
     sigma_is = sigma_is.replace(0.0, np.nan).dropna()
@@ -744,6 +756,295 @@ def tc_sweep_rates(
         )
         return df, returns_df
     return df
+
+
+# ── Market-level blend evaluation ─────────────────────────────────────────────
+
+def _try_market_blend(
+    pnl_file: str,
+    signal_label: str,
+    signals_dir: Optional[str | Path] = None,
+    is_end: str = IS_END,
+    lookback: int = 252,
+    min_obs: int = 63,
+    vol_target: float = 0.10,
+    min_market_obs: int = 252,
+) -> dict:
+    """
+    Evaluate all blend methods applied to per-market PnL for one signal.
+
+    Loads a date × market PnL parquet (in bp/day), vol-normalises on IS
+    realized σ, then runs the full static + dynamic blend suite treating
+    markets as "signals".  Analogous to try_asset_blend() in core/asset_blend.py
+    but at the within-signal, cross-market level.
+
+    Parameters
+    ----------
+    pnl_file        Parquet filename under signals_dir; shape date × market.
+    signal_label    Display label for the header ("MEAN REVERSION", etc.).
+    signals_dir     Directory containing the parquet files.  Default: rates/signals/.
+    is_end          Last IS date.  Default: IS_END.
+    lookback        Rolling-MSRR / DMA window in trading days.  Default: 252.
+    min_obs         Minimum observations before rolling weights are non-NaN.  Default: 63.
+    vol_target      Annual vol for MDD scaling.  Default: 0.10.
+    min_market_obs  Drop markets with fewer than this many non-NaN IS rows.  Default: 252.
+
+    Returns
+    -------
+    dict  keyed by method name, each value:
+        {"is": {"sharpe", "mdd", "turnover"}, "oos": {...}, "type": "static"|"dynamic"}
+    """
+    sig_dir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+
+    pnl = pd.read_parquet(sig_dir / pnl_file)
+    pnl.index = pd.to_datetime(pnl.index)
+    pnl = pnl.sort_index()
+
+    # Drop markets with insufficient IS history
+    is_counts = pnl.loc[pnl.index <= is_end].notna().sum()
+    pnl = pnl[is_counts[is_counts >= min_market_obs].index]
+    pnl = pnl.dropna(how="any")
+
+    F_is_raw  = pnl.loc[pnl.index <= is_end]
+    F_oos_raw = pnl.loc[pnl.index >  is_end]
+
+    if F_is_raw.empty:
+        raise ValueError(f"No IS data at or before {is_end} in {pnl_file}.")
+
+    # Vol-normalise on IS realized σ × √252
+    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = sigma.replace(0.0, np.nan)
+    F_is   = F_is_raw.div(sigma)
+    F_oos  = F_oos_raw.div(sigma)
+    F_full = pd.concat([F_is, F_oos]).sort_index()
+    names  = list(F_is.columns)
+
+    # ── Metric helpers ────────────────────────────────────────────────────────
+
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 30 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(252))
+
+    def _mdd_m(r: pd.Series) -> float:
+        r = r.dropna()
+        if r.empty:
+            return float("nan")
+        ann_vol = r.std() * np.sqrt(252)
+        if ann_vol < 1e-12:
+            return float("nan")
+        r_scaled = r * (vol_target / ann_vol)
+        cum = (1 + r_scaled).cumprod()
+        return float((cum / cum.cummax() - 1).min() * 100)
+
+    def _to_m(w_df: pd.DataFrame) -> float:
+        w = w_df.dropna(how="any")
+        if len(w) < 2:
+            return float("nan")
+        return float(w.diff().dropna(how="all").abs().sum(axis=1).mean() * 252)
+
+    def _apply_static_bw(bw) -> tuple[pd.Series, pd.Series]:
+        w = bw.weights.reindex(names).fillna(0.0)
+        total = w.abs().sum()
+        if total > 1e-12:
+            w = w / total
+        return (F_is * w).sum(axis=1), (F_oos * w).sum(axis=1)
+
+    def _apply_tvw_df(w_df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        def _apply(F):
+            idx = F.index.intersection(w_df.dropna(how="any").index)
+            if idx.empty:
+                return pd.Series(dtype=float)
+            w = w_df.loc[idx]
+            norm = w.abs().sum(axis=1).replace(0.0, np.nan)
+            return (F.loc[idx] * w.div(norm, axis=0)).sum(axis=1)
+        return _apply(F_is), _apply(F_oos)
+
+    def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
+        norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
+        return w_raw.div(norm, axis=0)
+
+    # ── Static methods ────────────────────────────────────────────────────────
+
+    static_blends: dict = {
+        "equal_weight": equal_weight(names),
+        "inv_vol":      inv_vol_blend(F_is),
+        "erc":          erc_blend(F_is),
+        "hrp":          hrp_blend(F_is),
+        "sh_p1":        sharpe_heuristic(F_is, power=1),
+        "msrr_ols":     msrr_ridge(F_is, lam=0.0),
+        "msrr_ridge":   msrr_ridge(F_is, lam=0.01),
+    }
+
+    # ── Dynamic methods ────────────────────────────────────────────────────────
+
+    dma = DMABlend(alpha=0.99)
+    dma.fit(F_is)
+    w_dma = pd.concat([dma._weights_history, dma.predict_weights(F_oos)]).sort_index()
+
+    dynamic_blends: dict = {
+        "rolling_msrr_ols":   _normalise_w(RollingMSRR(penalty="ols",   lookback=lookback, min_obs=min_obs)._roll(F_full)),
+        "rolling_msrr_ridge": _normalise_w(RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)._roll(F_full)),
+        "rolling_msrr_lasso": _normalise_w(RollingMSRR(penalty="lasso", lookback=lookback, min_obs=min_obs)._roll(F_full)),
+        "dma":                w_dma,
+    }
+
+    # ── Collect results ────────────────────────────────────────────────────────
+
+    result: dict = {}
+
+    for mname, bw in static_blends.items():
+        r_is, r_oos = _apply_static_bw(bw)
+        result[mname] = {
+            "is":   {"sharpe": _sharpe(r_is),  "mdd": _mdd_m(r_is),  "turnover": 0.0},
+            "oos":  {"sharpe": _sharpe(r_oos), "mdd": _mdd_m(r_oos), "turnover": 0.0},
+            "type": "static",
+        }
+
+    for mname, w_df in dynamic_blends.items():
+        r_is, r_oos = _apply_tvw_df(w_df)
+        result[mname] = {
+            "is":   {"sharpe": _sharpe(r_is),  "mdd": _mdd_m(r_is),  "turnover": _to_m(w_df.reindex(F_is.index))},
+            "oos":  {"sharpe": _sharpe(r_oos), "mdd": _mdd_m(r_oos), "turnover": _to_m(w_df.reindex(F_oos.index))},
+            "type": "dynamic",
+        }
+
+    # ── Print table ────────────────────────────────────────────────────────────
+
+    oos_end   = F_oos.index[-1]  if not F_oos.empty  else None
+    is_start  = F_is.index[0]
+    W = 84
+
+    print()
+    print("=" * W)
+    print(f"  RATES {signal_label} — MARKET-LEVEL BLEND")
+    print(f"  IS : {is_start.strftime('%Y-%m')} → {is_end[:7]}   |   "
+          f"OOS: {is_end[:7]} → {oos_end.strftime('%Y-%m') if oos_end else 'n/a'}")
+    print(f"  Markets : {names}")
+    print(f"  MDD at {vol_target*100:.0f}% vol target  |  rolling lookback = {lookback}d")
+    print("=" * W)
+    print(
+        f"  {'Method':<22}  {'Type':<8}"
+        f"  {'IS SR':>7}  {'IS MDD':>8}  {'IS TO':>7}"
+        f"  {'OOS SR':>7}  {'OOS MDD':>8}  {'OOS TO':>8}"
+    )
+    print("  " + "─" * (W - 2))
+
+    prev_type = None
+    for mname, stats in result.items():
+        t = stats["type"]
+        if prev_type is not None and t != prev_type:
+            print("  " + "─" * (W - 2))
+        prev_type = t
+        i, o = stats["is"], stats["oos"]
+
+        def _sr(v):  return f"{v:+.2f}"  if np.isfinite(v) else "   n/a"
+        def _mdd(v): return f"{v:+.1f}%" if np.isfinite(v) else "    n/a"
+        def _to(v):  return f"{v:.1f}x"  if np.isfinite(v) else "   n/a"
+
+        print(
+            f"  {mname:<22}  {t:<8}"
+            f"  {_sr(i['sharpe']):>7}  {_mdd(i['mdd']):>8}  {_to(i['turnover']):>7}"
+            f"  {_sr(o['sharpe']):>7}  {_mdd(o['mdd']):>8}  {_to(o['turnover']):>8}"
+        )
+
+    print("=" * W)
+
+    # Print IS weights for all static methods
+    col_w = max(10, max(len(n) for n in names) + 2)
+    print(f"\n  IS weights (static methods, L1-normalised)")
+    print("  " + "─" * (22 + col_w * len(names)))
+    print(f"  {'Method':<20}" + "".join(f"  {n:>{col_w}}" for n in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+    for mname, bw in static_blends.items():
+        w = bw.weights.reindex(names).fillna(0.0)
+        total = w.abs().sum()
+        if total > 1e-12:
+            w = w / total
+        print(f"  {mname:<20}" + "".join(f"  {w.get(n, 0.0):>+{col_w}.1%}" for n in names))
+    print("  " + "─" * (22 + col_w * len(names)))
+
+    return result
+
+
+def try_mr_market_blend(
+    signals_dir: Optional[str | Path] = None,
+    is_end: str = IS_END,
+    lookback: int = 252,
+    min_obs: int = 63,
+    vol_target: float = 0.10,
+) -> dict:
+    """
+    Evaluate all blend methods applied to per-market NS classic MR PnL.
+
+    Treats each market's MR return series as a "signal" and applies the same
+    blend suite used for signal-level combination, in contrast to the default
+    equal-weight sum in load_managed_returns().
+
+    Uses mean_reversion_pnl.parquet (date × market, bp/day).
+
+    Returns
+    -------
+    dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
+    """
+    return _try_market_blend(
+        pnl_file="mean_reversion_pnl.parquet",
+        signal_label="MEAN REVERSION",
+        signals_dir=signals_dir,
+        is_end=is_end, lookback=lookback,
+        min_obs=min_obs, vol_target=vol_target,
+    )
+
+
+def try_carry_market_blend(
+    signals_dir: Optional[str | Path] = None,
+    is_end: str = IS_END,
+    lookback: int = 252,
+    min_obs: int = 63,
+    vol_target: float = 0.10,
+) -> dict:
+    """
+    Evaluate all blend methods applied to per-market within-curve carry OIS PnL.
+
+    Uses carry_ois_par_pnl.parquet (date × market, bp/day).
+
+    Returns
+    -------
+    dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
+    """
+    return _try_market_blend(
+        pnl_file="carry_ois_par_pnl.parquet",
+        signal_label="CARRY",
+        signals_dir=signals_dir,
+        is_end=is_end, lookback=lookback,
+        min_obs=min_obs, vol_target=vol_target,
+    )
+
+
+def try_momentum_market_blend(
+    signals_dir: Optional[str | Path] = None,
+    is_end: str = IS_END,
+    lookback: int = 252,
+    min_obs: int = 63,
+    vol_target: float = 0.10,
+) -> dict:
+    """
+    Evaluate all blend methods applied to per-market TSMOM PnL.
+
+    Uses momentum_a_daily_pnl.parquet (date × market, bp/day).
+
+    Returns
+    -------
+    dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
+    """
+    return _try_market_blend(
+        pnl_file="momentum_a_daily_pnl.parquet",
+        signal_label="MOMENTUM",
+        signals_dir=signals_dir,
+        is_end=is_end, lookback=lookback,
+        min_obs=min_obs, vol_target=vol_target,
+    )
 
 
 def run_rates_tc(
