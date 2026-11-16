@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from asset_blend import _build_position_turnover_series, ASSET_CLASSES, IS_END, OOS_START
+from core.asset_blend import _build_position_turnover_series, ASSET_CLASSES, IS_END, OOS_START
 
 
 @pytest.fixture(scope="module")

@@ -16,7 +16,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional
 
-from equities.sectors import GICS, FINANCIALS_TICKERS
+from equities.production.sectors import GICS, FINANCIALS_TICKERS
 
 
 def momentum(
@@ -633,7 +633,7 @@ def build_vf_data(
         rebal_dates  : DatetimeIndex
         columns      : Index  — ticker universe
     """
-    from optimization import estimate_covariance
+    from core.optimization import estimate_covariance
 
     raw_signals: dict[str, pd.DataFrame] = {
         "momentum":                 momentum(prices),
@@ -681,7 +681,7 @@ def apply_vf_params(
                 use_ortho, use_tanh, tanh_scale, use_rank, …)
     ts_params : overrides for ViewFormationTS  (use_ortho, desired_vol)
     """
-    from equities.view_formation import ViewFormationXS, ViewFormationTS
+    from equities.production.view_formation import ViewFormationXS, ViewFormationTS
 
     raw_signals  = vf_data["raw_signals"]
     cov_matrices = vf_data["cov_matrices"]

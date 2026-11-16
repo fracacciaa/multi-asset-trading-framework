@@ -7,11 +7,11 @@ read parquet instead of re-running NS calibration and fit loops.
 Outputs written to rates/signals/:
   ns_factors.parquet          date × (market, factor)       NS level/slope/curvature
   momentum_a_daily.parquet    date × (market, tenor)        MOP TSMOM position sizes
-  momentum_a_daily_pnl.parquet date × market                momentum daily PnL (bp)
+  momentum_a_daily_pnl.parquet date × market                momentum daily PnL, full repricing (bp)
   mean_reversion.parquet      date × market                 factor-neutral NS residual z-score
   mean_reversion_pnl.parquet  date × market                 mean reversion daily PnL (bp)
   carry_ois_par.parquet       date × (market, tenor)        within-curve carry OIS positions
-  carry_ois_par_pnl.parquet   date × market                 within-curve carry OIS PnL (bp)
+  carry_ois_par_pnl.parquet   date × market                 within-curve carry OIS PnL, full repricing (bp)
   rx_m.parquet                date × (market, tenor)        Sihvonen monthly log excess returns (bp)
   ret_d.parquet               date × (market, tenor)        daily CM returns (bp)
   manifest.json
@@ -37,9 +37,11 @@ from rates.production.mean_reversion.signal import (
 from rates.production.momentum.returns import build_all_return_panels
 from rates.production.momentum.signal_a import build_signal_a_daily
 from rates.production.momentum.signal_a import DM_MARKETS as MOM_MARKETS
-from rates.production.carry.carry_ois_par import ois_par_carry_pnl, OIS_PAR_MARKETS
+from rates.production.momentum.pnl_repriced import momentum_pnl_all_repriced
+from rates.production.carry.carry_ois_par import OIS_PAR_MARKETS
 from rates.production.carry.signal import build_positions
 from rates.production.carry.carry_ois_par import ois_par_carry_panel, BENCHMARK_TENORS as CARRY_TENORS
+from rates.production.carry.pnl_repriced import ois_par_carry_pnl_repriced
 from rates.production.ois_data import OIS_MARKETS, fetch_ois_curves
 from rates.production.yc_builder import build_zero_curve
 
@@ -126,17 +128,10 @@ def run(
     if not mom_a_daily.empty:
         _log(f"  date range: {mom_a_daily.index[0].date()} – {mom_a_daily.index[-1].date()}")
 
-    _log("Momentum Signal A-daily PnL: pos(t-1) × ret_d(t), no forward-fill...")
-    if not mom_a_daily.empty and not ret_d_all.empty:
-        common_cols = mom_a_daily.columns.intersection(ret_d_all.columns)
-        common_idx  = mom_a_daily.index.intersection(ret_d_all.index)
-        pos_shifted = mom_a_daily.loc[common_idx, common_cols].shift(1)
-        mom_a_daily_pnl = (
-            pos_shifted * ret_d_all.loc[common_idx, common_cols]
-        ).T.groupby(level="market").sum().T
-        mom_a_daily_pnl.index.name = "date"
-    else:
-        mom_a_daily_pnl = pd.DataFrame()
+    _log("Momentum Signal A-daily PnL: full swap repricing (pos × swap_pv × 10000)...")
+    mom_a_daily_pnl = momentum_pnl_all_repriced(
+        markets=list(mom_panels.keys()), formation=252, start=start, end=end,
+    )
     _save("momentum_a_daily_pnl.parquet", mom_a_daily_pnl)
 
     # ── Step 3: NS factors ─────────────────────────────────────────────────────
@@ -178,8 +173,8 @@ def run(
         carry_pos = pd.DataFrame()
     _save("carry_ois_par.parquet", carry_pos)
 
-    _log("Within-curve carry OIS PnL: pos × daily mark-to-market (§6.2 approx)...")
-    carry_pnl = ois_par_carry_pnl(
+    _log("Within-curve carry OIS PnL: full swap repricing (pos × swap_pv × 10000)...")
+    carry_pnl = ois_par_carry_pnl_repriced(
         markets=carry_mkts, tenors=CARRY_TENORS, start=start, end=end,
     )
     _save("carry_ois_par_pnl.parquet", carry_pnl)
@@ -219,23 +214,23 @@ def run(
         "files": {
             "ns_factors":             "date × (market,factor) MultiIndex cols; level/slope/curvature",
             "carry_ois_par":          "date × (market,tenor) MultiIndex cols; within-curve carry OIS positions — signal only",
-            "carry_ois_par_pnl":      "date × market; §6.2 pos × daily mark-to-market — use for Sharpe (daily, √252)",
+            "carry_ois_par_pnl":      "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
             "mean_reversion":         "date × market; factor-neutral NS residual z-score — signal only",
             "mean_reversion_pnl":      "date × market; w(t-1)×ret_d(t) summed, bp — use for Sharpe (daily, √252)",
             "mean_reversion_dv01_pos": "date × (market,tenor); w×DV01 per tenor — use for TC gross turnover (bp)",
             "momentum_a_daily":       "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
-            "momentum_a_daily_pnl":   "date × market; daily pos(t-1)×ret_d(t) summed — use for Sharpe (daily, √252)",
+            "momentum_a_daily_pnl":   "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
             "rx_m":                   "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
             "ret_d":                  "date × (market,tenor); daily CM constant-maturity returns (bp)",
         },
         "sharpe_recipe": (
             "Always use the *_pnl files. "
             "sr = pnl[market].dropna().mean() / pnl[market].dropna().std() * sqrt(252). "
-            "carry_ois_par_pnl: §6.2 income+roll-down, DV01-neutral 5Y+10Y cross-section, daily rebalance. "
+            "carry_ois_par_pnl: full swap repricing, DV01-neutral 5Y+10Y cross-section, daily rebalance. "
             "mean_reversion_pnl: per-tenor factor-neutral score(t-1) × actual CM swap "
             "return ret_d(t), summed. ret_d already contains carry, roll and duration, "
             "so no DV01 multiplier and no separate carry leg. "
-            "momentum_a_daily_pnl: per-tenor vol-scaled positions × daily CM returns, summed."
+            "momentum_a_daily_pnl: full swap repricing, per-tenor vol-scaled positions, 252d formation."
         ),
     }
     with open(out_dir / "manifest.json", "w") as f:

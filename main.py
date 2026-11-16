@@ -17,7 +17,7 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pandas as pd
-from asset_blend import run_asset_tc
+from core.asset_blend import run_asset_tc
 
 if __name__ == "__main__":
     r = run_asset_tc(verbose=True, plot=True)

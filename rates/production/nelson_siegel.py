@@ -777,3 +777,59 @@ def benchmark_models(
         })
 
     return pd.DataFrame(rows).set_index("model")
+
+
+def adf_residuals_table(
+    markets: Optional[list[str]] = None,
+    model: str = "ns_calibrated",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    lambdas: Optional[dict] = None,
+    alpha: float = 0.05,
+    cal_subsample: int = 50,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    ADF p-value and pass/fail for each (market, tenor) NS residual series.
+
+    Returns
+    -------
+    pvals  : market × tenor DataFrame of ADF p-values
+    passed : market × tenor boolean DataFrame (True = stationary at `alpha`)
+
+    Uses the production model (ns_calibrated by default) and calibrated lambdas.
+    Residuals are computed on the full available history (or start/end if supplied).
+    cal_subsample : stride passed to calibrate_lambda (larger = faster, less precise lambda)
+    """
+    if markets is None:
+        markets = OIS_MARKETS
+    if lambdas is None:
+        lambdas = calibrate_lambda(markets=markets, end=end, subsample=cal_subsample)
+
+    rows_pval: dict[str, dict[float, float]] = {}
+
+    for market in markets:
+        raw = fetch_ois_curves(market, start=start, end=end)
+        zc  = build_zero_curve(raw)
+
+        lam_m = lam1_m = lam2_m = None
+        if model == "ns_calibrated":
+            lam_m = lambdas["ns"][market]
+            fac   = extract_factors(zc, model=model, lam=lam_m)
+        elif model == "nss_calibrated":
+            lam1_m, lam2_m = lambdas["nss"][market]
+            fac   = extract_factors(zc, model=model, lam1=lam1_m, lam2=lam2_m)
+        else:
+            fac = extract_factors(zc, model=model)
+
+        fitted = _reconstruct_fitted(zc, fac, model, lam=lam_m, lam1=lam1_m, lam2=lam2_m)
+        resid  = zc.loc[fitted.index].sub(fitted)
+
+        rows_pval[market] = {
+            float(col): _adf_pval(resid[col]) for col in resid.columns
+        }
+
+    pvals  = pd.DataFrame(rows_pval).T
+    pvals.index.name  = "market"
+    pvals.columns.name = "tenor_yr"
+    passed = pvals < alpha
+    return pvals, passed

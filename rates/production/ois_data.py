@@ -14,7 +14,7 @@ Short end ≤ 1Y treated as zero coupon (single payment at maturity).
 
 Market universe (11 markets):
   G10 — full curve (25-26 tenors), long history:
-    US          → USDEFFR  (EFFR OIS, 2001+)
+    US          → USDSOFR  (SOFR OIS, 2018+)
     EUR         → EUR      (€STR OIS, 2007+)
     UK          → GBP      (SONIA OIS, 2000+)
     Japan       → JPY      (TONA OIS, 2002+)
@@ -45,7 +45,7 @@ _OIS_PATH = "/Users/francescocaccia/Downloads/SWAPPPPP RATES.xlsx"
 # Market display name → sheet name
 OIS_SHEETS: dict[str, str] = {
     # G10 — full curve, long history
-    "US":          "USDEFFR",
+    "US":          "USDSOFR",
     "EUR":         "EUR",
     "UK":          "GBP",
     "Japan":       "JPY",

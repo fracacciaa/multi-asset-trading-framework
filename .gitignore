@@ -12,5 +12,7 @@ build/
 script.py
 script1.py
 *.pdf
+*.png
+*.parquet
 equities/cache/
 cache/

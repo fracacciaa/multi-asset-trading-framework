@@ -37,7 +37,7 @@ from rates.production.yc_builder import build_zero_curve
 # (cc convention throughout, which is standard for OIS).
 
 DAYCOUNT: dict[str, int] = {
-    "USDEFFR": 360, "USDSOFR": 360,
+    "USDSOFR": 360,
     "EUR": 360, "CHF": 360, "SEK": 360,
     "GBP": 365, "JPY": 365, "CAD": 365,
     "AUD": 365, "NZD": 365, "INR": 365, "CNY": 365,
