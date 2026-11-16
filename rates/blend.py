@@ -1,29 +1,30 @@
 """
 Rates signal blend layer.
 
-Loads the three production PnL parquets, aggregates across markets, and
-exposes the same blend API as equities/blend.py (all algorithms are imported
-directly — no duplication).
+Loads the three production PnL parquets, applies per-signal cross-market blending,
+then blends the three signals using rolling Ridge MSRR.
 
-Production blend: rolling Ridge MSRR (RollingMSRR, penalty="ridge", lookback=252d).
-  Refit Ridge weights at each step on the last 252 trading days.
-  Walk-forward on the full timeline (IS + OOS) so the OOS window includes
-  the IS tail — no lookahead.
+Cross-market blend (within each signal):
+    momentum        Static Ridge MSRR (IS-fit, frozen weights, lam=0.01)
+    carry           Static Ridge MSRR (IS-fit, frozen weights, lam=0.01)
+    mean_reversion  Rolling Ridge MSRR (walk-forward, lookback=252d, lam=0.01)
 
-Pipeline position:
+Signal-level blend (across the three signals):
+    Rolling Ridge MSRR (walk-forward, lookback=252d)
+
+Pipeline:
     rates/signals/*_pnl.parquet  →  load_managed_returns()  →  F (T × 3)
     F  →  vol_normalise()  →  F_norm
     F_norm  →  RollingMSRR(penalty="ridge")  →  time-varying blend weights
     blend weights  →  combined portfolio return
 
 Signals (production, from rates/signals/):
-    momentum        momentum_a_daily_pnl.parquet   daily TSMOM (9 markets)
-    carry           carry_ois_par_pnl.parquet       within-curve OIS carry (9 markets)
+    momentum        momentum_a_daily_pnl.parquet   daily TSMOM (8 markets)
+    carry           carry_ois_par_pnl.parquet       within-curve OIS carry (7 markets)
     mean_reversion  mean_reversion_pnl.parquet      NS classic MR, full swap repricing
 
-Each PnL parquet is date × market (bp, daily); load_managed_returns sums
-each signal across the common market intersection to produce a single
-time-series per signal (the cross-market portfolio managed return).
+Each PnL parquet is date × market (bp, daily).  load_managed_returns aggregates
+each signal to a scalar series using the signal-specific cross-market blend method.
 """
 
 from __future__ import annotations
@@ -114,6 +115,78 @@ TC_SCENARIOS: dict[str, dict[str, float]] = {
 _TC_DEFAULT_BP = 2.0    # fallback for markets not in TC_SCENARIOS
 _MOM_EFF_DUR   = 5.0    # effective duration (yr) for momentum TC: avg of 2Y≈1.9, 5Y≈4.5, 10Y≈8.5
 
+# ── Cross-market blend (within each signal) ───────────────────────────────────
+CROSS_MARKET_BLEND: dict[str, str] = {
+    "momentum":       "static_ridge",
+    "carry":          "static_ridge",
+    "mean_reversion": "rolling_ridge",
+}
+_CROSS_MARKET_LAM:      float = 0.01
+_CROSS_MARKET_LOOKBACK: int   = 252
+_CROSS_MARKET_MIN_OBS:  int   = 63
+
+
+def _mkt_blend_static_ridge(
+    pnl_df: pd.DataFrame,
+    is_end: str,
+    lam: float = _CROSS_MARKET_LAM,
+) -> pd.Series:
+    """
+    Vol-normalise per market using IS σ, fit Static Ridge once on IS data,
+    apply frozen weights to the full period.  Falls back to plain sum on
+    insufficient IS data.
+    """
+    pnl = pnl_df.sort_index()
+    is_data = pnl.loc[pnl.index <= is_end].dropna(how="any")
+    if len(is_data) < _CROSS_MARKET_MIN_OBS or is_data.shape[1] < 2:
+        return pnl.sum(axis=1)
+    sigma_is = is_data.std() * np.sqrt(252)
+    sigma_is = sigma_is.replace(0.0, np.nan).dropna()
+    if len(sigma_is) < 2:
+        return pnl.sum(axis=1)
+    cols        = list(sigma_is.index)
+    F_is_norm   = is_data[cols].div(sigma_is)
+    F_full_norm = pnl[cols].div(sigma_is)
+    bw   = msrr_ridge(F_is_norm, lam=lam)
+    w    = bw.weights.reindex(cols).fillna(0.0)
+    norm = w.abs().sum()
+    if norm < 1e-12:
+        return pnl.sum(axis=1)
+    w = w / norm
+    return (F_full_norm * w).sum(axis=1, min_count=len(cols))
+
+
+def _mkt_blend_rolling_ridge(
+    pnl_df: pd.DataFrame,
+    is_end: str,
+    lam: float = _CROSS_MARKET_LAM,
+    lookback: int = _CROSS_MARKET_LOOKBACK,
+    min_obs: int = _CROSS_MARKET_MIN_OBS,
+) -> pd.Series:
+    """
+    Vol-normalise per market using IS σ, then run rolling Ridge MSRR on the
+    full period (IS + OOS) with walk-forward weights.  Falls back to plain sum
+    on insufficient data.
+    """
+    pnl = pnl_df.sort_index().dropna(how="any")
+    if pnl.empty or pnl.shape[1] < 2:
+        return pnl_df.sort_index().sum(axis=1)
+    is_data = pnl.loc[pnl.index <= is_end]
+    if len(is_data) < min_obs:
+        return pnl_df.sort_index().sum(axis=1)
+    sigma_is = is_data.std() * np.sqrt(252)
+    sigma_is = sigma_is.replace(0.0, np.nan).dropna()
+    if len(sigma_is) < 2:
+        return pnl_df.sort_index().sum(axis=1)
+    cols   = list(sigma_is.index)
+    F_norm = pnl[cols].div(sigma_is)
+    model  = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
+    w_raw  = model._roll(F_norm)
+    norm   = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
+    w_all  = w_raw.div(norm, axis=0)
+    out    = (F_norm * w_all).sum(axis=1, min_count=len(cols))
+    return out.reindex(pnl_df.sort_index().index)
+
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
@@ -121,21 +194,29 @@ def load_managed_returns(
     signals: dict[str, str] | None = None,
     signals_dir: str | Path | None = None,
     markets: list[str] | None = None,
+    cross_market_blend: dict[str, str] | None = None,
+    cross_market_is_end: str = IS_END,
+    cross_market_lam: float = _CROSS_MARKET_LAM,
+    cross_market_lookback: int = _CROSS_MARKET_LOOKBACK,
 ) -> pd.DataFrame:
     """
     Load rates PnL parquets and build the managed-return matrix F (T × K).
 
-    Each signal's cross-market portfolio return at time t is the sum of
-    per-market PnL values on that date (after restricting to the common
-    market intersection).  This is the rates analog of
-    equities.blend.build_managed_returns.
+    Aggregates each signal's per-market PnL into a single time-series using
+    the method specified in `cross_market_blend`:
+      "sum"           plain sum across the common market intersection
+      "static_ridge"  Static Ridge MSRR fit on IS, frozen weights applied to all dates
+      "rolling_ridge" Rolling Ridge MSRR fit walk-forward on the full timeline
 
     Parameters
     ----------
-    signals     Map of signal_name → parquet filename.  Default: SIGNAL_FILES.
-    signals_dir Directory containing the parquet files.  Default: rates/signals/.
-    markets     Restrict to these markets before summing.  Default: all common
-                markets present in every signal file.
+    signals             Map of signal_name → parquet filename.  Default: SIGNAL_FILES.
+    signals_dir         Directory containing the parquet files.  Default: rates/signals/.
+    markets             Restrict each signal to these markets before blending.
+    cross_market_blend  Per-signal aggregation method.  Default: CROSS_MARKET_BLEND.
+    cross_market_is_end IS end date for vol-normalisation and static-ridge fit.
+    cross_market_lam    Ridge regularisation for static/rolling ridge.  Default: 0.01.
+    cross_market_lookback Lookback window (trading days) for rolling ridge.  Default: 252.
 
     Returns
     -------
@@ -144,6 +225,8 @@ def load_managed_returns(
     """
     if signals is None:
         signals = SIGNAL_FILES
+    if cross_market_blend is None:
+        cross_market_blend = CROSS_MARKET_BLEND
     sig_dir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
 
     frames: dict[str, pd.DataFrame] = {}
@@ -151,25 +234,41 @@ def load_managed_returns(
         path = sig_dir / fname
         frames[name] = pd.read_parquet(path)
 
-    # Common market intersection across all signals
-    if markets is None:
-        common_mkts = sorted(
-            set.intersection(*(set(df.columns) for df in frames.values()))
+    # Restrict columns if a market list was given
+    if markets is not None:
+        frames = {
+            n: df[[m for m in markets if m in df.columns]]
+            for n, df in frames.items()
+        }
+
+    # Common market intersection only used for "sum" signals
+    sum_names = [n for n in signals if cross_market_blend.get(n, "sum") == "sum"]
+    if sum_names and markets is None:
+        common_mkts: list[str] = sorted(
+            set.intersection(*(set(frames[n].columns) for n in sum_names))
         )
+    elif sum_names:
+        common_mkts = list(markets)  # type: ignore[arg-type]
     else:
-        common_mkts = markets
+        common_mkts = []
 
-    # Sum each signal across the common markets → scalar per date
-    series: dict[str, pd.Series] = {
-        name: df[common_mkts].sum(axis=1) for name, df in frames.items()
-    }
+    series: dict[str, pd.Series] = {}
+    for name, df in frames.items():
+        method = cross_market_blend.get(name, "sum")
+        if method == "static_ridge":
+            series[name] = _mkt_blend_static_ridge(
+                df, cross_market_is_end, lam=cross_market_lam,
+            )
+        elif method == "rolling_ridge":
+            series[name] = _mkt_blend_rolling_ridge(
+                df, cross_market_is_end, lam=cross_market_lam,
+                lookback=cross_market_lookback,
+            )
+        else:
+            series[name] = df[common_mkts].sum(axis=1)
 
-    F = pd.DataFrame(series)
+    F = pd.DataFrame(series).sort_index().dropna(how="any")
     F.index.name = "date"
-    F = F.sort_index()
-
-    # Inner join: only dates where every signal has data
-    F = F.dropna(how="any")
     return F
 
 
