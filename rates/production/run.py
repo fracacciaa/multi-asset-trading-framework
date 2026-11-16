@@ -8,8 +8,8 @@ Outputs written to rates/signals/:
   ns_factors.parquet          date × (market, factor)       NS level/slope/curvature
   momentum_a_daily.parquet    date × (market, tenor)        MOP TSMOM position sizes
   momentum_a_daily_pnl.parquet date × market                momentum daily PnL, full repricing (bp)
-  mean_reversion.parquet      date × market                 factor-neutral NS residual z-score
-  mean_reversion_pnl.parquet  date × market                 mean reversion daily PnL (bp)
+  mean_reversion_pnl.parquet  date × market                 NS classic MR daily PnL, full repricing (bp)
+  mean_reversion_zscores.parquet date × (market, tenor)     NS classic MR z-scores (signal + TC proxy)
   carry_ois_par.parquet       date × (market, tenor)        within-curve carry OIS positions
   carry_ois_par_pnl.parquet   date × market                 within-curve carry OIS PnL, full repricing (bp)
   rx_m.parquet                date × (market, tenor)        Sihvonen monthly log excess returns (bp)
@@ -31,9 +31,9 @@ import numpy as np
 import pandas as pd
 
 from rates.production.nelson_siegel import extract_factors_all_markets
-from rates.production.mean_reversion.signal import (
-    mean_reversion_rv, mean_reversion_pnl, mean_reversion_dv01_pos,
-)
+from rates.production.ns_classic.bootstrap import bootstrap_curves
+from rates.production.ns_classic.ns_fit import select_lambda
+from rates.production.ns_classic.pnl import classic_ns_pnl_repriced
 from rates.production.momentum.returns import build_all_return_panels
 from rates.production.momentum.signal_a import build_signal_a_daily
 from rates.production.momentum.signal_a import DM_MARKETS as MOM_MARKETS
@@ -46,6 +46,11 @@ from rates.production.ois_data import OIS_MARKETS, fetch_ois_curves
 from rates.production.yc_builder import build_zero_curve
 
 OUTPUT_DIR = Path(__file__).parent.parent / "signals"
+
+# NS classic MR constants — λ frozen on this IS training window
+_LAM_TRAIN_END = "2015-12-31"
+_MR_TARGET_VOL = 100.0   # bp/yr vol target per market
+_MR_BURN_IN    = 252     # trading days before signal goes live
 
 
 def run(
@@ -88,12 +93,14 @@ def run(
         df.to_parquet(p)
         _log(f"  Wrote {name}  {getattr(df, 'shape', '?')}")
 
-    # ── Step 0: build zero curves once (reused by all downstream steps) ────────
+    # ── Step 0: fetch par curves + build zero curves ───────────────────────────
     _log("Zero curves: bootstrapping + interpolating all markets...")
+    par_curves:  dict = {}
     zero_curves: dict = {}
     for mkt in markets:
         try:
             raw = fetch_ois_curves(mkt, start=start, end=end)
+            par_curves[mkt]  = raw
             zero_curves[mkt] = build_zero_curve(raw)
         except Exception as exc:
             _log(f"  Warning: zero curve failed for {mkt}: {exc}")
@@ -181,55 +188,83 @@ def run(
     if not carry_pnl.empty:
         _log(f"  {len(carry_pnl)} days, {len(carry_pnl.columns)} markets")
 
-    # ── Step 5: Mean reversion ─────────────────────────────────────────────────
-    _log("Mean reversion: factor-neutral NS residuals...")
-    mr_sig = mean_reversion_rv(markets=markets, start=start, end=end,
-                               zero_curves=zero_curves)
-    _save("mean_reversion.parquet", mr_sig)
+    # ── Step 5: Mean reversion — NS classic MR, full swap repricing ───────────
+    # λ selected once on data through _LAM_TRAIN_END then frozen.
+    # Falls back to λ=2.5 if selection fails (robust default near 5Y curvature peak).
+    _log(f"NS classic MR: λ selection (train end {_LAM_TRAIN_END}) + full swap repricing...")
+    mr_pnl_dict:    dict[str, pd.Series]    = {}
+    mr_zscore_dict: dict[str, pd.DataFrame] = {}
 
-    _log("Mean reversion PnL: w(t-1) × ret_d(t), actual CM swap return...")
-    mr_pnl = mean_reversion_pnl(markets=markets, start=start, end=end,
-                                zero_curves=zero_curves, ret_d=ret_d_all)
+    for mkt in markets:
+        if mkt not in par_curves:
+            continue
+        try:
+            par_mkt   = par_curves[mkt]
+            zeros_mkt = bootstrap_curves(par_mkt)
+            try:
+                lr  = select_lambda(zeros_mkt, end=_LAM_TRAIN_END)
+                lam = lr["best_lambda"]
+            except Exception:
+                lam = 2.5
+            pnl, z_scores, _ = classic_ns_pnl_repriced(
+                par_mkt, lam,
+                target_ann_vol=_MR_TARGET_VOL,
+                burn_in=_MR_BURN_IN,
+            )
+            mr_pnl_dict[mkt]    = pnl
+            mr_zscore_dict[mkt] = z_scores
+            _log(f"  {mkt}: λ={lam}  n={pnl.dropna().__len__()}")
+        except Exception as exc:
+            _log(f"  Warning: NS classic MR failed for {mkt}: {exc}")
+
+    mr_pnl = pd.DataFrame(mr_pnl_dict)
+    mr_pnl.index.name = "date"
     _save("mean_reversion_pnl.parquet", mr_pnl)
 
-    _log("Mean reversion DV01 positions: z × DV01 per tenor (for TC)...")
-    mr_dv01_pos = mean_reversion_dv01_pos(markets=markets, start=start, end=end,
-                                          zero_curves=zero_curves)
-    _save("mean_reversion_dv01_pos.parquet", mr_dv01_pos)
+    # z_scores saved as MultiIndex (market, tenor) — used as TC position proxy
+    if mr_zscore_dict:
+        mr_zscores = pd.concat(mr_zscore_dict, axis=1)
+        mr_zscores.columns.names = ["market", "tenor"]
+    else:
+        mr_zscores = pd.DataFrame()
+    _save("mean_reversion_zscores.parquet", mr_zscores)
+    # backward-compat alias read by rates/blend.py for TC estimation
+    _save("mean_reversion_dv01_pos.parquet", mr_zscores)
 
     # ── Manifest ───────────────────────────────────────────────────────────────
     manifest = {
         "markets":     sorted(markets),
         "carry_markets": sorted(carry_mkts),
         "mom_markets": sorted(mom_panels.keys()),
+        "mr_markets":  sorted(mr_pnl_dict.keys()),
         "start":       str(start) if start else None,
         "end":         str(end) if end else None,
         "ns_model":    "ns_calibrated",
         "carry_tenors": CARRY_TENORS,
+        "mr_lam_train_end": _LAM_TRAIN_END,
         "signals": [
             "momentum_a_daily",
             "carry_within_curve_ois",
-            "mean_reversion",
+            "mean_reversion_ns_classic",
         ],
         "files": {
-            "ns_factors":             "date × (market,factor) MultiIndex cols; level/slope/curvature",
-            "carry_ois_par":          "date × (market,tenor) MultiIndex cols; within-curve carry OIS positions — signal only",
-            "carry_ois_par_pnl":      "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
-            "mean_reversion":         "date × market; factor-neutral NS residual z-score — signal only",
-            "mean_reversion_pnl":      "date × market; w(t-1)×ret_d(t) summed, bp — use for Sharpe (daily, √252)",
-            "mean_reversion_dv01_pos": "date × (market,tenor); w×DV01 per tenor — use for TC gross turnover (bp)",
-            "momentum_a_daily":       "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
-            "momentum_a_daily_pnl":   "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
-            "rx_m":                   "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
-            "ret_d":                  "date × (market,tenor); daily CM constant-maturity returns (bp)",
+            "ns_factors":               "date × (market,factor) MultiIndex cols; level/slope/curvature",
+            "carry_ois_par":            "date × (market,tenor) MultiIndex cols; within-curve carry OIS positions",
+            "carry_ois_par_pnl":        "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
+            "mean_reversion_pnl":       "date × market; NS classic MR full repricing — use for Sharpe (daily, √252)",
+            "mean_reversion_zscores":   "date × (market,tenor) MultiIndex; NS classic z-scores — signal + TC proxy",
+            "mean_reversion_dv01_pos":  "alias for mean_reversion_zscores.parquet (backward compat)",
+            "momentum_a_daily":         "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
+            "momentum_a_daily_pnl":     "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
+            "rx_m":                     "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
+            "ret_d":                    "date × (market,tenor); daily CM constant-maturity returns (bp)",
         },
         "sharpe_recipe": (
             "Always use the *_pnl files. "
             "sr = pnl[market].dropna().mean() / pnl[market].dropna().std() * sqrt(252). "
             "carry_ois_par_pnl: full swap repricing, DV01-neutral 5Y+10Y cross-section, daily rebalance. "
-            "mean_reversion_pnl: per-tenor factor-neutral score(t-1) × actual CM swap "
-            "return ret_d(t), summed. ret_d already contains carry, roll and duration, "
-            "so no DV01 multiplier and no separate carry leg. "
+            "mean_reversion_pnl: NS classic MR full repricing, factor-neutral NS residuals, "
+            "λ frozen on data through 2015-12-31, 100 bp/yr vol target per market. "
             "momentum_a_daily_pnl: full swap repricing, per-tenor vol-scaled positions, 252d formation."
         ),
     }
@@ -239,18 +274,17 @@ def run(
 
     _log("Done.")
     return {
-        "ns_factors":           ns_factors,
-        "carry_ois_par":        carry_pos,
-        "carry_ois_par_pnl":    carry_pnl,
-        "mean_reversion":       mr_sig,
+        "ns_factors":              ns_factors,
+        "carry_ois_par":           carry_pos,
+        "carry_ois_par_pnl":       carry_pnl,
         "mean_reversion_pnl":      mr_pnl,
-        "mean_reversion_dv01_pos": mr_dv01_pos,
+        "mean_reversion_zscores":  mr_zscores,
         "momentum_a_daily":        mom_a_daily,
-        "momentum_a_daily_pnl": mom_a_daily_pnl,
-        "rx_m":                 rx_m_all,
-        "ret_d":                ret_d_all,
-        "all_panels":           all_panels,
-        "manifest":             manifest,
+        "momentum_a_daily_pnl":    mom_a_daily_pnl,
+        "rx_m":                    rx_m_all,
+        "ret_d":                   ret_d_all,
+        "all_panels":              all_panels,
+        "manifest":                manifest,
     }
 
 

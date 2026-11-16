@@ -19,7 +19,7 @@ Pipeline position:
 Signals (production, from rates/signals/):
     momentum        momentum_a_daily_pnl.parquet   daily TSMOM (9 markets)
     carry           carry_ois_par_pnl.parquet       within-curve OIS carry (9 markets)
-    mean_reversion  mean_reversion_pnl.parquet      factor-neutral NS residuals (11 markets)
+    mean_reversion  mean_reversion_pnl.parquet      NS classic MR, full swap repricing
 
 Each PnL parquet is date × market (bp, daily); load_managed_returns sums
 each signal across the common market intersection to produce a single
@@ -450,7 +450,7 @@ def tc_sweep_rates(
                 tc_cost = daily_abs_chg * h
             elif signal == "momentum":
                 tc_cost = daily_abs_chg * h * _MOM_EFF_DUR
-            else:   # mean_reversion: w×DV01 positions, PnL in bp — same formula as carry
+            else:   # mean_reversion: NS classic z-scores, PnL in bp — |Δz| × h
                 tc_cost = daily_abs_chg * h
             pnl_adj[mkt] = pnl_adj[mkt] - tc_cost.reindex(pnl_adj.index).fillna(0.0)
         return pnl_adj
