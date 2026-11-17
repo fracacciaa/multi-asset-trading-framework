@@ -91,6 +91,38 @@ _MONTHLY_SIGNALS: frozenset[str] = frozenset({"momentum"})
 # Returns parquet (daily excess returns, date × pair).
 _RX_FILE = "rx_d.parquet"
 
+# ── Cross-pair blend (within each monthly signal) ────────────────────────────
+CROSS_PAIR_BLEND: dict[str, str] = {
+    "momentum":  "inv_vol",
+    "mr_ns_loo": "inv_vol",
+    "carry_xs":  "inv_vol",
+}
+_CROSS_PAIR_MIN_PAIR_MONTHS = 36    # min IS months a pair needs to be included
+
+
+def _pair_blend_inv_vol(
+    pnl_df: pd.DataFrame,
+    is_end: str,
+    min_pair_months: int = _CROSS_PAIR_MIN_PAIR_MONTHS,
+) -> pd.Series:
+    """
+    Inverse-vol cross-pair blend: w_i ∝ 1/σ_i (IS σ × √12), frozen and applied
+    to the full period.  Falls back to plain sum on insufficient data.
+    """
+    pnl = pnl_df.sort_index()
+    is_data = pnl.loc[pnl.index <= is_end]
+    is_counts = is_data.notna().sum()
+    eligible = is_counts[is_counts >= min_pair_months].index.tolist()
+    if not eligible:
+        return pnl.sum(axis=1)
+    sigma_is = is_data[eligible].std() * np.sqrt(12)
+    sigma_is = sigma_is.replace(0.0, np.nan).dropna()
+    if sigma_is.empty:
+        return pnl.sum(axis=1)
+    w = 1.0 / sigma_is
+    w = w / w.sum()
+    return (pnl[w.index] * w).sum(axis=1, min_count=len(w))
+
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
@@ -196,6 +228,8 @@ OOS_START = "2021-01-01"
 
 def load_monthly_managed_returns(
     signals_dir: str | Path | None = None,
+    cross_pair_blend: dict[str, str] | None = None,
+    cross_pair_is_end: str = IS_END,
 ) -> pd.DataFrame:
     """
     Build the monthly managed-return matrix F (T × 3) for the three
@@ -206,27 +240,36 @@ def load_monthly_managed_returns(
         mr_ns_loo  MR NS-LOO monthly VF-TS    (daily positions  → rx_d → monthly sum)
         carry_xs   Carry XS monthly            (monthly weights, shift(1) → rx_m)
 
+    Within each signal, per-pair PnL series are aggregated using inv_vol weights
+    (IS σ × √12, frozen at cross_pair_is_end).
+
     carry_dupuy is excluded: it has 0.82 IS / 0.79 OOS correlation with carry_xs.
 
     Returns
     -------
     pd.DataFrame, shape (T, 3), monthly frequency (BME index).
     """
+    if cross_pair_blend is None:
+        cross_pair_blend = CROSS_PAIR_BLEND
     sdir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
     rx_m = pd.read_parquet(sdir / "returns.parquet")["rx_m"]
     rx_d = pd.read_parquet(sdir / _RX_FILE)
 
-    w_mom = pd.read_parquet(sdir / "signal_a_f9_h1.parquet")
-    pnl_mom = (w_mom.shift(1) * rx_m.reindex(columns=w_mom.columns)).sum(axis=1)
+    def _blend(pnl_df: pd.DataFrame, signal: str) -> pd.Series:
+        method = cross_pair_blend.get(signal, "inv_vol")
+        if method == "inv_vol":
+            return _pair_blend_inv_vol(pnl_df, is_end=cross_pair_is_end)
+        return pnl_df.sum(axis=1)
 
-    pos_mr = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
-    pnl_mr = (
-        (pos_mr * rx_d.reindex(columns=pos_mr.columns)).sum(axis=1)
-        .resample("BME").sum()
-    )
+    w_mom   = pd.read_parquet(sdir / "signal_a_f9_h1.parquet")
+    pnl_mom = _blend(w_mom.shift(1) * rx_m.reindex(columns=w_mom.columns), "momentum")
 
-    w_cxs = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
-    pnl_cxs = (w_cxs.shift(1) * rx_m.reindex(columns=w_cxs.columns)).sum(axis=1)
+    pos_mr     = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+    pnl_mr_d   = pos_mr * rx_d.reindex(columns=pos_mr.columns)
+    pnl_mr     = _blend(pnl_mr_d.resample("BME").sum(), "mr_ns_loo")
+
+    w_cxs   = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
+    pnl_cxs = _blend(w_cxs.shift(1) * rx_m.reindex(columns=w_cxs.columns), "carry_xs")
 
     F = pd.DataFrame({
         "momentum":  pnl_mom,
@@ -258,7 +301,7 @@ def run_fx_blend(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
 ) -> dict:
     """
     Canonical FX blend pipeline: monthly managed returns → rolling Ridge MSRR.
@@ -313,7 +356,7 @@ def run_fx_prod(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
     print_table: bool = True,
     vol_target: float = 0.10,
 ) -> pd.Series:
@@ -921,3 +964,339 @@ def compare_blend_methods(
     print("  " + "─" * (22 + col_w * len(names)))
 
     return df
+
+
+# ── Per-pair managed-return matrix ────────────────────────────────────────────
+
+def load_pair_managed_returns(
+    signal: str,
+    signals_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    """
+    Build the monthly per-pair managed-return matrix for one production signal.
+
+    For each currency pair p the managed return at month t is:
+        F[t, p] = Σ_{d in month t}  pos[d-1, p] × rx_d[d, p]   (MR — daily positions)
+        F[t, p] = pos[t-1, p] × rx_m[t, p]                      (momentum / carry_xs)
+
+    Parameters
+    ----------
+    signal      One of "momentum", "mr_ns_loo", "carry_xs".
+    signals_dir Directory containing the parquet files.  Default: fx/signals/.
+
+    Returns
+    -------
+    pd.DataFrame, shape (T, N_pairs), monthly BME index.
+    Only pairs present in both the signal file and rx are included.
+    Rows with any NaN are dropped (inner join across pairs).
+    """
+    sdir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+    rx_d = pd.read_parquet(sdir / _RX_FILE)
+    rx_m = pd.read_parquet(sdir / "returns.parquet")["rx_m"]
+
+    if signal == "momentum":
+        pos = pd.read_parquet(sdir / "signal_a_f9_h1.parquet")
+        pairs = sorted(set(pos.columns) & set(rx_m.columns))
+        F = (pos[pairs].shift(1) * rx_m.reindex(columns=pairs)).rename_axis("date")
+
+    elif signal == "mr_ns_loo":
+        pos = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+        pairs = sorted(set(pos.columns) & set(rx_d.columns))
+        daily = (pos[pairs] * rx_d.reindex(columns=pairs)).rename_axis("date")
+        F = daily.resample("BME").sum()
+
+    elif signal == "carry_xs":
+        pos = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
+        pairs = sorted(set(pos.columns) & set(rx_m.columns))
+        F = (pos[pairs].shift(1) * rx_m.reindex(columns=pairs)).rename_axis("date")
+
+    else:
+        raise ValueError(f"Unknown signal '{signal}'. Choose: momentum, mr_ns_loo, carry_xs.")
+
+    return F.dropna(how="any")
+
+
+# ── Pair-level blend evaluation ────────────────────────────────────────────────
+
+def _try_fx_pair_blend(
+    signal: str,
+    signal_label: str,
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    lookback: int = 36,
+    min_obs: int = 24,
+    vol_target: float = 0.10,
+    min_pair_obs: int = 36,
+) -> dict:
+    """
+    Evaluate all blend methods applied to per-pair managed returns for one signal.
+
+    Loads per-pair monthly managed returns, vol-normalises on IS σ × √12, then
+    runs the full static + dynamic blend suite treating currency pairs as "signals".
+    Analogous to _try_market_blend() in rates/blend.py but at monthly frequency.
+
+    Parameters
+    ----------
+    signal          "momentum", "mr_ns_loo", or "carry_xs".
+    signal_label    Display label for the header.
+    signals_dir     Directory containing the parquet files.  Default: fx/signals/.
+    is_end          Last IS date.  Default: IS_END ("2020-12-31").
+    lookback        Rolling-MSRR window in months.  Default: 36.
+    min_obs         Minimum observations before rolling weights are non-NaN.  Default: 24.
+    vol_target      Annual vol for MDD scaling.  Default: 0.10.
+    min_pair_obs    Drop pairs with fewer than this many non-NaN IS rows.  Default: 36.
+
+    Returns
+    -------
+    dict  keyed by method name, each value:
+        {"is": {"sharpe", "mdd", "turnover"}, "oos": {...}, "type": "static"|"dynamic"}
+    """
+    from core.asset_blend import _drift_to
+
+    F_raw = load_pair_managed_returns(signal=signal, signals_dir=signals_dir)
+
+    # Drop pairs with insufficient IS history or near-zero IS variance
+    is_data = F_raw.loc[F_raw.index <= is_end]
+    is_counts = is_data.notna().sum()
+    is_std    = is_data.std()
+    keep = is_counts[(is_counts >= min_pair_obs) & (is_std > 1e-8)].index
+    F_raw = F_raw[keep].dropna(how="any")
+
+    F_is_raw  = F_raw.loc[F_raw.index <= is_end]
+    F_oos_raw = F_raw.loc[F_raw.index >  is_end]
+
+    if F_is_raw.empty:
+        raise ValueError(f"No IS data at or before {is_end} for signal '{signal}'.")
+
+    sigma = F_is_raw.std() * np.sqrt(12)
+    sigma = sigma.replace(0.0, np.nan)
+    F_is   = F_is_raw.div(sigma)
+    F_oos  = F_oos_raw.div(sigma)
+    F_full = pd.concat([F_is, F_oos]).sort_index()
+    pairs  = list(F_is.columns)
+
+    # ── Metric helpers (monthly: annualise with √12) ──────────────────────────
+
+    def _sharpe(r: pd.Series) -> float:
+        r = r.dropna()
+        if len(r) < 12 or r.std() < 1e-12:
+            return float("nan")
+        return float(r.mean() / r.std() * np.sqrt(12))
+
+    def _mdd_m(r: pd.Series) -> float:
+        r = r.dropna()
+        if r.empty:
+            return float("nan")
+        ann_vol = r.std() * np.sqrt(12)
+        if ann_vol < 1e-12:
+            return float("nan")
+        r_scaled = r * (vol_target / ann_vol)
+        cum = (1 + r_scaled).cumprod()
+        return float((cum / cum.cummax() - 1).min() * 100)
+
+    def _to_m(w_df: pd.DataFrame, F: pd.DataFrame) -> float:
+        # Drift-corrected: returns at the vol target pull weights off target each month.
+        return _drift_to(w_df, F * vol_target, freq=12, l1_norm=True)
+
+    def _static_w_df(bw, F: pd.DataFrame) -> pd.DataFrame:
+        w = bw.weights.reindex(pairs).fillna(0.0)
+        total = w.abs().sum()
+        if total > 1e-12:
+            w = w / total
+        return pd.DataFrame(np.tile(w.values, (len(F), 1)), index=F.index, columns=pairs)
+
+    def _apply_static_bw(bw) -> tuple[pd.Series, pd.Series]:
+        w = bw.weights.reindex(pairs).fillna(0.0)
+        total = w.abs().sum()
+        if total > 1e-12:
+            w = w / total
+        return (F_is * w).sum(axis=1), (F_oos * w).sum(axis=1)
+
+    def _apply_tvw_df(w_df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        def _apply(F):
+            idx = F.index.intersection(w_df.dropna(how="any").index)
+            if idx.empty:
+                return pd.Series(dtype=float)
+            w = w_df.loc[idx]
+            norm = w.abs().sum(axis=1).replace(0.0, np.nan)
+            return (F.loc[idx] * w.div(norm, axis=0)).sum(axis=1)
+        return _apply(F_is), _apply(F_oos)
+
+    def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
+        norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
+        return w_raw.div(norm, axis=0)
+
+    # ── Static methods ────────────────────────────────────────────────────────
+
+    static_blends: dict = {
+        "equal_weight": equal_weight(pairs),
+        "inv_vol":      inv_vol_blend(F_is),
+        "erc":          erc_blend(F_is),
+        "hrp":          hrp_blend(F_is),
+        "sh_p1":        sharpe_heuristic(F_is, power=1),
+        "msrr_ols":     msrr_ridge(F_is, lam=0.0),
+        "msrr_ridge":   msrr_ridge(F_is, lam=0.01),
+    }
+
+    # ── Dynamic methods ────────────────────────────────────────────────────────
+
+    dma = DMABlend(alpha=0.99)
+    dma.fit(F_is)
+    w_dma = pd.concat([dma._weights_history, dma.predict_weights(F_oos)]).sort_index()
+
+    dynamic_blends: dict = {
+        "rolling_msrr_ols":   _normalise_w(RollingMSRR(penalty="ols",   lookback=lookback, min_obs=min_obs)._roll(F_full)),
+        "rolling_msrr_ridge": _normalise_w(RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)._roll(F_full)),
+        "rolling_msrr_lasso": _normalise_w(RollingMSRR(penalty="lasso", lookback=lookback, min_obs=min_obs)._roll(F_full)),
+        "dma":                w_dma,
+    }
+
+    # ── Collect results ────────────────────────────────────────────────────────
+
+    result: dict = {}
+
+    for mname, bw in static_blends.items():
+        r_is, r_oos = _apply_static_bw(bw)
+        result[mname] = {
+            "is":   {"sharpe": _sharpe(r_is),  "mdd": _mdd_m(r_is),  "turnover": _to_m(_static_w_df(bw, F_is),  F_is)},
+            "oos":  {"sharpe": _sharpe(r_oos), "mdd": _mdd_m(r_oos), "turnover": _to_m(_static_w_df(bw, F_oos), F_oos)},
+            "type": "static",
+        }
+
+    for mname, w_df in dynamic_blends.items():
+        r_is, r_oos = _apply_tvw_df(w_df)
+        result[mname] = {
+            "is":   {"sharpe": _sharpe(r_is),  "mdd": _mdd_m(r_is),  "turnover": _to_m(w_df.reindex(F_is.index),  F_is)},
+            "oos":  {"sharpe": _sharpe(r_oos), "mdd": _mdd_m(r_oos), "turnover": _to_m(w_df.reindex(F_oos.index), F_oos)},
+            "type": "dynamic",
+        }
+
+    # ── Print table ────────────────────────────────────────────────────────────
+
+    oos_end  = F_oos.index[-1] if not F_oos.empty else None
+    is_start = F_is.index[0]
+    W = 84
+
+    print()
+    print("=" * W)
+    print(f"  FX {signal_label} — PAIR-LEVEL BLEND")
+    print(f"  IS : {is_start.strftime('%Y-%m')} → {is_end[:7]}   |   "
+          f"OOS: {is_end[:7]} → {oos_end.strftime('%Y-%m') if oos_end else 'n/a'}")
+    print(f"  Pairs   : {pairs}")
+    print(f"  MDD at {vol_target*100:.0f}% vol target  |  rolling lookback = {lookback}m  |  monthly")
+    print("=" * W)
+    print(
+        f"  {'Method':<22}  {'Type':<8}"
+        f"  {'IS SR':>7}  {'IS MDD':>8}  {'IS TO':>7}"
+        f"  {'OOS SR':>7}  {'OOS MDD':>8}  {'OOS TO':>8}"
+    )
+    print("  " + "─" * (W - 2))
+
+    prev_type = None
+    for mname, stats in result.items():
+        t = stats["type"]
+        if prev_type is not None and t != prev_type:
+            print("  " + "─" * (W - 2))
+        prev_type = t
+        i, o = stats["is"], stats["oos"]
+
+        def _sr(v):  return f"{v:+.2f}"  if np.isfinite(v) else "   n/a"
+        def _mdd(v): return f"{v:+.1f}%" if np.isfinite(v) else "    n/a"
+        def _to(v):  return f"{v:.1f}x"  if np.isfinite(v) else "   n/a"
+
+        print(
+            f"  {mname:<22}  {t:<8}"
+            f"  {_sr(i['sharpe']):>7}  {_mdd(i['mdd']):>8}  {_to(i['turnover']):>7}"
+            f"  {_sr(o['sharpe']):>7}  {_mdd(o['mdd']):>8}  {_to(o['turnover']):>8}"
+        )
+
+    print("=" * W)
+
+    # Print IS weights for all static methods
+    col_w = max(8, max(len(p) for p in pairs) + 1)
+    print(f"\n  IS weights (static methods, L1-normalised)")
+    print("  " + "─" * (22 + col_w * len(pairs)))
+    print(f"  {'Method':<20}" + "".join(f"  {p:>{col_w}}" for p in pairs))
+    print("  " + "─" * (22 + col_w * len(pairs)))
+    for mname, bw in static_blends.items():
+        w = bw.weights.reindex(pairs).fillna(0.0)
+        total = w.abs().sum()
+        if total > 1e-12:
+            w = w / total
+        print(f"  {mname:<20}" + "".join(f"  {w.get(p, 0.0):>+{col_w}.1%}" for p in pairs))
+    print("  " + "─" * (22 + col_w * len(pairs)))
+
+    return result
+
+
+def try_momentum_pair_blend(
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    lookback: int = 36,
+    min_obs: int = 24,
+    vol_target: float = 0.10,
+) -> dict:
+    """
+    Evaluate all blend methods applied to per-pair FX momentum managed returns.
+
+    Treats each currency pair's monthly momentum return (pos × rx_m) as a
+    "signal" and applies the full static + dynamic blend suite to find optimal
+    pair weights, in contrast to the default XS cross-sectional weighting.
+
+    Returns
+    -------
+    dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
+    """
+    return _try_fx_pair_blend(
+        signal="momentum", signal_label="MOMENTUM",
+        signals_dir=signals_dir, is_end=is_end,
+        lookback=lookback, min_obs=min_obs, vol_target=vol_target,
+    )
+
+
+def try_mr_pair_blend(
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    lookback: int = 36,
+    min_obs: int = 24,
+    vol_target: float = 0.10,
+) -> dict:
+    """
+    Evaluate all blend methods applied to per-pair FX mean-reversion managed returns.
+
+    Treats each currency pair's monthly NS-LOO MR return (daily pos × rx_d,
+    summed to month) as a "signal" and applies the full blend suite.
+
+    Returns
+    -------
+    dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
+    """
+    return _try_fx_pair_blend(
+        signal="mr_ns_loo", signal_label="MEAN REVERSION",
+        signals_dir=signals_dir, is_end=is_end,
+        lookback=lookback, min_obs=min_obs, vol_target=vol_target,
+    )
+
+
+def try_carry_pair_blend(
+    signals_dir: str | Path | None = None,
+    is_end: str = IS_END,
+    lookback: int = 36,
+    min_obs: int = 24,
+    vol_target: float = 0.10,
+) -> dict:
+    """
+    Evaluate all blend methods applied to per-pair FX carry managed returns.
+
+    Treats each currency pair's monthly carry XS return (pos × rx_m) as a
+    "signal" and applies the full blend suite.
+
+    Returns
+    -------
+    dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
+    """
+    return _try_fx_pair_blend(
+        signal="carry_xs", signal_label="CARRY",
+        signals_dir=signals_dir, is_end=is_end,
+        lookback=lookback, min_obs=min_obs, vol_target=vol_target,
+    )

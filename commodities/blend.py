@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 # ── Re-export every blend algorithm from the equities layer ──────────────────
+from core.asset_blend import _drift_to
 from equities.blend import (                                        # noqa: F401
     BlendWeights,
     equal_weight,
@@ -77,6 +78,16 @@ TC_SCENARIOS_COMM: dict[str, float] = {
 
 _SIGNALS_DIR = Path(__file__).parent / "signals"
 
+# Cross-instrument aggregation applied within each signal when building the
+# managed-return parquets.  "equal" sums the per-instrument managed returns;
+# "static_ridge" fits ridge MSRR once on IS instrument returns and freezes the weights.
+CROSS_INSTRUMENT_BLEND: dict[str, str] = {
+    "tsmom_252":    "inv_vol",
+    "xs_carry_enh": "inv_vol",
+    "curvature":    "inv_vol",
+}
+_CROSS_INSTR_MIN_OBS: int = 252   # min IS observations for an instrument to be included
+
 SIGNAL_FILES: dict[str, str] = {
     "tsmom_252":    "tsmom_252_pnl.parquet",
     "xs_carry_enh": "xs_carry_enh_pnl.parquet",
@@ -95,15 +106,62 @@ BLEND_PARAMS = dict(
 )
 
 
+# ── Cross-instrument aggregation ──────────────────────────────────────────────
+
+def _instrument_multipliers(
+    F_i: pd.DataFrame,
+    method: str,
+    is_end: str,
+    min_obs: int = _CROSS_INSTR_MIN_OBS,
+) -> pd.Series:
+    """
+    Per-instrument multipliers v_i applied to the vol-scaled instrument weights,
+    so that the signal's managed return is Σ_i v_i · F_i.
+
+    "equal"   plain sum across instruments.
+    "inv_vol" w_i ∝ 1/σ_i (IS σ), frozen and applied to the full period.
+    """
+    if method == "equal":
+        return pd.Series(1.0, index=F_i.columns)
+    if method != "inv_vol":
+        raise ValueError(f"unknown cross-instrument method: {method!r}")
+
+    F_is = F_i.loc[:is_end]
+    keep = F_is.count()[lambda c: c >= min_obs].index
+    sigma = F_is[keep].std()
+    keep = sigma[sigma > 1e-12].index
+    sigma = sigma[keep]
+    if sigma.empty:
+        return pd.Series(1.0, index=F_i.columns)
+    w = 1.0 / sigma
+    w = w / w.sum()
+    # Rescale to the same gross as equal-weight sum (len(keep)) for TC comparability
+    v = w * len(keep)
+    return v.reindex(F_i.columns).fillna(0.0)
+
+
+def _aggregate_instruments(
+    F_i: pd.DataFrame,
+    method: str,
+    is_end: str,
+    min_obs: int = _CROSS_INSTR_MIN_OBS,
+) -> pd.Series:
+    """Collapse per-instrument managed returns (T × N) into one series Σ_i v_i · F_i."""
+    v = _instrument_multipliers(F_i, method, is_end, min_obs)
+    return (F_i.fillna(0.0) * v).sum(axis=1)
+
+
 # ── One-time parquet builder ──────────────────────────────────────────────────
 
 def build_signal_parquets(
     output_dir: str | Path | None = None,
     params: dict | None = None,
+    is_end: str = IS_END,
 ) -> None:
     """
-    Compute vol-scaled managed returns for all four production signals and save
-    them to parquet.  Call once; subsequent load_managed_returns() calls read
+    Compute vol-scaled managed returns for all production signals and save
+    them to parquet.  Instruments are aggregated per CROSS_INSTRUMENT_BLEND
+    (ridge weights are fit on data up to `is_end`).  Call once; subsequent load_managed_returns() calls read
     from disk in ~1 ms.
 
     Parameters
@@ -145,7 +203,8 @@ def build_signal_parquets(
         w = vol_scale(sig, returns, target_vol=p["asset_vol"], com=p["vol_com"])
         w = rebalance(w, rule=p["rebal"])
         # Managed return: w[t-1] × r[t], zero rows dropped
-        F_k = (w.shift(p["lag"]) * returns).sum(axis=1)
+        F_i = (w.shift(p["lag"]) * returns).dropna(how="all", axis=1)
+        F_k = _aggregate_instruments(F_i, CROSS_INSTRUMENT_BLEND[blend_key], is_end)
         F_k = F_k.replace(0.0, np.nan).dropna()
         F_k.index.name = "date"
         F_k.name = blend_key
@@ -362,11 +421,11 @@ def run_comm_prod(
     vol_target: float = 0.10,
 ) -> pd.Series:
     """
-    Production commodities pipeline: 3 signals → rolling OLS blend.
+    Production commodities pipeline: 3 signals → static ridge MSRR blend.
 
-    Loads (or rebuilds) signal parquets, fits an expanding-window MSRR OLS
-    blend, prints IS / OOS Sharpe, MDD, and annual turnover, and returns the
-    full daily return series (IS concatenated with OOS).
+    Loads (or rebuilds) signal parquets, fits a static ridge MSRR blend on IS,
+    prints IS / OOS Sharpe, MDD, and annual instrument-level turnover, and
+    returns the full daily return series (IS concatenated with OOS).
 
     Parameters
     ----------
@@ -381,12 +440,12 @@ def run_comm_prod(
     """
     from commodities.backtest import (
         PARAMS as _PARAMS, specific_contract_returns, _build_signals,
-        vol_scale, rebalance, book_scale,
+        vol_scale, rebalance,
     )
     from commodities.data import fetch_prices, fetch_term_structure, fetch_tickers
 
     TD = 252
-    p  = params or _PARAMS
+    p  = params or {**_PARAMS, **BLEND_PARAMS}
 
     # ── 1. Blend ──────────────────────────────────────────────────────────────
     res   = run_commodities_blend(is_end=is_end, min_obs=min_obs,
@@ -415,9 +474,9 @@ def run_comm_prod(
         sig = raw_sigs[raw_key].reindex(index=returns.index, columns=returns.columns)
         w   = vol_scale(sig, returns, target_vol=p["asset_vol"], com=p["vol_com"])
         w   = rebalance(w, rule=p["rebal"])
-        w   = book_scale(w, returns, target_vol=p["book_vol"],
-                         cov_hl=p["cov_hl"], k_max=p["k_max"])
-        w_k[blend_key] = w
+        F_i = (w.shift(p["lag"]) * returns).dropna(how="all", axis=1)
+        v   = _instrument_multipliers(F_i, CROSS_INSTRUMENT_BLEND[blend_key], is_end)
+        w_k[blend_key] = w.mul(v.reindex(w.columns).fillna(0.0), axis=1)
 
     # ── 3. Blended instrument weights ─────────────────────────────────────────
     names    = list(w_is.columns)
@@ -425,11 +484,13 @@ def run_comm_prod(
     all_cols = w_k[names[0]].columns
     ts_cut   = pd.Timestamp(is_end)
 
+    # Returns are Σ_k a_k · F_k / σ_k, so instrument weights carry a_k / σ_k.
+    F_raw    = load_managed_returns()
+    sigma_k  = F_raw.loc[F_raw.index <= ts_cut].std() * np.sqrt(TD)
     alpha_full = pd.concat([w_is, w_oos]).sort_index()
     a_df       = (alpha_full
                   .reindex(all_idx).ffill().fillna(0.0))
-    norms      = a_df.abs().sum(axis=1).replace(0.0, np.nan)
-    a_norm     = a_df.div(norms, axis=0).fillna(0.0)
+    a_norm     = a_df.div(sigma_k.reindex(a_df.columns), axis=1).fillna(0.0)
 
     W_blend = pd.DataFrame(0.0, index=all_idx, columns=all_cols)
     for k in names:
@@ -572,11 +633,8 @@ def tc_sweep_comm(
         cum = (1 + r * vol_target).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
-    def _blend_to(w_df: pd.DataFrame) -> float:
-        w = w_df.dropna(how="any")
-        norm = w.abs().sum(axis=1).replace(0.0, np.nan)
-        w_n = w.div(norm, axis=0)
-        return float(w_n.diff().dropna(how="all").abs().sum(axis=1).mean() * 252)
+    def _blend_to(w_df: pd.DataFrame, F_n: pd.DataFrame) -> float:
+        return _drift_to(w_df, F_n * vol_target, freq=252, l1_norm=True)
 
     def _norm_w(w_df: pd.DataFrame) -> pd.DataFrame:
         norm = w_df.abs().sum(axis=1).replace(0.0, np.nan)
@@ -600,14 +658,14 @@ def tc_sweep_comm(
         r_is_f  = (F_is_n  * w_is_fixed).sum(axis=1)
         r_oos_f = (F_oos_n * w_oos_fixed).sum(axis=1)
 
-        for period, r in [("IS", r_is_f), ("OOS", r_oos_f)]:
+        for period, r, w_f, F_f in [("IS", r_is_f, w_is_fixed, F_is_n), ("OOS", r_oos_f, w_oos_fixed, F_oos_n)]:
             records.append({
                 "Method":   "Fixed weights",
                 "Scenario": scenario_name,
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
                 "MDD_pct":  _mdd(r),
-                "TO":       float("nan"),  # static weights → 0 blend TO
+                "TO":       _blend_to(w_f, F_f),
             })
 
         if _collect_returns:
@@ -633,7 +691,7 @@ def tc_sweep_comm(
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
                 "MDD_pct":  _mdd(r),
-                "TO":       _blend_to(w),
+                "TO":       _blend_to(w, F_is_n if period == "IS" else F_oos_n),
             })
 
         if _collect_returns:
@@ -732,8 +790,9 @@ def compare_blend_methods(
 
     Daily frequency; Sharpe annualised with √252.
     MDD at vol_target wealth scaling.
-    TO = annualised one-way turnover of blend weights for rolling methods; n/a for Static
-         Ridge (blend-weight TO is 0 by construction; instrument-level TO not available here).
+    TO = annualised one-way drift-corrected turnover of blend weights (static weights
+         still trade back to target after returns move them).  Blend-level only;
+         instrument-level trading is not included.
 
     Returns
     -------
@@ -762,12 +821,9 @@ def compare_blend_methods(
         cum = (1 + r * vol_target).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
-    def _blend_weight_to(w_df: pd.DataFrame) -> float:
-        """Annual one-way turnover of L1-normalised blend weights."""
-        w = w_df.dropna(how="any")
-        norm = w.abs().sum(axis=1).replace(0.0, np.nan)
-        w_norm = w.div(norm, axis=0)
-        return float(w_norm.diff().dropna(how="all").abs().sum(axis=1).mean() * 252)
+    def _blend_weight_to(w_df: pd.DataFrame, F_n: pd.DataFrame) -> float:
+        """Drift-corrected annual one-way turnover of L1-normalised blend weights."""
+        return _drift_to(w_df, F_n * vol_target, freq=252, l1_norm=True)
 
     def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
         norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
@@ -815,7 +871,7 @@ def compare_blend_methods(
                 "Period": period,
                 "Sharpe": _sharpe(r),
                 "MDD":    _mdd(r),
-                "TO":     float("nan") if method_name == "Static Ridge" else _blend_weight_to(w),
+                "TO":     _blend_weight_to(w, F_is if period == "IS" else F_oos),
             })
 
     df = pd.DataFrame(records)
@@ -824,8 +880,7 @@ def compare_blend_methods(
     W = 72
     print("=" * W)
     print(f"  COMMODITIES BLEND COMPARISON  (vol target={vol_target*100:.0f}%, λ_ridge={ridge_lam})")
-    print(f"  note: TO = blend-weight turnover; instrument-level TO needs Bloomberg")
-    print(f"  note: TO = blend-weight turnover (ann.); Static Ridge = n/a (0 by construction, instrument-level TO unavailable)")
+    print(f"  note: TO = drift-corrected blend-weight turnover (ann.); excludes instrument-level trading")
     print("=" * W)
     print(f"  {'Method':<20}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
     print("  " + "─" * (W - 2))

@@ -62,22 +62,9 @@
   "rr_orientation": "foreign_oriented (FCU call - FCU put)",
   "mid_only_note": "No bid/ask data. Dupuy attractive-currency filter is vacuous with mid quotes. TC_BP values are flat placeholders, not estimates.",
   "momentum": {
-    "monthly": {
-      "signal": "XS f=9m h=1",
-      "train_sr": 0.51,
-      "test_sr": 0.56
-    },
-    "daily": {
-      "halflife_days": 126,
-      "is_sr": 0.06,
-      "is_sr_by_hl": {
-        "10": -0.413,
-        "32": -0.197,
-        "63": 0.056,
-        "95": 0.032,
-        "126": 0.06
-      }
-    }
+    "signal": "XS f=9m h=1",
+    "train_sr": 0.51,
+    "test_sr": 0.56
   },
   "mv_floor_hit_rate_daily": 0.00778318276580959,
   "cs_corr_fd_rr": -0.9103341327551961,
