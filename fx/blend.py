@@ -100,6 +100,26 @@ CROSS_PAIR_BLEND: dict[str, str] = {
 _CROSS_PAIR_MIN_PAIR_MONTHS = 36    # min IS months a pair needs to be included
 
 
+def _pair_inv_vol_weights(
+    pnl_df: pd.DataFrame,
+    is_end: str,
+    min_pair_months: int = _CROSS_PAIR_MIN_PAIR_MONTHS,
+) -> pd.Series | None:
+    """w_i ∝ 1/σ_i (IS σ × √12) over pairs with ≥ min_pair_months IS obs; None if none qualify."""
+    pnl = pnl_df.sort_index()
+    is_data = pnl.loc[pnl.index <= is_end]
+    is_counts = is_data.notna().sum()
+    eligible = is_counts[is_counts >= min_pair_months].index.tolist()
+    if not eligible:
+        return None
+    sigma_is = is_data[eligible].std() * np.sqrt(12)
+    sigma_is = sigma_is.replace(0.0, np.nan).dropna()
+    if sigma_is.empty:
+        return None
+    w = 1.0 / sigma_is
+    return w / w.sum()
+
+
 def _pair_blend_inv_vol(
     pnl_df: pd.DataFrame,
     is_end: str,
@@ -110,17 +130,9 @@ def _pair_blend_inv_vol(
     to the full period.  Falls back to plain sum on insufficient data.
     """
     pnl = pnl_df.sort_index()
-    is_data = pnl.loc[pnl.index <= is_end]
-    is_counts = is_data.notna().sum()
-    eligible = is_counts[is_counts >= min_pair_months].index.tolist()
-    if not eligible:
+    w = _pair_inv_vol_weights(pnl, is_end, min_pair_months)
+    if w is None:
         return pnl.sum(axis=1)
-    sigma_is = is_data[eligible].std() * np.sqrt(12)
-    sigma_is = sigma_is.replace(0.0, np.nan).dropna()
-    if sigma_is.empty:
-        return pnl.sum(axis=1)
-    w = 1.0 / sigma_is
-    w = w / w.sum()
     return (pnl[w.index] * w).sum(axis=1, min_count=len(w))
 
 

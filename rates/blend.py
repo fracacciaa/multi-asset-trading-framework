@@ -122,6 +122,26 @@ CROSS_MARKET_BLEND: dict[str, str] = {
 _CROSS_MARKET_MIN_MKT_DAYS: int   = 756   # min IS days a market needs to be included (≈3yr)
 
 
+def _inv_vol_weights(
+    pnl_df: pd.DataFrame,
+    is_end: str,
+    min_mkt_days: int = _CROSS_MARKET_MIN_MKT_DAYS,
+) -> pd.Series | None:
+    """w_i ∝ 1/σ_i (IS σ) over markets with ≥ min_mkt_days IS obs; None if none qualify."""
+    pnl = pnl_df.sort_index()
+    is_raw = pnl.loc[pnl.index <= is_end]
+    is_counts = is_raw.notna().sum()
+    eligible  = is_counts[is_counts >= min_mkt_days].index.tolist()
+    if not eligible:
+        return None
+    sigma_is = is_raw[eligible].std() * np.sqrt(252)
+    sigma_is = sigma_is.replace(0.0, np.nan).dropna()
+    if sigma_is.empty:
+        return None
+    w = 1.0 / sigma_is
+    return w / w.sum()
+
+
 def _mkt_blend_inv_vol(
     pnl_df: pd.DataFrame,
     is_end: str,
@@ -133,17 +153,9 @@ def _mkt_blend_inv_vol(
     receive higher weight.  Falls back to equal-weight sum on insufficient data.
     """
     pnl = pnl_df.sort_index()
-    is_raw = pnl.loc[pnl.index <= is_end]
-    is_counts = is_raw.notna().sum()
-    eligible  = is_counts[is_counts >= min_mkt_days].index.tolist()
-    if not eligible:
+    w = _inv_vol_weights(pnl, is_end, min_mkt_days)
+    if w is None:
         return pnl.sum(axis=1)
-    sigma_is = is_raw[eligible].std() * np.sqrt(252)
-    sigma_is = sigma_is.replace(0.0, np.nan).dropna()
-    if sigma_is.empty:
-        return pnl.sum(axis=1)
-    w = 1.0 / sigma_is
-    w = w / w.sum()
     return (pnl[w.index] * w).sum(axis=1, min_count=len(w))
 
 

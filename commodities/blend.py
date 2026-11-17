@@ -153,21 +153,14 @@ def _aggregate_instruments(
 
 # ── One-time parquet builder ──────────────────────────────────────────────────
 
-def build_signal_parquets(
-    output_dir: str | Path | None = None,
+def _signal_panels(
     params: dict | None = None,
-    is_end: str = IS_END,
-) -> None:
+) -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
     """
-    Compute vol-scaled managed returns for all production signals and save
-    them to parquet.  Instruments are aggregated per CROSS_INSTRUMENT_BLEND
-    (ridge weights are fit on data up to `is_end`).  Call once; subsequent load_managed_returns() calls read
-    from disk in ~1 ms.
+    Per-signal instrument panels: {signal: (w, F_i)}.
 
-    Parameters
-    ----------
-    output_dir  Directory for parquet output.  Default: commodities/signals/.
-    params      Pipeline parameters.  Default: BLEND_PARAMS.
+    w   vol-scaled, rebalanced instrument weights (T × N, before lag)
+    F_i per-instrument managed returns w[t-1] × r[t] (T × N, all-NaN columns dropped)
     """
     from commodities.data import fetch_prices, fetch_term_structure, fetch_tickers
     from commodities.backtest import (
@@ -175,8 +168,6 @@ def build_signal_parquets(
     )
 
     p = params or BLEND_PARAMS
-    out_dir = Path(output_dir) if output_dir else _SIGNALS_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading Bloomberg data …")
     prices  = fetch_prices()
@@ -193,17 +184,46 @@ def build_signal_parquets(
         "curvature":         "curvature",
     }
 
-    print("Computing managed returns …")
+    panels: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
     for raw_key, blend_key in _key_map.items():
         if raw_key not in raw_signals:
             print(f"  Skipping {raw_key} (not available)")
             continue
-        raw_sig = raw_signals[raw_key]
-        sig = raw_sig.reindex(index=returns.index, columns=returns.columns)
+        sig = raw_signals[raw_key].reindex(index=returns.index, columns=returns.columns)
         w = vol_scale(sig, returns, target_vol=p["asset_vol"], com=p["vol_com"])
         w = rebalance(w, rule=p["rebal"])
         # Managed return: w[t-1] × r[t], zero rows dropped
         F_i = (w.shift(p["lag"]) * returns).dropna(how="all", axis=1)
+        panels[blend_key] = (w, F_i)
+    return panels
+
+
+def build_signal_parquets(
+    output_dir: str | Path | None = None,
+    params: dict | None = None,
+    is_end: str = IS_END,
+    panels: dict | None = None,
+) -> None:
+    """
+    Compute vol-scaled managed returns for all production signals and save
+    them to parquet.  Instruments are aggregated per CROSS_INSTRUMENT_BLEND
+    (ridge weights are fit on data up to `is_end`).  Call once; subsequent load_managed_returns() calls read
+    from disk in ~1 ms.
+
+    Parameters
+    ----------
+    output_dir  Directory for parquet output.  Default: commodities/signals/.
+    params      Pipeline parameters.  Default: BLEND_PARAMS.
+    panels      Pre-computed _signal_panels() output; computed here if None.
+    """
+    out_dir = Path(output_dir) if output_dir else _SIGNALS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if panels is None:
+        panels = _signal_panels(params)
+
+    print("Computing managed returns …")
+    for blend_key, (_, F_i) in panels.items():
         F_k = _aggregate_instruments(F_i, CROSS_INSTRUMENT_BLEND[blend_key], is_end)
         F_k = F_k.replace(0.0, np.nan).dropna()
         F_k.index.name = "date"
