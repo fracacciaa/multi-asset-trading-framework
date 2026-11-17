@@ -5,9 +5,7 @@ Loads the three production PnL parquets, applies per-signal cross-market blendin
 then blends the three signals using rolling Ridge MSRR.
 
 Cross-market blend (within each signal):
-    momentum        Static Ridge MSRR (IS-fit, frozen weights, lam=0.01)
-    carry           Static Ridge MSRR (IS-fit, frozen weights, lam=0.01)
-    mean_reversion  Rolling Ridge MSRR (walk-forward, lookback=252d, lam=0.01)
+    All signals     Inverse-vol weights (IS σ, frozen)
 
 Signal-level blend (across the three signals):
     Rolling Ridge MSRR (walk-forward, lookback=252d)
@@ -117,87 +115,36 @@ _MOM_EFF_DUR   = 5.0    # effective duration (yr) for momentum TC: avg of 2Y≈1
 
 # ── Cross-market blend (within each signal) ───────────────────────────────────
 CROSS_MARKET_BLEND: dict[str, str] = {
-    "momentum":       "static_ridge",
-    "carry":          "static_ridge",
-    "mean_reversion": "rolling_ridge",
+    "momentum":       "inv_vol",
+    "carry":          "inv_vol",
+    "mean_reversion": "inv_vol",
 }
-_CROSS_MARKET_LAM:          float = 0.01
-_CROSS_MARKET_LOOKBACK:     int   = 252
-_CROSS_MARKET_MIN_OBS:      int   = 63
-_CROSS_MARKET_MIN_MKT_DAYS: int   = 756   # min IS days a market needs to be included in static-ridge fit (≈3yr)
+_CROSS_MARKET_MIN_MKT_DAYS: int   = 756   # min IS days a market needs to be included (≈3yr)
 
 
-def _mkt_blend_static_ridge(
+def _mkt_blend_inv_vol(
     pnl_df: pd.DataFrame,
     is_end: str,
-    lam: float = _CROSS_MARKET_LAM,
     min_mkt_days: int = _CROSS_MARKET_MIN_MKT_DAYS,
 ) -> pd.Series:
     """
-    Vol-normalise per market using IS σ, fit Static Ridge once on IS data,
-    apply frozen weights to the full period.  Falls back to plain sum on
-    insufficient IS data.
-
-    Only markets with at least `min_mkt_days` valid IS observations are
-    included in the training set, avoiding degenerate IS windows when a
-    late-starting market collapses the common-date intersection.
+    Inverse-vol cross-market blend: w_i ∝ 1/σ_i (IS σ), frozen and applied to
+    the full period.  More liquid markets tend to have lower vol and therefore
+    receive higher weight.  Falls back to equal-weight sum on insufficient data.
     """
     pnl = pnl_df.sort_index()
     is_raw = pnl.loc[pnl.index <= is_end]
-    # Restrict training to markets that have enough IS coverage
     is_counts = is_raw.notna().sum()
     eligible  = is_counts[is_counts >= min_mkt_days].index.tolist()
-    if len(eligible) < 2:
+    if not eligible:
         return pnl.sum(axis=1)
-    is_data = is_raw[eligible].dropna(how="any")
-    if len(is_data) < _CROSS_MARKET_MIN_OBS:
-        return pnl.sum(axis=1)
-    sigma_is = is_data.std() * np.sqrt(252)
+    sigma_is = is_raw[eligible].std() * np.sqrt(252)
     sigma_is = sigma_is.replace(0.0, np.nan).dropna()
-    if len(sigma_is) < 2:
+    if sigma_is.empty:
         return pnl.sum(axis=1)
-    cols        = list(sigma_is.index)
-    F_is_norm   = is_data[cols].div(sigma_is)
-    F_full_norm = pnl[cols].div(sigma_is)
-    bw   = msrr_ridge(F_is_norm, lam=lam)
-    w    = bw.weights.reindex(cols).fillna(0.0)
-    norm = w.abs().sum()
-    if norm < 1e-12:
-        return pnl.sum(axis=1)
-    w = w / norm
-    return (F_full_norm * w).sum(axis=1, min_count=len(cols))
-
-
-def _mkt_blend_rolling_ridge(
-    pnl_df: pd.DataFrame,
-    is_end: str,
-    lam: float = _CROSS_MARKET_LAM,
-    lookback: int = _CROSS_MARKET_LOOKBACK,
-    min_obs: int = _CROSS_MARKET_MIN_OBS,
-) -> pd.Series:
-    """
-    Vol-normalise per market using IS σ, then run rolling Ridge MSRR on the
-    full period (IS + OOS) with walk-forward weights.  Falls back to plain sum
-    on insufficient data.
-    """
-    pnl = pnl_df.sort_index().dropna(how="any")
-    if pnl.empty or pnl.shape[1] < 2:
-        return pnl_df.sort_index().sum(axis=1)
-    is_data = pnl.loc[pnl.index <= is_end]
-    if len(is_data) < min_obs:
-        return pnl_df.sort_index().sum(axis=1)
-    sigma_is = is_data.std() * np.sqrt(252)
-    sigma_is = sigma_is.replace(0.0, np.nan).dropna()
-    if len(sigma_is) < 2:
-        return pnl_df.sort_index().sum(axis=1)
-    cols   = list(sigma_is.index)
-    F_norm = pnl[cols].div(sigma_is)
-    model  = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
-    w_raw  = model._roll(F_norm)
-    norm   = w_raw.abs().sum(axis=1).replace(0.0, np.nan)
-    w_all  = w_raw.div(norm, axis=0)
-    out    = (F_norm * w_all).sum(axis=1, min_count=len(cols))
-    return out.reindex(pnl_df.sort_index().index)
+    w = 1.0 / sigma_is
+    w = w / w.sum()
+    return (pnl[w.index] * w).sum(axis=1, min_count=len(w))
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
@@ -208,17 +155,14 @@ def load_managed_returns(
     markets: list[str] | None = None,
     cross_market_blend: dict[str, str] | None = None,
     cross_market_is_end: str = IS_END,
-    cross_market_lam: float = _CROSS_MARKET_LAM,
-    cross_market_lookback: int = _CROSS_MARKET_LOOKBACK,
 ) -> pd.DataFrame:
     """
     Load rates PnL parquets and build the managed-return matrix F (T × K).
 
     Aggregates each signal's per-market PnL into a single time-series using
     the method specified in `cross_market_blend`:
-      "sum"           plain sum across the common market intersection
-      "static_ridge"  Static Ridge MSRR fit on IS, frozen weights applied to all dates
-      "rolling_ridge" Rolling Ridge MSRR fit walk-forward on the full timeline
+      "sum"     plain sum across the common market intersection
+      "inv_vol" inverse-vol weights (IS σ, frozen) — default for all signals
 
     Parameters
     ----------
@@ -226,9 +170,7 @@ def load_managed_returns(
     signals_dir         Directory containing the parquet files.  Default: rates/signals/.
     markets             Restrict each signal to these markets before blending.
     cross_market_blend  Per-signal aggregation method.  Default: CROSS_MARKET_BLEND.
-    cross_market_is_end IS end date for vol-normalisation and static-ridge fit.
-    cross_market_lam    Ridge regularisation for static/rolling ridge.  Default: 0.01.
-    cross_market_lookback Lookback window (trading days) for rolling ridge.  Default: 252.
+    cross_market_is_end IS end date for vol-normalisation and inv-vol weight fit.
 
     Returns
     -------
@@ -266,16 +208,9 @@ def load_managed_returns(
 
     series: dict[str, pd.Series] = {}
     for name, df in frames.items():
-        method = cross_market_blend.get(name, "sum")
-        if method == "static_ridge":
-            series[name] = _mkt_blend_static_ridge(
-                df, cross_market_is_end, lam=cross_market_lam,
-            )
-        elif method == "rolling_ridge":
-            series[name] = _mkt_blend_rolling_ridge(
-                df, cross_market_is_end, lam=cross_market_lam,
-                lookback=cross_market_lookback,
-            )
+        method = cross_market_blend.get(name, "inv_vol")
+        if method == "inv_vol":
+            series[name] = _mkt_blend_inv_vol(df, cross_market_is_end)
         else:
             series[name] = df[common_mkts].sum(axis=1)
 
@@ -561,7 +496,7 @@ def tc_sweep_rates(
                 tc_cost = daily_abs_chg * h
             elif signal == "momentum":
                 tc_cost = daily_abs_chg * h * _MOM_EFF_DUR
-            else:   # mean_reversion: NS classic z-scores, PnL in bp — |Δz| × h
+            else:   # mean_reversion: held DV01 positions (monthly rebalancing), PnL in bp — |Δheld_dv01| × h
                 tc_cost = daily_abs_chg * h
             pnl_adj[mkt] = pnl_adj[mkt] - tc_cost.reindex(pnl_adj.index).fillna(0.0)
         return pnl_adj
@@ -794,6 +729,8 @@ def _try_market_blend(
     dict  keyed by method name, each value:
         {"is": {"sharpe", "mdd", "turnover"}, "oos": {...}, "type": "static"|"dynamic"}
     """
+    from core.asset_blend import _drift_to
+
     sig_dir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
 
     pnl = pd.read_parquet(sig_dir / pnl_file)
@@ -838,11 +775,16 @@ def _try_market_blend(
         cum = (1 + r_scaled).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
-    def _to_m(w_df: pd.DataFrame) -> float:
-        w = w_df.dropna(how="any")
-        if len(w) < 2:
-            return float("nan")
-        return float(w.diff().dropna(how="all").abs().sum(axis=1).mean() * 252)
+    def _to_m(w_df: pd.DataFrame, F: pd.DataFrame) -> float:
+        # Drift-corrected: returns at the vol target pull weights off target each day.
+        return _drift_to(w_df, F * vol_target, freq=252, l1_norm=True)
+
+    def _static_w_df(bw, F: pd.DataFrame) -> pd.DataFrame:
+        w = bw.weights.reindex(names).fillna(0.0)
+        total = w.abs().sum()
+        if total > 1e-12:
+            w = w / total
+        return pd.DataFrame(np.tile(w.values, (len(F), 1)), index=F.index, columns=names)
 
     def _apply_static_bw(bw) -> tuple[pd.Series, pd.Series]:
         w = bw.weights.reindex(names).fillna(0.0)
@@ -897,16 +839,16 @@ def _try_market_blend(
     for mname, bw in static_blends.items():
         r_is, r_oos = _apply_static_bw(bw)
         result[mname] = {
-            "is":   {"sharpe": _sharpe(r_is),  "mdd": _mdd_m(r_is),  "turnover": 0.0},
-            "oos":  {"sharpe": _sharpe(r_oos), "mdd": _mdd_m(r_oos), "turnover": 0.0},
+            "is":   {"sharpe": _sharpe(r_is),  "mdd": _mdd_m(r_is),  "turnover": _to_m(_static_w_df(bw, F_is),  F_is)},
+            "oos":  {"sharpe": _sharpe(r_oos), "mdd": _mdd_m(r_oos), "turnover": _to_m(_static_w_df(bw, F_oos), F_oos)},
             "type": "static",
         }
 
     for mname, w_df in dynamic_blends.items():
         r_is, r_oos = _apply_tvw_df(w_df)
         result[mname] = {
-            "is":   {"sharpe": _sharpe(r_is),  "mdd": _mdd_m(r_is),  "turnover": _to_m(w_df.reindex(F_is.index))},
-            "oos":  {"sharpe": _sharpe(r_oos), "mdd": _mdd_m(r_oos), "turnover": _to_m(w_df.reindex(F_oos.index))},
+            "is":   {"sharpe": _sharpe(r_is),  "mdd": _mdd_m(r_is),  "turnover": _to_m(w_df.reindex(F_is.index),  F_is)},
+            "oos":  {"sharpe": _sharpe(r_oos), "mdd": _mdd_m(r_oos), "turnover": _to_m(w_df.reindex(F_oos.index), F_oos)},
             "type": "dynamic",
         }
 
