@@ -194,6 +194,7 @@ def run(
     _log(f"NS classic MR: λ selection (train end {_LAM_TRAIN_END}) + full swap repricing...")
     mr_pnl_dict:    dict[str, pd.Series]    = {}
     mr_zscore_dict: dict[str, pd.DataFrame] = {}
+    mr_dv01_dict:   dict[str, pd.DataFrame] = {}
 
     for mkt in markets:
         if mkt not in par_curves:
@@ -206,13 +207,16 @@ def run(
                 lam = lr["best_lambda"]
             except Exception:
                 lam = 2.5
-            pnl, z_scores, _ = classic_ns_pnl_repriced(
+            pnl, z_scores, resids, held_dv01 = classic_ns_pnl_repriced(
                 par_mkt, lam,
                 target_ann_vol=_MR_TARGET_VOL,
                 burn_in=_MR_BURN_IN,
+                rebalance_freq="daily",
+                _return_held_dv01=True,
             )
             mr_pnl_dict[mkt]    = pnl
             mr_zscore_dict[mkt] = z_scores
+            mr_dv01_dict[mkt]   = held_dv01   # held DV01 positions → TC proxy
             _log(f"  {mkt}: λ={lam}  n={pnl.dropna().__len__()}")
         except Exception as exc:
             _log(f"  Warning: NS classic MR failed for {mkt}: {exc}")
@@ -221,15 +225,21 @@ def run(
     mr_pnl.index.name = "date"
     _save("mean_reversion_pnl.parquet", mr_pnl)
 
-    # z_scores saved as MultiIndex (market, tenor) — used as TC position proxy
+    # z_scores: diagnostic use only
     if mr_zscore_dict:
         mr_zscores = pd.concat(mr_zscore_dict, axis=1)
         mr_zscores.columns.names = ["market", "tenor"]
     else:
         mr_zscores = pd.DataFrame()
     _save("mean_reversion_zscores.parquet", mr_zscores)
-    # backward-compat alias read by rates/blend.py for TC estimation
-    _save("mean_reversion_dv01_pos.parquet", mr_zscores)
+
+    # actual DV01 positions (k_arr × z_scores) — read by rates/blend.py for TC estimation
+    if mr_dv01_dict:
+        mr_dv01_pos = pd.concat(mr_dv01_dict, axis=1)
+        mr_dv01_pos.columns.names = ["market", "tenor"]
+    else:
+        mr_dv01_pos = pd.DataFrame()
+    _save("mean_reversion_dv01_pos.parquet", mr_dv01_pos)
 
     # ── Manifest ───────────────────────────────────────────────────────────────
     manifest = {
@@ -252,8 +262,8 @@ def run(
             "carry_ois_par":            "date × (market,tenor) MultiIndex cols; within-curve carry OIS positions",
             "carry_ois_par_pnl":        "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
             "mean_reversion_pnl":       "date × market; NS classic MR full repricing — use for Sharpe (daily, √252)",
-            "mean_reversion_zscores":   "date × (market,tenor) MultiIndex; NS classic z-scores — signal + TC proxy",
-            "mean_reversion_dv01_pos":  "alias for mean_reversion_zscores.parquet (backward compat)",
+            "mean_reversion_zscores":   "date × (market,tenor) MultiIndex; NS classic z-scores — diagnostic, NOT for TC",
+            "mean_reversion_dv01_pos":  "date × (market,tenor) MultiIndex; held DV01 positions (daily rebalancing) — use for TC estimation in rates/blend.py",
             "momentum_a_daily":         "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
             "momentum_a_daily_pnl":     "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
             "rx_m":                     "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
@@ -263,8 +273,8 @@ def run(
             "Always use the *_pnl files. "
             "sr = pnl[market].dropna().mean() / pnl[market].dropna().std() * sqrt(252). "
             "carry_ois_par_pnl: full swap repricing, DV01-neutral 5Y+10Y cross-section, daily rebalance. "
-            "mean_reversion_pnl: NS classic MR full repricing, factor-neutral NS residuals, "
-            "λ frozen on data through 2015-12-31, 100 bp/yr vol target per market. "
+            "mean_reversion_pnl: NS classic MR full repricing, daily rebalancing, "
+            "factor-neutral NS residuals, λ frozen on data through 2015-12-31, 100 bp/yr vol target. "
             "momentum_a_daily_pnl: full swap repricing, per-tenor vol-scaled positions, 252d formation."
         ),
     }
@@ -279,6 +289,7 @@ def run(
         "carry_ois_par_pnl":       carry_pnl,
         "mean_reversion_pnl":      mr_pnl,
         "mean_reversion_zscores":  mr_zscores,
+        "mean_reversion_dv01_pos": mr_dv01_pos,
         "momentum_a_daily":        mom_a_daily,
         "momentum_a_daily_pnl":    mom_a_daily_pnl,
         "rx_m":                    rx_m_all,
