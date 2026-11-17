@@ -491,12 +491,14 @@ def tc_sweep_rates(
             else:
                 pos_m = pos_df[[mkt]]
             pos_m = pos_m.reindex(pnl_df.index, method="ffill")
-            daily_abs_chg = pos_m.diff().abs().sum(axis=1)
+            # Net position per market (sum across tenors): TC is on the change in
+            # total market allocation, not the sum of within-market tenor moves.
+            daily_abs_chg = pos_m.sum(axis=1).diff().abs()
             if signal == "carry":
                 tc_cost = daily_abs_chg * h
             elif signal == "momentum":
                 tc_cost = daily_abs_chg * h * _MOM_EFF_DUR
-            else:   # mean_reversion: held DV01 positions (monthly rebalancing), PnL in bp — |Δheld_dv01| × h
+            else:
                 tc_cost = daily_abs_chg * h
             pnl_adj[mkt] = pnl_adj[mkt] - tc_cost.reindex(pnl_adj.index).fillna(0.0)
         return pnl_adj
@@ -548,9 +550,28 @@ def tc_sweep_rates(
         valid = to_arr[~np.isnan(to_arr)]
         return float(valid.mean() * 252) if len(valid) > 0 else float("nan")
 
+    # ── Pre-compute inv_vol market weights per signal (TC-free IS PnL) ──────────
+    _mkt_weights: dict[str, pd.Series] = {}
+    for sig, pnl_df in pnl_frames.items():
+        is_raw = pnl_df.loc[pnl_df.index <= is_end]
+        is_counts = is_raw.notna().sum()
+        eligible = is_counts[is_counts >= _CROSS_MARKET_MIN_MKT_DAYS].index.tolist()
+        if eligible:
+            sigma_m = is_raw[eligible].std() * np.sqrt(252)
+            sigma_m = sigma_m.replace(0.0, np.nan).dropna()
+            if not sigma_m.empty:
+                w = 1.0 / sigma_m
+                _mkt_weights[sig] = w / w.sum()
+
+    def _apply_mkt_weights(pnl_df: pd.DataFrame, sig: str) -> pd.Series:
+        if sig in _mkt_weights:
+            w = _mkt_weights[sig]
+            return (pnl_df[w.index] * w).sum(axis=1, min_count=len(w))
+        return pnl_df[common_mkts].sum(axis=1)
+
     # ── TC-free baseline: fit Rolling Ridge ONCE for fixed-weight method ──────
     F_free = pd.DataFrame(
-        {sig: pnl_frames[sig][common_mkts].sum(axis=1) for sig in pnl_frames}
+        {sig: _apply_mkt_weights(pnl_frames[sig], sig) for sig in pnl_frames}
     ).dropna(how="any").sort_index()
     F_free_is  = F_free.loc[F_free.index <= is_end]
     F_free_oos = F_free.loc[F_free.index >= oos_start]
@@ -575,7 +596,7 @@ def tc_sweep_rates(
                 pnl_adj = _tc_adjust(pnl_df, pos_frames[sig], tc_per_mkt, sig)
             else:
                 pnl_adj = pnl_df
-            series[sig] = pnl_adj[common_mkts].sum(axis=1)
+            series[sig] = _apply_mkt_weights(pnl_adj, sig)
 
         F_tc     = pd.DataFrame(series).dropna(how="any").sort_index()
         F_tc_is  = F_tc.loc[F_tc.index <= is_end]
