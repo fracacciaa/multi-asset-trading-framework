@@ -225,7 +225,12 @@ def _portfolio_to(
     return float((w_norm[cols] * to_avg[cols]).sum())
 
 
-def _drift_to(w_df: pd.DataFrame, F: pd.DataFrame, freq: int = 12) -> float:
+def _drift_to(
+    w_df: pd.DataFrame,
+    F: pd.DataFrame,
+    freq: int = 12,
+    l1_norm: bool = False,
+) -> float:
     """
     Drift-corrected annualised one-way turnover of blend weights.
 
@@ -243,7 +248,8 @@ def _drift_to(w_df: pd.DataFrame, F: pd.DataFrame, freq: int = 12) -> float:
     to_vals = []
     for i in range(1, len(idx)):
         w_prev = w[i - 1]
-        gross  = (w_prev * (1.0 + r[i])).sum()
+        drifted = w_prev * (1.0 + r[i])
+        gross   = np.abs(drifted).sum() if l1_norm else drifted.sum()
         if abs(gross) < 1e-12:
             continue
         w_drift = w_prev * (1.0 + r[i]) / gross

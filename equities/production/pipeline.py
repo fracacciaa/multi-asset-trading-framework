@@ -106,6 +106,11 @@ def _load_or_build_vf_data(prices, fundamentals, returns, rebuild=False, verbose
     if verbose:
         print("Building VF data — this takes a few minutes …")
     from equities.signals import build_vf_data
+    if prices is None or fundamentals is None or returns is None:
+        from equities.data import fetch_prices, fetch_fundamentals
+        prices       = fetch_prices(tickers=None) if prices is None else prices
+        fundamentals = fetch_fundamentals(tickers=None) if fundamentals is None else fundamentals
+        returns      = prices.pct_change(fill_method=None) if returns is None else returns
     vf_data = build_vf_data(prices=prices, fundamentals=fundamentals, returns=returns)
     with open(_VF_DATA_CACHE, "wb") as fh:
         pickle.dump(vf_data, fh)
