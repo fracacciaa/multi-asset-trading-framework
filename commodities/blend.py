@@ -673,10 +673,12 @@ def tc_sweep_comm(
         # Normalise using the same TC-free IS sigma across all scenarios (no look-ahead)
         F_is_n  = F_is_tc.div(sigma)
         F_oos_n = F_oos_tc.div(sigma)
+        # Cost is charged on |w| (a negative weight must not earn a rebate)
+        c_n = tc_daily / sigma
 
         # ── Method 1: Fixed weights (Static Ridge) ────────────────────────────
-        r_is_f  = (F_is_n  * w_is_fixed).sum(axis=1)
-        r_oos_f = (F_oos_n * w_oos_fixed).sum(axis=1)
+        r_is_f  = (F_is_free  * w_is_fixed).sum(axis=1)  - (w_is_fixed.abs()  * c_n).sum(axis=1)
+        r_oos_f = (F_oos_free * w_oos_fixed).sum(axis=1) - (w_oos_fixed.abs() * c_n).sum(axis=1)
 
         for period, r, w_f, F_f in [("IS", r_is_f, w_is_fixed, F_is_n), ("OOS", r_oos_f, w_oos_fixed, F_oos_n)]:
             records.append({
@@ -701,8 +703,10 @@ def tc_sweep_comm(
 
         valid_is  = w_is_a.dropna(how="all")
         valid_oos = w_oos_a.dropna(how="all")
-        r_is_a  = (F_is_n.loc[valid_is.index]   * valid_is).sum(axis=1)
-        r_oos_a = (F_oos_n.loc[valid_oos.index] * valid_oos).sum(axis=1)
+        r_is_a  = ((F_is_free.loc[valid_is.index]   * valid_is).sum(axis=1)
+                   - (valid_is.abs()  * c_n).sum(axis=1))
+        r_oos_a = ((F_oos_free.loc[valid_oos.index] * valid_oos).sum(axis=1)
+                   - (valid_oos.abs() * c_n).sum(axis=1))
 
         for period, r, w in [("IS", r_is_a, w_is_a), ("OOS", r_oos_a, w_oos_a)]:
             records.append({

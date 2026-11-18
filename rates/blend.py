@@ -438,7 +438,8 @@ def tc_sweep_rates(
                        signal mix.  Useful for understanding optimal strategy-mix
                        under each cost regime, not for measuring cost drag.
 
-    TC is deducted in native signal units per signal type:
+    TC is deducted in native signal units per signal type, AFTER blend weighting
+    (cost scales with |w|, so a negative weight never earns a rebate):
       carry          : |Δpos_dv01_m| × h_bp_m          (DV01-normalized, PnL in bp)
       momentum       : |Δpos_m| × h_bp_m × eff_dur      (vol-scaled pos, PnL in bp)
       mean_reversion : |Δ(z×DV01)_m| × h_bp_m / 100    (DV01-scaled pos, PnL in year·%)
@@ -482,14 +483,14 @@ def tc_sweep_rates(
 
     # ── TC adjustment per signal ──────────────────────────────────────────────
 
-    def _tc_adjust(
+    def _tc_cost(
         pnl_df: pd.DataFrame,
         pos_df: pd.DataFrame,
         tc_per_market: dict,
         signal: str,
     ) -> pd.DataFrame:
-        """Deduct daily TC cost from per-market PnL, in-place copy."""
-        pnl_adj = pnl_df.copy()
+        """Daily TC cost per market (>= 0), same shape as pnl_df."""
+        cost_df = pd.DataFrame(0.0, index=pnl_df.index, columns=pnl_df.columns)
         is_mi = isinstance(pos_df.columns, pd.MultiIndex)
         pos_markets = set(
             pos_df.columns.get_level_values("market") if is_mi else pos_df.columns
@@ -506,14 +507,20 @@ def tc_sweep_rates(
             # Net position per market (sum across tenors): TC is on the change in
             # total market allocation, not the sum of within-market tenor moves.
             daily_abs_chg = pos_m.sum(axis=1).diff().abs()
-            if signal == "carry":
-                tc_cost = daily_abs_chg * h
-            elif signal == "momentum":
+            if signal == "momentum":
                 tc_cost = daily_abs_chg * h * _MOM_EFF_DUR
             else:
                 tc_cost = daily_abs_chg * h
-            pnl_adj[mkt] = pnl_adj[mkt] - tc_cost.reindex(pnl_adj.index).fillna(0.0)
-        return pnl_adj
+            cost_df[mkt] = tc_cost.reindex(pnl_df.index).fillna(0.0)
+        return cost_df
+
+    def _net_return(G_n: pd.DataFrame, C_n: pd.DataFrame, weights: pd.DataFrame) -> pd.Series:
+        """Σ w_k·gross_k − Σ |w_k|·cost_k with L1-normalised weights (cost never earns a rebate)."""
+        idx = G_n.index.intersection(weights.dropna(how="any").index)
+        w = weights.loc[idx]
+        w = w.div(w.abs().sum(axis=1).replace(0.0, np.nan), axis=0)
+        return ((G_n.loc[idx] * w).sum(axis=1)
+                - (C_n.loc[idx] * w.abs()).sum(axis=1)).rename("combined")
 
     # ── Metric helpers ────────────────────────────────────────────────────────
 
@@ -601,16 +608,16 @@ def tc_sweep_rates(
     _returns_dict: dict[tuple, pd.Series] = {}   # populated when _collect_returns=True
 
     for scenario_name, tc_per_mkt in scenarios.items():
-        # TC-adjusted managed returns (shared by both methods)
-        series: dict[str, pd.Series] = {}
+        # Blended per-signal cost series; net = gross − cost (used only to FIT weights)
+        cost_blend: dict[str, pd.Series] = {}
         for sig, pnl_df in pnl_frames.items():
             if sig in pos_frames:
-                pnl_adj = _tc_adjust(pnl_df, pos_frames[sig], tc_per_mkt, sig)
+                cdf = _tc_cost(pnl_df, pos_frames[sig], tc_per_mkt, sig)
             else:
-                pnl_adj = pnl_df
-            series[sig] = _apply_mkt_weights(pnl_adj, sig)
-
-        F_tc     = pd.DataFrame(series).dropna(how="any").sort_index()
+                cdf = pd.DataFrame(0.0, index=pnl_df.index, columns=pnl_df.columns)
+            cost_blend[sig] = _apply_mkt_weights(cdf, sig)
+        C_tc = pd.DataFrame(cost_blend).reindex(F_free.index).fillna(0.0)
+        F_tc = F_free - C_tc
         F_tc_is  = F_tc.loc[F_tc.index <= is_end]
         F_tc_oos = F_tc.loc[F_tc.index >= oos_start]
 
@@ -622,10 +629,13 @@ def tc_sweep_rates(
         # same scale they were calibrated on.
         F_tc_is_n  = F_tc_is.div(sigma_free)
         F_tc_oos_n = F_tc_oos.div(sigma_free)
+        G_is_f, G_oos_f = F_free_is.div(sigma_free), F_free_oos.div(sigma_free)
+        C_is_f  = C_tc.loc[F_tc_is_n.index].div(sigma_free)
+        C_oos_f = C_tc.loc[F_tc_oos_n.index].div(sigma_free)
         w_is_f  = w_fixed.reindex(F_tc_is_n.index)
         w_oos_f = w_fixed.reindex(F_tc_oos_n.index)
-        r_is_f  = rolling_combined_return(F_tc_is_n, w_is_f)
-        r_oos_f = rolling_combined_return(F_tc_oos_n, w_oos_f)
+        r_is_f  = _net_return(G_is_f, C_is_f, w_is_f)
+        r_oos_f = _net_return(G_oos_f, C_oos_f, w_oos_f)
 
         for period, r, w, t0, t1 in [
             ("IS",  r_is_f,  w_is_f,  F_tc_is_n.index[0],  F_tc_is_n.index[-1]),
@@ -654,8 +664,10 @@ def tc_sweep_rates(
         w_all = w_raw.div(norm, axis=0)
         w_is_a  = w_all.reindex(F_is_n.index)
         w_oos_a = w_all.reindex(F_oos_n.index)
-        r_is_a  = rolling_combined_return(F_is_n, w_is_a)
-        r_oos_a = rolling_combined_return(F_oos_n, w_oos_a)
+        # Weights are fitted on net returns but realised as Σ w·gross − Σ |w|·cost
+        sigma_a = (F_tc_is.std() * np.sqrt(252)).replace(0.0, np.nan)
+        r_is_a  = _net_return(F_free_is.div(sigma_a),  C_tc.loc[F_is_n.index].div(sigma_a),  w_is_a)
+        r_oos_a = _net_return(F_free_oos.div(sigma_a), C_tc.loc[F_oos_n.index].div(sigma_a), w_oos_a)
 
         for period, r, w, t0, t1 in [
             ("IS",  r_is_a,  w_is_a,  F_is_n.index[0],  F_is_n.index[-1]),

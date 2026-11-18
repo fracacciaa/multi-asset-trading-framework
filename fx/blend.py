@@ -531,7 +531,8 @@ def tc_sweep_fx(
       Adaptive Ridge — Rolling Ridge RE-FIT on TC-adjusted IS per scenario;
                        blend weights shift away from high-TC signals as costs rise.
 
-    TC deducted from each signal's monthly managed return:
+    TC is deducted AFTER blend weighting (cost scales with |w|, no rebate from
+    negative weights), per signal:
       momentum / carry_xs  : Σ_pair |Δpos_pair| × (h_pair_bp / 10_000)
       mr_ns_loo            : Σ_pair daily |Δpos_pair| × (h_pair_bp / 10_000), summed to month
                              (mr_ns_loo rebalances daily, so TC accumulates intra-month)
@@ -631,6 +632,14 @@ def tc_sweep_fx(
         delta = pos.diff().abs().sum(axis=1)
         return float((delta / gross).dropna().mean() * 12)
 
+    def _net_return(G_n: pd.DataFrame, C_n: pd.DataFrame, weights: pd.DataFrame) -> pd.Series:
+        """Σ w_k·gross_k − Σ |w_k|·cost_k with L1-normalised weights (cost never earns a rebate)."""
+        idx = G_n.index.intersection(weights.dropna().index)
+        w = weights.loc[idx]
+        w = w.div(w.abs().sum(axis=1).replace(0.0, np.nan), axis=0)
+        return ((G_n.loc[idx] * w).sum(axis=1)
+                - (C_n.loc[idx] * w.abs()).sum(axis=1)).rename("combined")
+
     # ── TC-free baseline: fit Rolling Ridge ONCE for fixed-weight method ──────
     F_free_is  = F_gross.loc[F_gross.index <= is_end]
     F_free_oos = F_gross.loc[F_gross.index >= oos_start]
@@ -657,14 +666,13 @@ def tc_sweep_fx(
             )
             return (dpos_df * h_vec).sum(axis=1)
 
-        # TC-adjusted managed returns
-        series = {
-            "momentum":  F_gross["momentum"]  - _tc_series(dpos_mom).reindex(F_gross.index).fillna(0.0),
-            "mr_ns_loo": F_gross["mr_ns_loo"] - _tc_series(dpos_mr_m).reindex(F_gross.index).fillna(0.0),
-            "carry_xs":  F_gross["carry_xs"]  - _tc_series(dpos_cxs).reindex(F_gross.index).fillna(0.0),
-        }
-
-        F_tc = pd.DataFrame(series).dropna().sort_index()
+        # Per-signal cost series; net = gross − cost (used only to FIT weights)
+        C_tc = pd.DataFrame({
+            "momentum":  _tc_series(dpos_mom).reindex(F_gross.index).fillna(0.0),
+            "mr_ns_loo": _tc_series(dpos_mr_m).reindex(F_gross.index).fillna(0.0),
+            "carry_xs":  _tc_series(dpos_cxs).reindex(F_gross.index).fillna(0.0),
+        })
+        F_tc = (F_gross - C_tc).dropna().sort_index()
         F_tc_is  = F_tc.loc[F_tc.index <= is_end]
         F_tc_oos = F_tc.loc[F_tc.index >= oos_start]
 
@@ -674,8 +682,12 @@ def tc_sweep_fx(
         # ── Method 1: Fixed weights — TC-free Ridge, only deduct cost ─────────
         F_tc_is_n  = F_tc_is.div(sigma_free)
         F_tc_oos_n = F_tc_oos.div(sigma_free)
-        r_is_f  = combined_return_rolling(F_tc_is_n,  w_is_fixed.reindex(F_tc_is_n.index))
-        r_oos_f = combined_return_rolling(F_tc_oos_n, w_oos_fixed.reindex(F_tc_oos_n.index))
+        C_is_f  = C_tc.loc[F_tc_is_n.index].div(sigma_free)
+        C_oos_f = C_tc.loc[F_tc_oos_n.index].div(sigma_free)
+        r_is_f  = _net_return(F_free_is_n.loc[F_tc_is_n.index], C_is_f,
+                              w_is_fixed.reindex(F_tc_is_n.index))
+        r_oos_f = _net_return(F_free_oos_n.loc[F_tc_oos_n.index], C_oos_f,
+                              w_oos_fixed.reindex(F_tc_oos_n.index))
 
         for period, r, w, t0, t1 in [
             ("IS",  r_is_f,  w_is_fixed,  F_tc_is_n.index[0],  F_tc_is_n.index[-1]),
@@ -705,8 +717,11 @@ def tc_sweep_fx(
         model_tc.fit(F_tc_is_n2)
         w_is_a  = model_tc._weights_history
         w_oos_a = model_tc.predict_weights(F_tc_oos_n2)
-        r_is_a  = combined_return_rolling(F_tc_is_n2, w_is_a)
-        r_oos_a = combined_return_rolling(F_tc_oos_n2, w_oos_a)
+        # Weights are fitted on net returns but realised as Σ w·gross − Σ |w|·cost
+        r_is_a  = _net_return(F_free_is.loc[F_tc_is.index].div(sigma_tc),
+                              C_tc.loc[F_tc_is.index].div(sigma_tc), w_is_a)
+        r_oos_a = _net_return(F_free_oos.loc[F_tc_oos.index].div(sigma_tc),
+                              C_tc.loc[F_tc_oos.index].div(sigma_tc), w_oos_a)
 
         for period, r, w, t0, t1 in [
             ("IS",  r_is_a,  w_is_a,  F_tc_is_n2.index[0],  F_tc_is_n2.index[-1]),
