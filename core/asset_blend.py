@@ -1034,13 +1034,9 @@ def run_assets_tc(
 
     For each TC scenario (best / base / worst), feeds the TC-adjusted "Fixed
     weights" composite return from each asset class into the cross-asset blend
-    layer and evaluates two blend methods:
-
-      Fixed weights  — Rolling Ridge fit ONCE on TC-free cross-asset returns;
-                       only the per-asset TC deduction changes across scenarios.
-                       Shows pure TC impact propagated from asset-class level.
-      Adaptive Ridge — Rolling Ridge RE-FIT on TC-adjusted cross-asset returns
-                       per scenario; allocator can shift away from high-TC assets.
+    layer with fixed weights: the Rolling Ridge is fit ONCE on TC-free
+    cross-asset returns; only the per-asset TC deduction changes across
+    scenarios. Shows pure TC impact propagated from asset-class level.
 
     Per-asset TC uses the "Fixed weights" method from each asset class's sweep:
       rates       : TC_SCENARIOS  (market-specific OIS spreads)
@@ -1188,61 +1184,13 @@ def run_assets_tc(
             pd.concat([r_is_f, r_oos_f]).sort_index()
         )
 
-        # ── Method 2: Adaptive Ridge ──────────────────────────────────────────
-        # Re-normalise and re-fit per scenario
-        sigma_tc = F_tc_is_raw.std() * np.sqrt(12)
-        sigma_tc = sigma_tc.replace(0.0, np.nan)
-        F_tc_is_n2  = F_tc_is_raw.div(sigma_tc)
-        F_tc_oos_n2 = F_tc_oos_raw.div(sigma_tc)
-
-        model_tc     = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
-        F_tc_full_n2 = pd.concat([F_tc_is_n2, F_tc_oos_n2]).sort_index()
-        w_all_a      = model_tc._roll(F_tc_full_n2)
-        w_is_a       = w_all_a.reindex(F_tc_is_n2.index)
-        w_oos_a      = w_all_a.reindex(F_tc_oos_n2.index)
-
-        r_is_a  = _apply_tvw(F_tc_is_n2,  w_is_a)
-        r_oos_a = _apply_tvw(F_tc_oos_n2, w_oos_a)
-
-        # Deduct cross-asset rebalancing TC for adaptive weights
-        w_a_comb = pd.concat([
-            _norm_w(w_is_a.dropna(how="any")),
-            _norm_w(w_oos_a.dropna(how="any")),
-        ]).sort_index()
-        tc_cross_a = (w_a_comb.diff().abs().fillna(0.0) * h_vec).sum(axis=1)
-        r_net_a    = pd.concat([r_is_a, r_oos_a]).sort_index() - tc_cross_a.reindex(
-            pd.concat([r_is_a, r_oos_a]).index).fillna(0.0)
-        r_is_a  = r_net_a.loc[r_net_a.index <= is_end]
-        r_oos_a = r_net_a.loc[r_net_a.index >= oos_start]
-
-        for period, r, w in [
-            ("IS",  r_is_a,  w_is_a),
-            ("OOS", r_oos_a, w_oos_a),
-        ]:
-            records.append({
-                "Method":   "Adaptive Ridge",
-                "Scenario": scenario_name,
-                "Period":   period,
-                "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r, vol_target) * 100,
-                "TO":       _portfolio_to(w, to_df, r.index),
-            })
-
-        _returns_dict[("Adaptive Ridge", scenario_name)] = (
-            pd.concat([r_is_a, r_oos_a]).sort_index()
-        )
-
     df = pd.DataFrame(records)
 
     # ── 4. Print results ──────────────────────────────────────────────────────
     W = 80
-    for method in ["Fixed weights", "Adaptive Ridge"]:
+    for method in ["Fixed weights"]:
         sub = df[df["Method"] == method]
-        label = (
-            "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
-            if method == "Fixed weights"
-            else "ADAPTIVE RIDGE — Ridge re-fit per TC scenario"
-        )
+        label = "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
         print("\n" + "=" * W)
         print(f"  MULTI-ASSET TC SWEEP — {label}")
         print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  lookback={lookback}m  |  λ={lam}")
@@ -1311,15 +1259,9 @@ def run_asset_tc(
     optionally plots the cumulative return under gross, best, base, and worst
     TC scenarios.
 
-    Two methods are compared, mirroring run_assets_tc():
-      Fixed weights  — Rolling Ridge fit once on gross returns; only the
-                       per-asset cost propagates into the return.
-      Adaptive Ridge — Rolling Ridge refit on TC-adjusted returns per scenario;
-                       the allocator shifts weight away from costly assets.
-
-    The printed table adds a "gross" row to both methods as the TC = 0 baseline.
-    The chart shows the Adaptive Ridge lines (gross + 3 scenarios) since that is
-    the production method.
+    Fixed weights: Rolling Ridge fit once on gross returns; only the per-asset
+    cost propagates into the return. The printed table adds a "gross" row as
+    the TC = 0 baseline; the chart shows gross + 3 scenarios.
 
     Parameters
     ----------
@@ -1336,7 +1278,7 @@ def run_asset_tc(
 
     Returns
     -------
-    pd.Series — base-scenario Adaptive Ridge net-of-TC monthly return series,
+    pd.Series — base-scenario fixed-weights net-of-TC monthly return series,
     name = "asset_blend_net".
     """
     import contextlib, io as _io
@@ -1379,15 +1321,14 @@ def run_asset_tc(
         ("OOS", r_gross_oos, w_oos_fixed),
     ]:
         gross_to = _portfolio_to(w, to_df, r.index)
-        for method in ["Fixed weights", "Adaptive Ridge"]:
-            gross_rows.append({
-                "Method":   method,
-                "Scenario": "gross",
-                "Period":   period,
-                "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r, vol_target) * 100,
-                "TO":       gross_to,
-            })
+        gross_rows.append({
+            "Method":   "Fixed weights",
+            "Scenario": "gross",
+            "Period":   period,
+            "Sharpe":   _sharpe(r),
+            "MDD_pct":  _mdd(r, vol_target) * 100,
+            "TO":       gross_to,
+        })
 
     gross_df  = pd.DataFrame(gross_rows)
     all_metrics = pd.concat([gross_df, metrics_df], ignore_index=True)
@@ -1396,12 +1337,8 @@ def run_asset_tc(
     if verbose:
         scen_order = ["gross"] + list(scenarios.keys())
         W = 80
-        for method in ["Fixed weights", "Adaptive Ridge"]:
-            label = (
-                "FIXED WEIGHTS — TC-free Ridge fit; only cost propagated"
-                if method == "Fixed weights"
-                else "ADAPTIVE RIDGE — Ridge refit per TC scenario  [production]"
-            )
+        for method in ["Fixed weights"]:
+            label = "FIXED WEIGHTS — TC-free Ridge fit; only cost propagated  [production]"
             sub = all_metrics[all_metrics["Method"] == method]
             print("\n" + "=" * W)
             print(f"  CROSS-ASSET TC ANALYSIS — {label}")
@@ -1431,16 +1368,16 @@ def run_asset_tc(
 
         # Sharpe degradation summary
         print()
-        print("  Sharpe degradation  (Adaptive Ridge, OOS)")
+        print("  Sharpe degradation  (Fixed weights, OOS)")
         print("  " + "─" * 44)
         gross_oos_sr = all_metrics.loc[
-            (all_metrics["Method"] == "Adaptive Ridge") &
+            (all_metrics["Method"] == "Fixed weights") &
             (all_metrics["Scenario"] == "gross") &
             (all_metrics["Period"] == "OOS"), "Sharpe"
         ].values[0]
         for scen in list(scenarios.keys()):
             net_sr = all_metrics.loc[
-                (all_metrics["Method"] == "Adaptive Ridge") &
+                (all_metrics["Method"] == "Fixed weights") &
                 (all_metrics["Scenario"] == scen) &
                 (all_metrics["Period"] == "OOS"), "Sharpe"
             ]
@@ -1473,7 +1410,7 @@ def run_asset_tc(
                 if scen == "gross":
                     r_s = r_gross
                 else:
-                    key = ("Adaptive Ridge", scen)
+                    key = ("Fixed weights", scen)
                     if key not in returns_df.columns:
                         continue
                     r_s = returns_df[key].dropna()
@@ -1508,7 +1445,7 @@ def run_asset_tc(
             # Annotate OOS Sharpe for each scenario on the right margin
             for scen, (color, _, _, _) in scen_styles.items():
                 row = all_metrics.loc[
-                    (all_metrics["Method"] == "Adaptive Ridge") &
+                    (all_metrics["Method"] == "Fixed weights") &
                     (all_metrics["Scenario"] == scen) &
                     (all_metrics["Period"] == "OOS")
                 ]
@@ -1524,7 +1461,7 @@ def run_asset_tc(
             ax.set_ylabel("Wealth index", fontsize=10)
             ax.set_title(
                 f"Cross-Asset Blend — TC Sensitivity  "
-                f"(Adaptive Ridge, lookback={lookback}m, λ={lam}, "
+                f"(Fixed weights, lookback={lookback}m, λ={lam}, "
                 f"vol target={vol_target*100:.0f}%)",
                 fontsize=10,
             )
@@ -1545,8 +1482,8 @@ def run_asset_tc(
             if verbose:
                 print(f"\n  [plot skipped: {e}]")
 
-    # ── 6. Return base-scenario Adaptive Ridge series ─────────────────────────
-    base_key = ("Adaptive Ridge", "base")
+    # ── 6. Return base-scenario fixed-weights series ─────────────────────────
+    base_key = ("Fixed weights", "base")
     r_base = returns_df[base_key].dropna() if base_key in returns_df.columns else r_gross
     r_base.name = "asset_blend_net"
     return r_base

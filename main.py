@@ -21,6 +21,6 @@ from core.asset_blend import run_asset_tc
 
 if __name__ == "__main__":
     r = run_asset_tc(verbose=True, plot=True)
-    print(f"\nProduction return (base TC, Adaptive Ridge): "
+    print(f"\nProduction return (base TC, fixed weights): "
           f"{len(r)} monthly observations, "
           f"{r.index[0].strftime('%Y-%m')} → {r.index[-1].strftime('%Y-%m')}")
