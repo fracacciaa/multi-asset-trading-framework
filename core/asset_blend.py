@@ -1024,19 +1024,17 @@ def run_assets_tc(
     scenarios: Optional[dict] = None,
     is_end: str = IS_END,
     oos_start: str = OOS_START,
-    lookback: int = 36,
-    min_obs: int = 24,
     vol_target: float = 0.10,
-    lam: float = 0.01,
 ) -> dict:
     """
     Full cross-asset TC sweep: metrics table + monthly return timeseries.
 
-    For each TC scenario (best / base / worst), feeds the TC-adjusted "Fixed
-    weights" composite return from each asset class into the cross-asset blend
-    layer with fixed weights: the Rolling Ridge is fit ONCE on TC-free
-    cross-asset returns; only the per-asset TC deduction changes across
-    scenarios. Shows pure TC impact propagated from asset-class level.
+    Cross-asset blend: static inverse-vol (risk parity ignoring correlations).
+    Each sleeve is scaled by its IS σ, weights are w_k ∝ 1/σ_k of the scaled
+    sleeves (frozen on IS, hence constant), and the portfolio is scaled once so
+    its gross IS vol equals vol_target.  The same weights and scale are used for
+    every TC scenario, so only the per-asset-class cost differs; constant
+    weights incur no cross-asset rebalancing cost.
 
     Per-asset TC uses the "Fixed weights" method from each asset class's sweep:
       rates       : TC_SCENARIOS  (market-specific OIS spreads)
@@ -1050,16 +1048,15 @@ def run_assets_tc(
                 Default: TC_SCENARIOS_ASSETS.
     is_end      Last IS date (inclusive).  Default: "2020-12-31".
     oos_start   First OOS date (inclusive).  Default: "2021-01-01".
-    lookback    Rolling Ridge window in months.  Default: 36.
-    min_obs     Minimum months before first weight estimate.  Default: 24.
-    vol_target  For MDD computation.  Default: 0.10.
-    lam         Ridge penalty.  Default: 0.01.
+    vol_target  Annual vol target (frozen IS scale) and MDD scaling.  Default: 0.10.
 
     Returns
     -------
     dict:
         'metrics'   pd.DataFrame — [Method, Scenario, Period, Sharpe, MDD_pct, TO]
         'returns'   pd.DataFrame — monthly returns, MultiIndex columns (Method, Scenario)
+        'gross'     pd.Series — TC-free monthly return
+        'w_is', 'w_oos'  constant blend weights (DataFrames over IS / OOS dates)
     """
     import contextlib
     import io as _io
@@ -1067,9 +1064,9 @@ def run_assets_tc(
     if scenarios is None:
         scenarios = TC_SCENARIOS_ASSETS
 
-    from rates.blend       import tc_sweep_rates, TC_SCENARIOS       as _TC_RATES
-    from fx.blend          import tc_sweep_fx,    TC_SCENARIOS_FX    as _TC_FX
-    from commodities.blend import tc_sweep_comm,  TC_SCENARIOS_COMM  as _TC_COMM
+    from rates.blend       import tc_sweep_rates
+    from fx.blend          import tc_sweep_fx
+    from commodities.blend import tc_sweep_comm
     from equities.production.pipeline import tc_sweep_eq
 
     # ── 1. Run per-asset TC sweeps, suppress their print output ──────────────
@@ -1085,7 +1082,7 @@ def run_assets_tc(
     with contextlib.redirect_stdout(_io.StringIO()):
         to_df = _build_position_turnover_series()
 
-    # ── 2. TC-free cross-asset returns for Fixed weights baseline ─────────────
+    # ── 2. TC-free sleeves, inverse-vol weights, vol-target scale ─────────────
     print("Building TC-free cross-asset baseline …")
     F_free_all     = load_asset_returns(verbose=False)
     F_free_is_raw  = F_free_all.loc[F_free_all.index <= is_end]
@@ -1096,20 +1093,14 @@ def run_assets_tc(
     F_free_is  = F_free_is_raw.div(sigma_free)
     F_free_oos = F_free_oos_raw.div(sigma_free)
 
-    # Walk-forward Rolling Ridge on full gross IS+OOS timeline.
-    # predict_weights(_oos_only) would restart the lookback window from scratch,
-    # losing IS history and producing NaN for the first min_obs OOS months.
-    # Using _roll(full) carries IS data into OOS, matching run_asset_blend().
-    model_free  = RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
-    F_free_full = pd.concat([F_free_is, F_free_oos]).sort_index()
-    w_free_all  = model_free._roll(F_free_full)
-    w_is_fixed  = w_free_all.reindex(F_free_is.index)
-    w_oos_fixed = w_free_all.reindex(F_free_oos.index)
+    inv_sigma = 1.0 / F_free_is.std()
+    w_static  = inv_sigma / inv_sigma.sum()
+    w_is  = pd.DataFrame([w_static.values] * len(F_free_is),  index=F_free_is.index,  columns=F_free_is.columns)
+    w_oos = pd.DataFrame([w_static.values] * len(F_free_oos), index=F_free_oos.index, columns=F_free_oos.columns)
 
-    def _norm_w(w_df: pd.DataFrame) -> pd.DataFrame:
-        """L1-normalise weights row-wise (mirrors _apply_tvw logic)."""
-        n = w_df.abs().sum(axis=1).replace(0.0, np.nan)
-        return w_df.div(n, axis=0)
+    r_gross_raw = pd.concat([_apply_tvw(F_free_is, w_is), _apply_tvw(F_free_oos, w_oos)]).sort_index()
+    scale = vol_target / (r_gross_raw.loc[r_gross_raw.index <= is_end].std() * np.sqrt(12))
+    r_gross = (r_gross_raw * scale).rename("gross")
 
     # ── 3. TC scenario sweep ──────────────────────────────────────────────────
     records: list = []
@@ -1133,46 +1124,22 @@ def run_assets_tc(
         F_tc_is_raw  = F_tc_all.loc[F_tc_all.index <= is_end]
         F_tc_oos_raw = F_tc_all.loc[F_tc_all.index >= oos_start]
 
-        if len(F_tc_is_raw) < min_obs or F_tc_oos_raw.empty:
+        if len(F_tc_is_raw) < 12 or F_tc_oos_raw.empty:
             continue
 
-        # Average one-way spread per asset class for this scenario (bps).
-        # Rates and FX: mean of instrument/pair-specific spreads.
-        # Commodities: bps/yr drag ÷ est. 4× annual TO ≈ per-trade spread.
-        # Equities: numeric tc_bps level (already one-way bp).
-        h_bp = {
-            "rates":       float(np.mean(list(_TC_RATES[asset_scens["rates"]].values()))),
-            "fx":          float(np.mean(list(_TC_FX[asset_scens["fx"]].values()))),
-            "commodities": _TC_COMM[asset_scens["commodities"]] / 4.0,
-            "equities":    float(asset_scens["equities"]),
-        }
-        h_vec = pd.Series({k: v / 10_000.0 for k, v in h_bp.items()})
-
-        # ── Method 1: Fixed weights ───────────────────────────────────────────
-        # Normalise using TC-free IS sigma (no look-ahead, no re-fitting)
+        # Normalise with the TC-free IS σ; weights and scale are frozen.
         F_tc_is_n  = F_tc_is_raw.div(sigma_free)
         F_tc_oos_n = F_tc_oos_raw.div(sigma_free)
 
-        r_is_f  = _apply_tvw(F_tc_is_n,  w_is_fixed.reindex(F_tc_is_n.index))
-        r_oos_f = _apply_tvw(F_tc_oos_n, w_oos_fixed.reindex(F_tc_oos_n.index))
-
-        # Deduct cross-asset rebalancing TC: cost of scaling sleeve k by |Δw_k|
-        w_f_comb = pd.concat([
-            _norm_w(w_is_fixed.reindex(r_is_f.index).dropna(how="any")),
-            _norm_w(w_oos_fixed.reindex(r_oos_f.index).dropna(how="any")),
-        ]).sort_index()
-        tc_cross_f = (w_f_comb.diff().abs().fillna(0.0) * h_vec).sum(axis=1)
-        r_net_f    = pd.concat([r_is_f, r_oos_f]).sort_index() - tc_cross_f.reindex(
-            pd.concat([r_is_f, r_oos_f]).index).fillna(0.0)
-        r_is_f  = r_net_f.loc[r_net_f.index <= is_end]
-        r_oos_f = r_net_f.loc[r_net_f.index >= oos_start]
+        r_is_f  = _apply_tvw(F_tc_is_n,  w_is.reindex(F_tc_is_n.index))  * scale
+        r_oos_f = _apply_tvw(F_tc_oos_n, w_oos.reindex(F_tc_oos_n.index)) * scale
 
         for period, r, w in [
-            ("IS",  r_is_f,  w_is_fixed),
-            ("OOS", r_oos_f, w_oos_fixed),
+            ("IS",  r_is_f,  w_is),
+            ("OOS", r_oos_f, w_oos),
         ]:
             records.append({
-                "Method":   "Fixed weights",
+                "Method":   "Inverse vol",
                 "Scenario": scenario_name,
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
@@ -1180,7 +1147,7 @@ def run_assets_tc(
                 "TO":       _portfolio_to(w, to_df, r.index),
             })
 
-        _returns_dict[("Fixed weights", scenario_name)] = (
+        _returns_dict[("Inverse vol", scenario_name)] = (
             pd.concat([r_is_f, r_oos_f]).sort_index()
         )
 
@@ -1188,12 +1155,12 @@ def run_assets_tc(
 
     # ── 4. Print results ──────────────────────────────────────────────────────
     W = 80
-    for method in ["Fixed weights"]:
+    for method in ["Inverse vol"]:
         sub = df[df["Method"] == method]
-        label = "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
+        label = "STATIC INVERSE-VOL — IS-frozen weights; only cost deducted"
         print("\n" + "=" * W)
         print(f"  MULTI-ASSET TC SWEEP — {label}")
-        print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  lookback={lookback}m  |  λ={lam}")
+        print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  vol target={vol_target*100:.0f}%")
         print("=" * W)
         print(f"  {'Scenario':<12}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>7}")
         print("  " + "─" * (W - 2))
@@ -1230,11 +1197,12 @@ def run_assets_tc(
         returns_df.columns, names=["Method", "Scenario"]
     )
     return {
-        "metrics":     df,
-        "returns":     returns_df,
-        "to_df":       to_df,
-        "w_is_fixed":  w_is_fixed,
-        "w_oos_fixed": w_oos_fixed,
+        "metrics": df,
+        "returns": returns_df,
+        "gross":   r_gross,
+        "to_df":   to_df,
+        "w_is":    w_is,
+        "w_oos":   w_oos,
     }
 
 
@@ -1244,24 +1212,17 @@ def run_asset_tc(
     scenarios: Optional[dict] = None,
     is_end:     str   = IS_END,
     oos_start:  str   = OOS_START,
-    lookback:   int   = 36,
-    min_obs:    int   = 24,
     vol_target: float = 0.10,
-    lam:        float = 0.01,
     plot:       bool  = True,
     verbose:    bool  = True,
 ) -> pd.Series:
     """
     Production cross-asset TC analysis: gross vs net-of-TC metrics + chart.
 
-    Builds the TC-free gross portfolio (Rolling Ridge MSRR), runs run_assets_tc()
-    for all TC scenarios, then prints a combined IS / OOS summary table and
-    optionally plots the cumulative return under gross, best, base, and worst
-    TC scenarios.
-
-    Fixed weights: Rolling Ridge fit once on gross returns; only the per-asset
-    cost propagates into the return. The printed table adds a "gross" row as
-    the TC = 0 baseline; the chart shows gross + 3 scenarios.
+    Static inverse-vol blend of the four asset-class sleeves, scaled to a 10%
+    IS vol target.  Runs run_assets_tc() for all TC scenarios, then prints a
+    combined IS / OOS summary table (with a "gross" TC = 0 row) and optionally
+    plots the cumulative return under gross, best, base, and worst TC scenarios.
 
     Parameters
     ----------
@@ -1269,16 +1230,13 @@ def run_asset_tc(
                 Default: TC_SCENARIOS_ASSETS (best / base / worst).
     is_end      Last IS date.  Default: "2020-12-31".
     oos_start   First OOS date.  Default: "2021-01-01".
-    lookback    Rolling Ridge window in months.  Default: 36.
-    min_obs     Minimum months before first weight estimate.  Default: 24.
-    vol_target  For MDD scaling and plot.  Default: 0.10.
-    lam         Ridge regularisation.  Default: 0.01.
+    vol_target  Annual vol target and MDD scaling.  Default: 0.10.
     plot        Save and show the cumulative-return chart.  Default: True.
     verbose     Print the summary table.  Default: True.
 
     Returns
     -------
-    pd.Series — base-scenario fixed-weights net-of-TC monthly return series,
+    pd.Series — base-scenario net-of-TC monthly return series,
     name = "asset_blend_net".
     """
     import contextlib, io as _io
@@ -1286,43 +1244,33 @@ def run_asset_tc(
     if scenarios is None:
         scenarios = TC_SCENARIOS_ASSETS
 
-    # ── 1. Gross baseline (TC = 0, Rolling Ridge) ─────────────────────────────
-    if verbose:
-        print("Building gross (TC-free) baseline …")
-    with contextlib.redirect_stdout(_io.StringIO()):
-        r_gross = run_asset_blend(
-            is_end=is_end, lookback=lookback, min_obs=min_obs,
-            lam=lam, vol_target=vol_target, plot=False, verbose=False,
-        )
-
-    r_gross_is  = r_gross.loc[r_gross.index <= is_end]
-    r_gross_oos = r_gross.loc[r_gross.index >= oos_start]
-
-    # ── 2. TC sweep ───────────────────────────────────────────────────────────
+    # ── 1. TC sweep (also builds the gross baseline) ──────────────────────────
     if verbose:
         print("Running TC sweep …")
     with contextlib.redirect_stdout(_io.StringIO()):
         tc_res = run_assets_tc(
             scenarios=scenarios, is_end=is_end, oos_start=oos_start,
-            lookback=lookback, min_obs=min_obs, vol_target=vol_target, lam=lam,
+            vol_target=vol_target,
         )
 
     metrics_df  = tc_res["metrics"]
     returns_df  = tc_res["returns"]
     to_df       = tc_res["to_df"]
-    w_is_fixed  = tc_res["w_is_fixed"]
-    w_oos_fixed = tc_res["w_oos_fixed"]
+    r_gross     = tc_res["gross"]
+    w_is        = tc_res["w_is"]
+    w_oos       = tc_res["w_oos"]
+    r_gross_is  = r_gross.loc[r_gross.index <= is_end]
+    r_gross_oos = r_gross.loc[r_gross.index >= oos_start]
 
     # ── 3. Build gross metrics row ────────────────────────────────────────────
-    # Gross uses the same Rolling Ridge blend weights as the Fixed-weights baseline.
     gross_rows = []
     for period, r, w in [
-        ("IS",  r_gross_is,  w_is_fixed),
-        ("OOS", r_gross_oos, w_oos_fixed),
+        ("IS",  r_gross_is,  w_is),
+        ("OOS", r_gross_oos, w_oos),
     ]:
         gross_to = _portfolio_to(w, to_df, r.index)
         gross_rows.append({
-            "Method":   "Fixed weights",
+            "Method":   "Inverse vol",
             "Scenario": "gross",
             "Period":   period,
             "Sharpe":   _sharpe(r),
@@ -1337,13 +1285,13 @@ def run_asset_tc(
     if verbose:
         scen_order = ["gross"] + list(scenarios.keys())
         W = 80
-        for method in ["Fixed weights"]:
-            label = "FIXED WEIGHTS — TC-free Ridge fit; only cost propagated  [production]"
+        for method in ["Inverse vol"]:
+            label = "STATIC INVERSE-VOL — IS-frozen weights; only cost propagated  [production]"
             sub = all_metrics[all_metrics["Method"] == method]
             print("\n" + "=" * W)
             print(f"  CROSS-ASSET TC ANALYSIS — {label}")
             print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}"
-                  f"  |  lookback={lookback}m  |  λ={lam}")
+                  f"  |  vol target={vol_target*100:.0f}%")
             print("=" * W)
             print(f"  {'Scenario':<16}  {'Period':<6}"
                   f"  {'Sharpe':>8}  {'MDD':>8}  {'TO':>7}")
@@ -1368,16 +1316,16 @@ def run_asset_tc(
 
         # Sharpe degradation summary
         print()
-        print("  Sharpe degradation  (Fixed weights, OOS)")
+        print("  Sharpe degradation  (Inverse vol, OOS)")
         print("  " + "─" * 44)
         gross_oos_sr = all_metrics.loc[
-            (all_metrics["Method"] == "Fixed weights") &
+            (all_metrics["Method"] == "Inverse vol") &
             (all_metrics["Scenario"] == "gross") &
             (all_metrics["Period"] == "OOS"), "Sharpe"
         ].values[0]
         for scen in list(scenarios.keys()):
             net_sr = all_metrics.loc[
-                (all_metrics["Method"] == "Fixed weights") &
+                (all_metrics["Method"] == "Inverse vol") &
                 (all_metrics["Scenario"] == scen) &
                 (all_metrics["Period"] == "OOS"), "Sharpe"
             ]
@@ -1410,7 +1358,7 @@ def run_asset_tc(
                 if scen == "gross":
                     r_s = r_gross
                 else:
-                    key = ("Fixed weights", scen)
+                    key = ("Inverse vol", scen)
                     if key not in returns_df.columns:
                         continue
                     r_s = returns_df[key].dropna()
@@ -1445,7 +1393,7 @@ def run_asset_tc(
             # Annotate OOS Sharpe for each scenario on the right margin
             for scen, (color, _, _, _) in scen_styles.items():
                 row = all_metrics.loc[
-                    (all_metrics["Method"] == "Fixed weights") &
+                    (all_metrics["Method"] == "Inverse vol") &
                     (all_metrics["Scenario"] == scen) &
                     (all_metrics["Period"] == "OOS")
                 ]
@@ -1461,7 +1409,7 @@ def run_asset_tc(
             ax.set_ylabel("Wealth index", fontsize=10)
             ax.set_title(
                 f"Cross-Asset Blend — TC Sensitivity  "
-                f"(Fixed weights, lookback={lookback}m, λ={lam}, "
+                f"(static inverse-vol, "
                 f"vol target={vol_target*100:.0f}%)",
                 fontsize=10,
             )
@@ -1482,8 +1430,8 @@ def run_asset_tc(
             if verbose:
                 print(f"\n  [plot skipped: {e}]")
 
-    # ── 6. Return base-scenario fixed-weights series ─────────────────────────
-    base_key = ("Fixed weights", "base")
+    # ── 6. Return base-scenario series ─────────────────────────
+    base_key = ("Inverse vol", "base")
     r_base = returns_df[base_key].dropna() if base_key in returns_df.columns else r_gross
     r_base.name = "asset_blend_net"
     return r_base

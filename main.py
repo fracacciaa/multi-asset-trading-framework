@@ -7,7 +7,7 @@ Steps
 2. Rates      run_blend()         daily return series (IS + OOS)
 3. FX         run_fx_blend()      monthly return series (IS + OOS)
 4. Commodities run_comm_blend()   daily return series (IS + OOS)
-5. Cross-asset run_asset_blend()  monthly blended portfolio (Rolling Ridge MSRR)
+5. Cross-asset run_asset_tc()     monthly static inverse-vol blend, 10% vol target
 """
 
 import sys
