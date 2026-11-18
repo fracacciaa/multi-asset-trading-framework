@@ -567,8 +567,7 @@ def _build_position_turnover_series() -> pd.DataFrame:
     ).resample("BME").last().rename("rates")
 
     # ── FX ────────────────────────────────────────────────────────────────────
-    _FX_SDIR = _Path(__file__).parent / "fx" / "signals"
-    from fx.blend import run_fx_blend as _run_fx_blend
+    from fx.blend import run_fx_blend as _run_fx_blend, _SIGNALS_DIR as _FX_SDIR
     with contextlib.redirect_stdout(_io.StringIO()):
         _fx_res = _run_fx_blend()
 

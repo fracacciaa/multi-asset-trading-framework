@@ -434,7 +434,7 @@ def load_eq_returns(signals_dir: str | None = None) -> pd.Series:
     Load the pre-computed IS+OOS equities production return series from parquet.
 
     Mirrors load_managed_returns() in rates/fx/commodities — no Bloomberg required.
-    Regenerate with: python -m equities.export_signals
+    Regenerate with: python -m equities.production.pipeline
     """
     path = os.path.join(signals_dir or _SIGNALS_DIR, "eq_prod_returns.parquet")
     df = pd.read_parquet(path)
@@ -448,7 +448,7 @@ def load_combined_positions(signals_dir: str | None = None) -> pd.DataFrame:
     Load the pre-computed blended instrument-level positions from parquet.
 
     Used by asset_blend._build_position_turnover_series() for equities TO.
-    Regenerate with: python -m equities.export_signals
+    Regenerate with: python -m equities.production.pipeline
     """
     path = os.path.join(signals_dir or _SIGNALS_DIR, "combined_positions.parquet")
     return pd.read_parquet(path)
@@ -1130,3 +1130,49 @@ def compare_blend_methods(
     print("  " + "─" * (22 + col_w * len(names)))
 
     return df
+
+
+def export_signals(
+    signals_dir: str | None = None,
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+    lam: float = 0.01,
+) -> None:
+    """
+    Write the parquets read by load_eq_returns() / load_combined_positions():
+    eq_prod_returns, combined_positions and one {signal}_positions per production
+    signal.  Same construction as run_eq_prod (tc_bps = 0).
+    """
+    from equities.data import fetch_prices
+    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+    from core.backtest import run_backtest
+
+    out = signals_dir or _SIGNALS_DIR
+    os.makedirs(out, exist_ok=True)
+
+    positions = _load_or_build_positions(False, verbose=False)
+    positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
+    vf_data        = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
+    vf_rebal_dates = set(vf_data["rebal_dates"])
+
+    prices  = fetch_prices(tickers=None)
+    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    ret_is  = returns.loc[returns.index <= is_end]
+    ret_oos = returns.loc[returns.index >= oos_start]
+
+    F_is     = build_managed_returns({k: v.loc[v.index <= is_end] for k, v in positions.items()}, ret_is)
+    combined = combine_signals(positions, msrr_ridge(F_is, lam=lam))
+    sig_fn   = _make_signal_fn(combined)
+    bt_is  = run_backtest(ret_is,  sig_fn, rebalance_dates=vf_rebal_dates, transaction_cost_bps=0.0)
+    bt_oos = run_backtest(ret_oos, sig_fn, rebalance_dates=vf_rebal_dates, transaction_cost_bps=0.0)
+    full_ret = pd.concat([bt_is["daily_return"], bt_oos["daily_return"]]).sort_index()
+
+    full_ret.rename("eq_prod").to_frame().to_parquet(os.path.join(out, "eq_prod_returns.parquet"))
+    combined.to_parquet(os.path.join(out, "combined_positions.parquet"))
+    for k, v in positions.items():
+        v.to_parquet(os.path.join(out, f"{k}_positions.parquet"))
+    print(f"Wrote eq_prod_returns, combined_positions and {len(positions)} signal position files to {out}")
+
+
+if __name__ == "__main__":
+    export_signals()
