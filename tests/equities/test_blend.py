@@ -250,7 +250,8 @@ def test_fit_static_returns_all_methods():
     signals, fwd_ret, _, _, _ = _make_positions()
     result = fit_static(signals, fwd_ret)
     expected_keys = {
-        "equal_weight", "sh_p1", "sh_p2", "msrr_ols", "msrr_ridge",
+        "equal_weight", "inv_vol", "erc", "hrp",
+        "sh_p1", "sh_p2", "msrr_ols", "msrr_ridge",
         "enet", "lasso", "c_enet", "e_enet", "e_lasso",
         "inv_msfe", "pcr", "pls",
     }
