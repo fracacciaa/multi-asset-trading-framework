@@ -574,26 +574,20 @@ def tc_sweep_comm(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     oos_start: str = OOS_START,
-    lookback: int = 252,
-    min_obs: int = 252,
     vol_target: float = 0.10,
     lam: float = 0.01,
     _collect_returns: bool = False,
 ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """
-    TC sensitivity sweep for the commodities blend (two methods).
+    TC sensitivity sweep for the commodities blend (fixed static-Ridge weights).
 
     TC approximation: instrument-level position parquets are not available here
     (only pre-computed signal PnL parquets), so TC is modelled as a fixed annual
     drag applied equally to all signals.  Scenarios express estimated cost as
     spread × annual instrument-level TO (see TC_SCENARIOS_COMM for defaults).
 
-    Method 1 — Fixed weights (Static Ridge): IS-fitted static Ridge weights held
-        constant across all scenarios; only the TC cost changes.  Shows pure TC impact.
-
-    Method 2 — Adaptive Rolling Ridge: Rolling Ridge re-fit per TC scenario on
-        TC-adjusted IS returns.  For commodities TC is uniform across signals, so
-        this mainly reflects the static vs rolling blend architecture difference.
+    Fixed weights (Static Ridge): IS-fitted static Ridge weights held constant
+    across all scenarios; only the TC cost changes.  Shows pure TC impact.
 
     Parameters
     ----------
@@ -601,8 +595,6 @@ def tc_sweep_comm(
     signals_dir     Path to signal parquets.  Default: commodities/signals/.
     is_end          Last IS date (inclusive).  Default: IS_END.
     oos_start       First OOS date (inclusive).  Default: OOS_START.
-    lookback        Rolling window for Adaptive Ridge.  Default: 252.
-    min_obs         Min observations before Rolling Ridge activates.  Default: 252.
     vol_target      Used only for MDD computation.  Default: 0.10.
     lam             Ridge penalty.  Default: 0.01.
     _collect_returns  Internal flag: when True returns (df, returns_df) tuple.
@@ -656,10 +648,6 @@ def tc_sweep_comm(
     def _blend_to(w_df: pd.DataFrame, F_n: pd.DataFrame) -> float:
         return _drift_to(w_df, F_n * vol_target, freq=252, l1_norm=True)
 
-    def _norm_w(w_df: pd.DataFrame) -> pd.DataFrame:
-        norm = w_df.abs().sum(axis=1).replace(0.0, np.nan)
-        return w_df.div(norm, axis=0)
-
     records = []
     _returns_dict: dict[tuple, pd.Series] = {}
 
@@ -695,45 +683,13 @@ def tc_sweep_comm(
                 pd.concat([r_is_f, r_oos_f]).sort_index()
             )
 
-        # ── Method 2: Adaptive Rolling Ridge ─────────────────────────────────
-        model = _RollingMSRR(penalty="ridge", lam=lam, lookback=lookback, min_obs=min_obs)
-        model.fit(F_is_n)
-        w_is_a  = _norm_w(model._weights_history)
-        w_oos_a = _norm_w(model.predict_weights(F_oos_n))
-
-        valid_is  = w_is_a.dropna(how="all")
-        valid_oos = w_oos_a.dropna(how="all")
-        r_is_a  = ((F_is_free.loc[valid_is.index]   * valid_is).sum(axis=1)
-                   - (valid_is.abs()  * c_n).sum(axis=1))
-        r_oos_a = ((F_oos_free.loc[valid_oos.index] * valid_oos).sum(axis=1)
-                   - (valid_oos.abs() * c_n).sum(axis=1))
-
-        for period, r, w in [("IS", r_is_a, w_is_a), ("OOS", r_oos_a, w_oos_a)]:
-            records.append({
-                "Method":   "Adaptive Ridge",
-                "Scenario": scenario_name,
-                "Period":   period,
-                "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r),
-                "TO":       _blend_to(w, F_is_n if period == "IS" else F_oos_n),
-            })
-
-        if _collect_returns:
-            _returns_dict[("Adaptive Ridge", scenario_name)] = (
-                pd.concat([r_is_a, r_oos_a]).sort_index()
-            )
-
     df = pd.DataFrame(records)
 
     # ── Print table ───────────────────────────────────────────────────────────
     W = 82
-    for method in ["Fixed weights", "Adaptive Ridge"]:
+    for method in ["Fixed weights"]:
         sub = df[df["Method"] == method]
-        label = (
-            "FIXED WEIGHTS (Static Ridge, IS-fitted) — only TC cost deducted"
-            if method == "Fixed weights"
-            else "ADAPTIVE RIDGE (Rolling Ridge) — re-fit per TC scenario"
-        )
+        label = "FIXED WEIGHTS (Static Ridge, IS-fitted) — only TC cost deducted"
         print("\n" + "=" * W)
         print(f"  COMMODITIES TC SWEEP — {label}")
         print(f"  IS ≤ {is_end}   |   OOS ≥ {oos_start}   |   λ={lam}")
@@ -773,8 +729,6 @@ def run_comm_tc(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     oos_start: str = OOS_START,
-    lookback: int = 252,
-    min_obs: int = 252,
     vol_target: float = 0.10,
     lam: float = 0.01,
 ) -> dict:
@@ -789,7 +743,7 @@ def run_comm_tc(
     """
     df, returns_df = tc_sweep_comm(
         scenarios=scenarios, signals_dir=signals_dir, is_end=is_end,
-        oos_start=oos_start, lookback=lookback, min_obs=min_obs,
+        oos_start=oos_start,
         vol_target=vol_target, lam=lam, _collect_returns=True,
     )
     return {"metrics": df, "returns": returns_df}

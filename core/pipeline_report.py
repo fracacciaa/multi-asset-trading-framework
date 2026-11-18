@@ -149,7 +149,7 @@ def print_row(label: str, row: dict, label_w: int) -> None:
 def print_tc(tc_df: pd.DataFrame, title: str, cfg: ReportCfg, label_w: int = 30) -> None:
     """Print a tc_sweep_* metrics frame ([Method, Scenario, Period, Sharpe, MDD_pct, TO])."""
     header(title, label_w, cfg.sub)
-    for method in ("Fixed weights", "Adaptive Ridge"):
+    for method in dict.fromkeys(tc_df["Method"]):
         print(f"  [{method}]")
         for name in dict.fromkeys(tc_df["Scenario"]):
             m = tc_df[(tc_df["Method"] == method) & (tc_df["Scenario"] == name)]

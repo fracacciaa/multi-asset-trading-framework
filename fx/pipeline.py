@@ -7,7 +7,7 @@ turnover for IS (≤ blend.IS_END) and OOS (≥ blend.OOS_START) at four levels:
   1. markets     per signal × per currency pair
   2. signals     inverse-vol cross-pair blend of each signal (momentum, mr_ns_loo, carry_xs)
   3. composites  rolling-Ridge blends of every subset (≥2) of the signals
-  4. TC-aware    tc_sweep_fx scenarios (best / base / worst), both methods
+  4. TC-aware    tc_sweep_fx scenarios (best / base / worst), fixed weights
 
 Conventions: see core/pipeline_report.py.  Positions are month-end snapshots
 (mr_ns_loo positions are sampled at the last business day of each month, as in

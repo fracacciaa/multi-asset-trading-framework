@@ -8,7 +8,7 @@ for IS (≤ blend.IS_END) and OOS (≥ blend.OOS_START) at four levels:
   1. markets     per signal × per instrument
   2. signals     inverse-vol cross-instrument blend of each signal
   3. composites  static-Ridge (IS-fit) blends of every subset (≥2) of the signals
-  4. TC-aware    tc_sweep_comm scenarios (best / base / worst), both methods
+  4. TC-aware    tc_sweep_comm scenarios (best / base / worst), fixed weights
 
 Conventions: see core/pipeline_report.py.  Turnover is instrument-level on the
 weekly-rebalanced vol-scaled weights, scaled by the inv-vol instrument
@@ -37,8 +37,6 @@ def run_commodities_pipeline(
     signals_dir: Optional[str | Path] = None,
     params: Optional[dict] = None,
     lam: float = 0.01,
-    lookback: int = 252,
-    min_obs: int = 252,
     vol_target: float = 0.10,
     scenarios: Optional[dict] = None,
 ) -> dict:
@@ -55,7 +53,6 @@ def run_commodities_pipeline(
     signals_dir      Parquet directory (default commodities/signals/).
     params           Pipeline parameters (default blend.BLEND_PARAMS).
     lam              Ridge penalty for the static-Ridge composites.
-    lookback, min_obs  Rolling-Ridge settings for the TC sweep's adaptive method.
     vol_target       Annual vol used for MDD scaling.
     scenarios        TC scenarios (default blend.TC_SCENARIOS_COMM: best/base/worst).
 
@@ -139,8 +136,7 @@ def run_commodities_pipeline(
     # ── stage 4: TC-aware scenarios ───────────────────────────────────────────
     with contextlib.redirect_stdout(io.StringIO()):
         tc = _b.run_comm_tc(
-            scenarios=scenarios, signals_dir=sdir, lookback=lookback,
-            min_obs=min_obs, vol_target=vol_target, lam=lam,
+            scenarios=scenarios, signals_dir=sdir, vol_target=vol_target, lam=lam,
         )
     R.print_tc(tc["metrics"],
                "STAGE 4 — TC-AWARE SCENARIOS (all 3 signals, uniform annual cost drag)", cfg)

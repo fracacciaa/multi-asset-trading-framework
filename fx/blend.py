@@ -524,12 +524,9 @@ def tc_sweep_fx(
     """
     TC sensitivity sweep for the FX blend with market-specific forward spreads.
 
-    Runs two parallel sweeps (same logic as tc_sweep_rates in rates/blend.py):
-      Fixed weights  — Rolling Ridge fit ONCE on TC-free signals; only the TC
-                       deduction changes across scenarios.  Pure cost impact,
-                       Sharpe decreases monotonically with higher TC.
-      Adaptive Ridge — Rolling Ridge RE-FIT on TC-adjusted IS per scenario;
-                       blend weights shift away from high-TC signals as costs rise.
+    Fixed weights: the rolling Ridge is fit ONCE on TC-free signals; only the TC
+    deduction changes across scenarios (same logic as tc_sweep_rates).  Pure cost
+    impact, Sharpe decreases monotonically with higher TC.
 
     TC is deducted AFTER blend weighting (cost scales with |w|, no rebate from
     negative weights), per signal:
@@ -552,7 +549,7 @@ def tc_sweep_fx(
     Returns
     -------
     pd.DataFrame with columns [Method, Scenario, Period, Sharpe, MDD_pct, TO].
-    Method is "Fixed weights" or "Adaptive Ridge".
+    Method is always "Fixed weights".
     When _collect_returns=True (used internally by run_fx_tc), returns a tuple
     (df, returns_df) where returns_df is a DataFrame with MultiIndex columns
     (Method, Scenario) containing the IS+OOS combined monthly return series.
@@ -707,51 +704,13 @@ def tc_sweep_fx(
                 [r_is_f, r_oos_f]
             ).sort_index()
 
-        # ── Method 2: Adaptive Ridge — re-fit per TC scenario ─────────────────
-        sigma_tc = F_tc_is.std() * np.sqrt(12)
-        sigma_tc = sigma_tc.replace(0.0, np.nan)
-        F_tc_is_n2  = F_tc_is.div(sigma_tc)
-        F_tc_oos_n2 = F_tc_oos.div(sigma_tc)
-
-        model_tc = RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
-        model_tc.fit(F_tc_is_n2)
-        w_is_a  = model_tc._weights_history
-        w_oos_a = model_tc.predict_weights(F_tc_oos_n2)
-        # Weights are fitted on net returns but realised as Σ w·gross − Σ |w|·cost
-        r_is_a  = _net_return(F_free_is.loc[F_tc_is.index].div(sigma_tc),
-                              C_tc.loc[F_tc_is.index].div(sigma_tc), w_is_a)
-        r_oos_a = _net_return(F_free_oos.loc[F_tc_oos.index].div(sigma_tc),
-                              C_tc.loc[F_tc_oos.index].div(sigma_tc), w_oos_a)
-
-        for period, r, w, t0, t1 in [
-            ("IS",  r_is_a,  w_is_a,  F_tc_is_n2.index[0],  F_tc_is_n2.index[-1]),
-            ("OOS", r_oos_a, w_oos_a, F_tc_oos_n2.index[0], F_tc_oos_n2.index[-1]),
-        ]:
-            records.append({
-                "Method":   "Adaptive Ridge",
-                "Scenario": scenario_name,
-                "Period":   period,
-                "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r),
-                "TO":       _to(w, sigma_tc, t0, t1),
-            })
-
-        if _collect_returns:
-            _returns_dict[("Adaptive Ridge", scenario_name)] = pd.concat(
-                [r_is_a, r_oos_a]
-            ).sort_index()
-
     df = pd.DataFrame(records)
 
     # ── Print results ─────────────────────────────────────────────────────────
     W = 80
-    for method in ["Fixed weights", "Adaptive Ridge"]:
+    for method in ["Fixed weights"]:
         sub = df[df["Method"] == method]
-        label = (
-            "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
-            if method == "Fixed weights"
-            else "ADAPTIVE RIDGE — Ridge re-fit per TC scenario"
-        )
+        label = "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
         print("\n" + "=" * W)
         print(f"  FX  |  {label}")
         print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  vol target={vol_target*100:.0f}%  |  monthly")

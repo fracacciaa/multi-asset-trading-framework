@@ -7,7 +7,7 @@ and turnover for IS (≤ blend.IS_END) and OOS (≥ blend.OOS_START) at four lev
   1. markets     per signal × per market
   2. signals     inverse-vol cross-market blend of each signal
   3. composites  rolling-Ridge blends of every subset (≥2) of the signals
-  4. TC-aware    tc_sweep_rates scenarios (best / base / worst), both methods
+  4. TC-aware    tc_sweep_rates scenarios (best / base / worst), fixed weights
 
 Conventions: see core/pipeline_report.py.  Signal and composite turnover use
 positions scaled by the inv-vol market weights (and by the Ridge weights for
