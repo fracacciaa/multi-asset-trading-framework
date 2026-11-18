@@ -292,6 +292,18 @@ def load_monthly_managed_returns(
     return F
 
 
+def roll_weights_full(
+    model: "RollingMSRR", F_is: pd.DataFrame, F_oos: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Rolling weights over the concatenated IS+OOS history, split back at the IS/OOS
+    boundary. model.predict_weights(F_oos) would restart the lookback at the first
+    OOS month, leaving the first min_obs OOS months without weights.
+    """
+    w_all = model._roll(pd.concat([F_is, F_oos]).sort_index())
+    return w_all.reindex(F_is.index).dropna(how="all"), w_all.reindex(F_oos.index).dropna(how="all")
+
+
 def combined_return_rolling(
     F: pd.DataFrame,
     weights_history: pd.DataFrame,
@@ -349,9 +361,7 @@ def run_fx_blend(
     F_oos = F_oos_raw.div(sigma)
 
     model = RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
-    model.fit(F_is)
-    w_is  = model._weights_history
-    w_oos = model.predict_weights(F_oos)
+    w_is, w_oos = roll_weights_full(model, F_is, F_oos)
 
     return {
         "weights_history": w_is,
@@ -567,30 +577,36 @@ def tc_sweep_fx(
     pos_cxs = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
     pos_mr  = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")  # daily
 
-    # ── Gross managed returns (TC-free, matches load_monthly_managed_returns) ─
-    pnl_mom = (pos_mom.shift(1) * rx_m.reindex(columns=pos_mom.columns)).sum(axis=1)
-    pnl_mr  = ((pos_mr * rx_d.reindex(columns=pos_mr.columns)).sum(axis=1)
-               .resample("BME").sum())
-    pnl_cxs = (pos_cxs.shift(1) * rx_m.reindex(columns=pos_cxs.columns)).sum(axis=1)
+    # ── Gross managed returns: identical to the production F (inv-vol pairs) ──
+    F_gross = load_monthly_managed_returns(signals_dir=sdir, cross_pair_is_end=is_end)
 
-    F_gross = pd.DataFrame({
-        "momentum":  pnl_mom,
-        "mr_ns_loo": pnl_mr,
-        "carry_xs":  pnl_cxs,
-    }).dropna().sort_index()
+    # Frozen cross-pair weights per signal (same as load_monthly_managed_returns)
+    pair_pnl = {
+        "momentum":  pos_mom.shift(1) * rx_m.reindex(columns=pos_mom.columns),
+        "mr_ns_loo": (pos_mr * rx_d.reindex(columns=pos_mr.columns)).resample("BME").sum(),
+        "carry_xs":  pos_cxs.shift(1) * rx_m.reindex(columns=pos_cxs.columns),
+    }
+    pair_w: dict[str, pd.Series] = {}
+    for sig, df in pair_pnl.items():
+        w = (_pair_inv_vol_weights(df, is_end)
+             if CROSS_PAIR_BLEND.get(sig, "inv_vol") == "inv_vol" else None)
+        pair_w[sig] = w if w is not None else pd.Series(1.0, index=df.columns)
 
-    # ── Precompute per-pair |Δpos| (factor out of scenario loop) ─────────────
+    def _wcols(df: pd.DataFrame, sig: str) -> pd.DataFrame:
+        return df.mul(pair_w[sig].reindex(df.columns).fillna(0.0), axis=1)
+
+    # ── Precompute weighted per-pair |Δpos| (factor out of scenario loop) ─────
     # momentum / carry_xs: monthly rebalance → one TC event per month per pair
-    dpos_mom = pos_mom.diff().abs()      # monthly, per pair
-    dpos_cxs = pos_cxs.diff().abs()      # monthly, per pair
+    dpos_mom = _wcols(pos_mom.diff().abs(), "momentum")
+    dpos_cxs = _wcols(pos_cxs.diff().abs(), "carry_xs")
     # mr_ns_loo: daily rebalance → accumulate daily TC within each month, per pair
-    dpos_mr_m = pos_mr.diff().abs().resample("BME").sum()  # monthly, per pair
+    dpos_mr_m = _wcols(pos_mr.diff().abs().resample("BME").sum(), "mr_ns_loo")
 
-    # Monthly positions for blended-pair TO computation (mirrors run_fx_prod)
+    # Monthly pair-weighted positions for blended-pair TO computation
     monthly_pos = {
-        "momentum":  pos_mom,
-        "mr_ns_loo": pos_mr.resample("BME").last(),
-        "carry_xs":  pos_cxs,
+        "momentum":  _wcols(pos_mom, "momentum"),
+        "mr_ns_loo": _wcols(pos_mr.resample("BME").last(), "mr_ns_loo"),
+        "carry_xs":  _wcols(pos_cxs, "carry_xs"),
     }
     common_pairs = sorted(
         set.intersection(*[set(p.columns) for p in monthly_pos.values()])
@@ -647,9 +663,7 @@ def tc_sweep_fx(
     F_free_oos_n = F_free_oos.div(sigma_free)
 
     model_free = RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
-    model_free.fit(F_free_is_n)
-    w_is_fixed  = model_free._weights_history
-    w_oos_fixed = model_free.predict_weights(F_free_oos_n)
+    w_is_fixed, w_oos_fixed = roll_weights_full(model_free, F_free_is_n, F_free_oos_n)
 
     # ── Sweep ─────────────────────────────────────────────────────────────────
     records = []
@@ -875,15 +889,11 @@ def compare_blend_methods(
 
     # ── Method 1: Rolling OLS ────────────────────────────────────────────────
     model_ols = RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)
-    model_ols.fit(F_is)
-    w_ols_is  = model_ols._weights_history
-    w_ols_oos = model_ols.predict_weights(F_oos)
+    w_ols_is, w_ols_oos = roll_weights_full(model_ols, F_is, F_oos)
 
     # ── Method 2: Rolling Ridge ──────────────────────────────────────────────
     model_ridge = RollingMSRR(penalty="ridge", lam=ridge_lam, lookback=lookback, min_obs=min_obs)
-    model_ridge.fit(F_is)
-    w_ridge_is  = model_ridge._weights_history
-    w_ridge_oos = model_ridge.predict_weights(F_oos)
+    w_ridge_is, w_ridge_oos = roll_weights_full(model_ridge, F_is, F_oos)
 
     # ── Method 3: Static Ridge (IS-fit, constant weights) ───────────────────
     static_bw  = msrr_ridge(F_is, lam=ridge_lam)

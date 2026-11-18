@@ -13,7 +13,7 @@ Conventions: see core/pipeline_report.py.  Positions are month-end snapshots
 (mr_ns_loo positions are sampled at the last business day of each month, as in
 run_fx_prod), so mr_ns_loo turnover excludes intra-month trading.  Signal and
 composite turnover use positions scaled by the inv-vol pair weights; the TC
-table's turnover comes from tc_sweep_fx, which does not apply the pair weights.
+table's turnover comes from tc_sweep_fx, which applies the same pair weights.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def run_fx_pipeline(
     signals_dir: Optional[str | Path] = None,
     lookback: int = 36,
     min_obs: int = 36,
-    tc_min_obs: int = 24,
+    tc_min_obs: Optional[int] = None,
     vol_target: float = 0.10,
     scenarios: Optional[dict] = None,
     verbose: bool = True,
@@ -55,7 +55,8 @@ def run_fx_pipeline(
     signals_dir        Parquet directory (default fx/signals/).
     lookback, min_obs  Rolling Ridge MSRR settings for composites (months;
                        defaults match run_fx_prod).
-    tc_min_obs         min_obs for the TC sweep (default matches run_fx_tc).
+    tc_min_obs         min_obs for the TC sweep (default: same as min_obs, so net and
+                       gross share the same IS sample).
     vol_target         Annual vol used for MDD scaling.
     scenarios          TC scenarios (default blend.TC_SCENARIOS_FX: best/base/worst).
     verbose            Print signal-pipeline progress.
@@ -151,8 +152,7 @@ def run_fx_pipeline(
     for subset in subsets:
         cols = list(subset)
         model = _b.RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
-        model.fit(F_is[cols])
-        w_all = pd.concat([model._weights_history, model.predict_weights(F_oos[cols])]).sort_index()
+        w_all = pd.concat(_b.roll_weights_full(model, F_is[cols], F_oos[cols])).sort_index()
         r = _b.combined_return_rolling(F_n[cols], w_all)
         row = R.metrics(
             r,
@@ -169,7 +169,7 @@ def run_fx_pipeline(
     with contextlib.redirect_stdout(io.StringIO()):
         tc = _b.run_fx_tc(
             scenarios=scenarios, signals_dir=sdir,
-            lookback=lookback, min_obs=tc_min_obs, vol_target=vol_target,
+            lookback=lookback, min_obs=tc_min_obs or min_obs, vol_target=vol_target,
         )
     R.print_tc(tc["metrics"],
                "STAGE 4 — TC-AWARE SCENARIOS (all 3 signals, pair-specific forward spreads)", cfg)
