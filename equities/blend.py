@@ -1017,16 +1017,21 @@ def hrp_blend(F: pd.DataFrame) -> BlendWeights:
         raise ImportError("scipy is required for hrp_blend.") from e
 
     names    = list(F.columns)
-    corr     = F.corr().values
-    cov      = F.cov().values
+    corr     = F.corr().fillna(0.0).values   # NaN → 0 (uncorrelated) for near-constant columns
+    np.fill_diagonal(corr, 1.0)
+    cov      = F.cov().fillna(0.0).values
     K        = len(names)
 
     # 1. Distance matrix d_ij = sqrt((1 − ρ_ij) / 2)
     dist = np.sqrt(np.clip((1.0 - corr) / 2.0, 0.0, 1.0))
+    dist = (dist + dist.T) / 2.0   # symmetrise to guard against float rounding
     np.fill_diagonal(dist, 0.0)
+    # Extract upper triangle as condensed form — squareform's square→condensed path
+    # rejects matrices with floating-point asymmetry, so bypass it.
+    condensed = dist[np.triu_indices(K, k=1)]
 
     # 2. Single-linkage clustering → sorted leaf order
-    link     = linkage(squareform(dist), method="single")
+    link     = linkage(condensed, method="single")
     sort_idx = list(leaves_list(link))
 
     # 3. Recursive bisection
