@@ -14,5 +14,11 @@ script1.py
 *.pdf
 *.png
 *.parquet
+!rates/signals/*.parquet
+!fx/signals/*.parquet
+!equities/signals/*.parquet
+!commodities/signals/*.parquet
+!core/cache/*.parquet
 equities/cache/
-cache/
+equities/production/cache/
+rates/production/carry/cache/
