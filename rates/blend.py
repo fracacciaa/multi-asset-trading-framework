@@ -433,7 +433,7 @@ def tc_sweep_rates(
     (cost scales with |w|, so a negative weight never earns a rebate):
       carry          : |Δpos_dv01_m| × h_bp_m          (DV01-normalized, PnL in bp)
       momentum       : |Δpos_m| × h_bp_m × eff_dur      (vol-scaled pos, PnL in bp)
-      mean_reversion : |Δ(z×DV01)_m| × h_bp_m / 100    (DV01-scaled pos, PnL in year·%)
+      mean_reversion : |Δ(z×DV01)_m| × h_bp_m            (DV01-scaled pos, PnL in bp)
 
     Parameters
     ----------
