@@ -74,9 +74,9 @@ ASSET_CLASSES = ["equities", "rates", "fx", "commodities"]
 # Rates / FX / commodities use their own "best"/"base"/"worst" labels.
 # Equities uses numeric one-way TC bps (no named scenarios in tc_sweep_eq).
 TC_SCENARIOS_ASSETS: dict[str, dict] = {
-    "best":  {"rates": "best",  "fx": "best",  "commodities": "best",  "equities": 0.25},
-    "base":  {"rates": "base",  "fx": "base",  "commodities": "base",  "equities": 0.50},
-    "worst": {"rates": "worst", "fx": "worst", "commodities": "worst", "equities": 1.00},
+    "scenario 1": {"rates": "best",  "fx": "best",  "commodities": "best",  "equities": 0.25},
+    "scenario 2": {"rates": "base",  "fx": "base",  "commodities": "base",  "equities": 0.50},
+    "scenario 3": {"rates": "worst", "fx": "worst", "commodities": "worst", "equities": 1.00},
 }
 
 
@@ -1305,7 +1305,7 @@ def run_asset_tc(
                     print("  " + "─" * (W - 2))
                 prev = scen
                 for _, row in rows.iterrows():
-                    tag = " [prod]" if scen == "base" else ""
+                    tag = " [prod]" if scen == "scenario 2" else ""
                     label_scen = f"{scen}{tag}"
                     sr  = f"{row['Sharpe']:+.2f}"  if np.isfinite(row["Sharpe"])  else "   n/a"
                     mdd = f"{row['MDD_pct']:.1f}%"  if np.isfinite(row["MDD_pct"]) else "   n/a"
@@ -1331,7 +1331,7 @@ def run_asset_tc(
             ]
             if net_sr.empty:
                 continue
-            tag = " ← production" if scen == "base" else ""
+            tag = " ← production" if scen == "scenario 2" else ""
             diff = net_sr.values[0] - gross_oos_sr
             print(f"  {scen:<8}  {net_sr.values[0]:+.2f}  "
                   f"(Δ {diff:+.2f} vs gross){tag}")
@@ -1346,9 +1346,9 @@ def run_asset_tc(
             is_split = pd.Timestamp(is_end)
             scen_styles = {
                 "gross": ("#1a237e", 2.0, "-",  "gross (no TC)"),
-                "best":  ("#43a047", 1.4, "--", "best TC"),
-                "base":  ("#e65100", 1.8, "-",  "base TC  [production]"),
-                "worst": ("#b71c1c", 1.4, ":",  "worst TC"),
+                "scenario 1": ("#43a047", 1.4, "--", "scenario 1"),
+                "scenario 2": ("#e65100", 1.8, "-",  "scenario 2  [production]"),
+                "scenario 3": ("#b71c1c", 1.4, ":",  "scenario 3"),
             }
 
             fig, ax = plt.subplots(figsize=(12, 6))
@@ -1431,7 +1431,7 @@ def run_asset_tc(
                 print(f"\n  [plot skipped: {e}]")
 
     # ── 6. Return base-scenario series ─────────────────────────
-    base_key = ("Inverse vol", "base")
+    base_key = ("Inverse vol", "scenario 2")
     r_base = returns_df[base_key].dropna() if base_key in returns_df.columns else r_gross
     r_base.name = "asset_blend_net"
     return r_base
