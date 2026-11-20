@@ -34,7 +34,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from fx.ns_fwd import (
+from fx.production.ns_fwd import (
     build_fwd_panel,
     compute_xs_positions,
     _hat_matrices_k,

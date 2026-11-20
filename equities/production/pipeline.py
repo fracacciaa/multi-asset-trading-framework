@@ -74,7 +74,7 @@ _VF_DATA_CACHE          = os.path.join(os.path.dirname(__file__), "cache", "vf_d
 _VF_DATA_RESEARCH_CACHE = os.path.join(os.path.dirname(__file__), "cache", "vf_data_research.pkl")
 _VF_POSITIONS_CACHE     = os.path.join(os.path.dirname(__file__), "cache", "vf_positions.pkl")
 
-_SIGNALS_DIR = os.path.join(os.path.dirname(__file__), "signals")
+_SIGNALS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "signals")
 _EQ_RETURNS_PARQUET   = os.path.join(_SIGNALS_DIR, "eq_prod_returns.parquet")
 _COMBINED_POS_PARQUET = os.path.join(_SIGNALS_DIR, "combined_positions.parquet")
 
@@ -105,9 +105,9 @@ def _load_or_build_vf_data(prices, fundamentals, returns, rebuild=False, verbose
 
     if verbose:
         print("Building VF data — this takes a few minutes …")
-    from equities.signals import build_vf_data
+    from equities.production.signal_lib import build_vf_data
     if prices is None or fundamentals is None or returns is None:
-        from equities.data import fetch_prices, fetch_fundamentals
+        from equities.production.data import fetch_prices, fetch_fundamentals
         prices       = fetch_prices(tickers=None) if prices is None else prices
         fundamentals = fetch_fundamentals(tickers=None) if fundamentals is None else fundamentals
         returns      = prices.pct_change(fill_method=None) if returns is None else returns
@@ -145,7 +145,7 @@ def _load_or_build_research_vf_data(prices, fundamentals, rebuild=False, verbose
     with open(_VF_DATA_CACHE, "rb") as fh:
         prod_vf = pickle.load(fh)
 
-    from equities.signals import (
+    from equities.production.signal_lib import (
         residual_momentum, fip_momentum, high_52w,
         industry_reversal, medium_reversal,
         residual_reversal, vol_scaled_reversal,
@@ -232,8 +232,8 @@ def run_eq_signals(
         {"is":  {"sharpe", "max_drawdown", "ann_turnover"},
          "oos": {"sharpe", "max_drawdown", "ann_turnover"}}
     """
-    from equities.data import fetch_prices, fetch_fundamentals
-    from equities.signals import apply_vf_params
+    from equities.production.data import fetch_prices, fetch_fundamentals
+    from equities.production.signal_lib import apply_vf_params
     from core.backtest import run_backtest
 
     prices       = fetch_prices(tickers=None)
@@ -284,8 +284,8 @@ def run_vf_ablation(
     -------
     dict[config_name, dict[signal_name, {"is_sharpe", "oos_sharpe"}]]
     """
-    from equities.data import fetch_prices, fetch_fundamentals
-    from equities.signals import apply_vf_params
+    from equities.production.data import fetch_prices, fetch_fundamentals
+    from equities.production.signal_lib import apply_vf_params
     from equities.blend import managed_return
 
     prices       = fetch_prices(tickers=None)
@@ -352,8 +352,8 @@ def run_eq_research_signals(
          "oos": {"sharpe", "max_drawdown", "ann_turnover"},
          "family": str, "is_production": bool}
     """
-    from equities.data import fetch_prices, fetch_fundamentals
-    from equities.signals import apply_vf_params
+    from equities.production.data import fetch_prices, fetch_fundamentals
+    from equities.production.signal_lib import apply_vf_params
     from core.backtest import run_backtest
 
     prices       = fetch_prices(tickers=None)
@@ -464,8 +464,8 @@ def _load_or_build_positions(rebuild: bool = False, verbose: bool = True) -> dic
 
     if verbose:
         print("Building VF positions — this takes ~5 min …")
-    from equities.data import fetch_prices, fetch_fundamentals
-    from equities.signals import build_vf_positions
+    from equities.production.data import fetch_prices, fetch_fundamentals
+    from equities.production.signal_lib import build_vf_positions
 
     prices       = fetch_prices(tickers=None)
     fundamentals = fetch_fundamentals(tickers=None)
@@ -507,7 +507,7 @@ def try_eq_blend(
          "oos": {"sharpe", "max_drawdown", "ann_turnover"},
          "type": str}
     """
-    from equities.data import fetch_prices
+    from equities.production.data import fetch_prices
     from equities.blend import (
         build_managed_returns, combine_signals,
         equal_weight, sharpe_heuristic, msrr_ridge, msrr_lasso,
@@ -644,7 +644,7 @@ def run_eq_blend(
     -------
     pd.DataFrame : date × ticker blended position weights.
     """
-    from equities.data import fetch_prices
+    from equities.production.data import fetch_prices
     from equities.blend import build_managed_returns, msrr_ridge, combine_signals
 
     positions = _load_or_build_positions(rebuild, verbose)
@@ -695,7 +695,7 @@ def run_eq_prod(
     -------
     pd.Series : daily portfolio returns, full history (IS + OOS), name="eq_prod".
     """
-    from equities.data import fetch_prices
+    from equities.production.data import fetch_prices
     from equities.blend import build_managed_returns, msrr_ridge, combine_signals
     from core.backtest import run_backtest
 
@@ -750,7 +750,7 @@ def tc_sweep_eq(
     pd.DataFrame with columns [TC_bps, Period, Sharpe, MDD_pct, TO]
     or (df, returns_df) when _collect_returns=True.
     """
-    from equities.data import fetch_prices
+    from equities.production.data import fetch_prices
     from equities.blend import build_managed_returns, msrr_ridge, combine_signals
     from core.backtest import run_backtest
 
@@ -914,7 +914,7 @@ def _print_blend_table(result: dict, is_end: str, oos_start: str) -> None:
 
 
 def _print_ablation_table(results: dict, is_end: str, oos_start: str) -> None:
-    from equities.signals import _SIGNAL_KINDS
+    from equities.production.signal_lib import _SIGNAL_KINDS
 
     # Group: XS signals share xs/* configs; TS signals share ts/* configs
     xs_signals = [s for s, k in _SIGNAL_KINDS.items() if k == "xs"]
@@ -1003,7 +1003,7 @@ def compare_blend_methods(
     -------
     pd.DataFrame with columns [Method, Period, Sharpe, MDD, TO].
     """
-    from equities.data import fetch_prices
+    from equities.production.data import fetch_prices
     from equities.blend import (
         build_managed_returns, combine_signals,
         msrr_ridge, RollingMSRR,
@@ -1143,7 +1143,7 @@ def export_signals(
     eq_prod_returns, combined_positions and one {signal}_positions per production
     signal.  Same construction as run_eq_prod (tc_bps = 0).
     """
-    from equities.data import fetch_prices
+    from equities.production.data import fetch_prices
     from equities.blend import build_managed_returns, msrr_ridge, combine_signals
     from core.backtest import run_backtest
 

@@ -44,14 +44,14 @@ from fx.production.signal_a import build_signal_a, portfolio_returns
 from fx.production.signal_d import build_signal_d_daily
 from fx.production.signal_e import build_signal_e_daily
 from fx.production.formations import xs_weights, ts_weights
-from fx.ns_fwd import (
+from fx.production.ns_fwd import (
     build_fwd_panel,
     compute_xs_positions,
     _calibrate_lam,
     build_ns_loo_vfts_signal,
     LAM_GRID,
 )
-from fx.ns_rv import build_rv_signals, compute_halflife_table
+from fx.production.ns_rv import build_rv_signals, compute_halflife_table
 
 OUTPUT_DIR = Path(__file__).parent.parent / "signals"
 

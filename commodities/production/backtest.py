@@ -4,7 +4,7 @@ signal comparison harness.
 
 Typical usage
 -------------
-    from commodities.backtest import run_comparison, PARAMS
+    from commodities.production.backtest import run_comparison, PARAMS
     results = run_comparison()
     print(results.to_string())
 """
@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from commodities.data import (
+from commodities.production.data import (
     fetch_prices,
     fetch_prices_power,
     fetch_term_structure,
@@ -25,7 +25,7 @@ from commodities.data import (
     tenor_from_tickers,
     business_days_to_month_end_panel,
 )
-from commodities.signals import (
+from commodities.production.signals import (
     COMMODITY_SECTORS,
     tsmom,
     xs_carry_enhanced,

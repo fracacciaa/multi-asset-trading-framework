@@ -608,7 +608,7 @@ def _build_position_turnover_series() -> pd.DataFrame:
     ).rename("fx")
 
     # ── Commodities ───────────────────────────────────────────────────────────
-    from commodities.backtest import (
+    from commodities.production.backtest import (
         PARAMS as _CP,
         specific_contract_returns as _spec_rets,
         _build_signals as _cbuild,
@@ -616,7 +616,7 @@ def _build_position_turnover_series() -> pd.DataFrame:
         rebalance as _creb,
         book_scale as _cbook,
     )
-    from commodities.data import (
+    from commodities.production.data import (
         fetch_prices as _fetch_comm,
         fetch_term_structure as _fetch_ts,
         fetch_tickers as _fetch_tk,

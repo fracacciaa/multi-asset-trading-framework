@@ -14,7 +14,7 @@ Signal formation:
   5. Cross-sectional rank → long top-n / short bottom-n.
 
 Usage:
-    from fx.ns_fwd import compare
+    from fx.production.ns_fwd import compare
     compare(start="2005-01-01")
 """
 
@@ -26,7 +26,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from fx.data import fetch_spot, fetch_forwards
+from fx.production.bloomberg import fetch_spot, fetch_forwards
 from fx.production.data import (
     CARRY_PAIRS,
     PRIMARY_START,

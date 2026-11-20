@@ -116,7 +116,7 @@ def _eq_rows(is_end: str, oos_start: str) -> list[tuple[str, dict]]:
         _load_or_build_positions, _load_or_build_vf_data,
         PRODUCTION_SIGNALS, _make_signal_fn,
     )
-    from equities.data import fetch_prices
+    from equities.production.data import fetch_prices
     from equities.blend import build_managed_returns, msrr_ridge, combine_signals
     from core.backtest import run_backtest
 

@@ -18,7 +18,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from fx.data import (
+from fx.production.bloomberg import (
     FX_PAIRS,
     XXXUSD_PAIRS,
     fetch_spot,

@@ -162,8 +162,8 @@ def _signal_panels(
     w   vol-scaled, rebalanced instrument weights (T × N, before lag)
     F_i per-instrument managed returns w[t-1] × r[t] (T × N, all-NaN columns dropped)
     """
-    from commodities.data import fetch_prices, fetch_term_structure, fetch_tickers
-    from commodities.backtest import (
+    from commodities.production.data import fetch_prices, fetch_term_structure, fetch_tickers
+    from commodities.production.backtest import (
         specific_contract_returns, vol_scale, rebalance, _build_signals,
     )
 
@@ -457,11 +457,11 @@ def run_comm_prod(
     -------
     pd.Series — daily return series named "commodities", IS then OOS.
     """
-    from commodities.backtest import (
+    from commodities.production.backtest import (
         PARAMS as _PARAMS, specific_contract_returns, _build_signals,
         vol_scale, rebalance,
     )
-    from commodities.data import fetch_prices, fetch_term_structure, fetch_tickers
+    from commodities.production.data import fetch_prices, fetch_term_structure, fetch_tickers
 
     TD = 252
     p  = params or {**_PARAMS, **BLEND_PARAMS}
