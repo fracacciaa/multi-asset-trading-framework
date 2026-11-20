@@ -527,7 +527,7 @@ def tc_sweep_fx(
     is_end: str = IS_END,
     oos_start: str = OOS_START,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
     vol_target: float = 0.10,
     _collect_returns: bool = False,
 ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
@@ -775,7 +775,7 @@ def run_fx_tc(
     is_end: str = IS_END,
     oos_start: str = OOS_START,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
     vol_target: float = 0.10,
 ) -> dict:
     """
@@ -811,7 +811,7 @@ def run_fx_tc(
 def compare_blend_methods(
     signals_dir: str | Path | None = None,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
     ridge_lam: float = 0.01,
     vol_target: float = 0.10,
 ) -> pd.DataFrame:
@@ -1020,7 +1020,7 @@ def _try_fx_pair_blend(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
     vol_target: float = 0.10,
     min_pair_obs: int = 36,
 ) -> dict:
@@ -1083,11 +1083,7 @@ def _try_fx_pair_blend(
         r = r.dropna()
         if r.empty:
             return float("nan")
-        ann_vol = r.std() * np.sqrt(12)
-        if ann_vol < 1e-12:
-            return float("nan")
-        r_scaled = r * (vol_target / ann_vol)
-        cum = (1 + r_scaled).cumprod()
+        cum = (1 + r * vol_target).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _to_m(w_df: pd.DataFrame, F: pd.DataFrame) -> float:
@@ -1229,7 +1225,7 @@ def try_momentum_pair_blend(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
     vol_target: float = 0.10,
 ) -> dict:
     """
@@ -1254,7 +1250,7 @@ def try_mr_pair_blend(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
     vol_target: float = 0.10,
 ) -> dict:
     """
@@ -1278,7 +1274,7 @@ def try_carry_pair_blend(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     lookback: int = 36,
-    min_obs: int = 24,
+    min_obs: int = 36,
     vol_target: float = 0.10,
 ) -> dict:
     """

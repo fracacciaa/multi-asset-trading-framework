@@ -94,18 +94,27 @@ OOS_START = "2019-01-01"
 #   UK     — Sept 2022 Gilt/LDI crisis; bid-ask blew out 10-20× intraday
 #   EUR    — broadly liquid but ECB fragmentation episodes widen spreads
 #   AUS    — structurally smaller market; RBA YCC 2020-21 distortions
+#   NZ/SE  — small, thin OIS markets; wider than AUS across scenarios
+#   CH     — SARON OIS thin and short-history; low yield level keeps best-case tight
+#   India/China — EM, limited tenors, onshore access frictions; widest spreads
 TC_SCENARIOS: dict[str, dict[str, float]] = {
     "best": {
         "US": 0.25, "EUR": 0.50, "UK": 0.50,
         "Japan": 0.50, "Canada": 0.50, "Australia": 1.00,
+        "New Zealand": 1.50, "Sweden": 1.00, "Switzerland": 1.00,
+        "India": 2.00, "China": 1.50,
     },
     "base": {
         "US": 0.75, "EUR": 1.00, "UK": 1.50,
         "Japan": 2.00, "Canada": 1.25, "Australia": 2.00,
+        "New Zealand": 3.00, "Sweden": 2.50, "Switzerland": 2.00,
+        "India": 4.00, "China": 3.00,
     },
     "worst": {
         "US": 2.00, "EUR": 2.50, "UK": 5.00,
         "Japan": 8.00, "Canada": 3.00, "Australia": 5.00,
+        "New Zealand": 7.00, "Sweden": 6.00, "Switzerland": 5.00,
+        "India": 10.00, "China": 8.00,
     },
 }
 
@@ -768,11 +777,7 @@ def _try_market_blend(
         r = r.dropna()
         if r.empty:
             return float("nan")
-        ann_vol = r.std() * np.sqrt(252)
-        if ann_vol < 1e-12:
-            return float("nan")
-        r_scaled = r * (vol_target / ann_vol)
-        cum = (1 + r_scaled).cumprod()
+        cum = (1 + r * vol_target).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _to_m(w_df: pd.DataFrame, F: pd.DataFrame) -> float:

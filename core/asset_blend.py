@@ -184,11 +184,7 @@ def _mdd(r: pd.Series, vol_target: float = 0.10, freq: int = 12) -> float:
     r = r.dropna()
     if r.empty:
         return float("nan")
-    ann_vol = r.std() * np.sqrt(freq)
-    if ann_vol < 1e-12:
-        return float("nan")
-    r_scaled = r * (vol_target / ann_vol)
-    cum = (1 + r_scaled).cumprod()
+    cum = (1 + r * vol_target).cumprod()
     return float((cum / cum.cummax() - 1).min())
 
 
@@ -1291,7 +1287,7 @@ def run_asset_tc(
         scen_order = ["gross"] + list(scenarios.keys())
         W = 80
         for method in ["Inverse vol"]:
-            label = "STATIC INVERSE-VOL — IS-frozen weights; only cost propagated  [production]"
+            label = "STATIC INVERSE-VOL — IS-frozen weights; only cost propagated"
             sub = all_metrics[all_metrics["Method"] == method]
             print("\n" + "=" * W)
             print(f"  CROSS-ASSET TC ANALYSIS — {label}")
