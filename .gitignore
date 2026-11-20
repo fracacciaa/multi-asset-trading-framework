@@ -13,6 +13,7 @@ script.py
 script1.py
 *.pdf
 *.png
+!core/asset_tc_composite.png
 *.parquet
 equities/cache/
 cache/
