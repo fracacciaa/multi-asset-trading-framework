@@ -14,7 +14,7 @@ import sys
 import os
 
 # Ensure project root is on path
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 from core.asset_blend import run_asset_tc

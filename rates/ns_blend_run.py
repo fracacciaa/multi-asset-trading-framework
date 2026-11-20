@@ -7,6 +7,9 @@ and rolling method.  Vol-normalises using IS-window sigma before
 fitting so the blend isn't dominated by the highest-vol market.
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import pandas as pd
 import warnings

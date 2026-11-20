@@ -1,5 +1,8 @@
 """Compare continuous-z daily MR vs hysteresis (enter |z|>1, exit at 0) MR: gross SR and TC."""
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import warnings
 warnings.filterwarnings("ignore")
 

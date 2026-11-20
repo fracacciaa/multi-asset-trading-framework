@@ -1,5 +1,8 @@
 """Cross-market carry Sharpe under different IS/OOS splits, same full-repricing parquet."""
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import warnings
 warnings.filterwarnings("ignore")
 

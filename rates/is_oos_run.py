@@ -5,6 +5,9 @@ IS  : burn-in end → 2015-12-31  (λ trained on this window)
 OOS : 2016-01-01 → end of data
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import pandas as pd
 import warnings
