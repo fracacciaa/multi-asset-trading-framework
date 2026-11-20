@@ -91,13 +91,28 @@ def _cached_load(path: str) -> dict[str, pd.DataFrame]:
     return data
 
 
+_SIGNALS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "signals")
+_RETURNS_PARQUET = os.path.join(_SIGNALS_DIR, "returns.parquet")
+
+
 def fetch_prices(
     tickers: Optional[list],
     start: Optional[str] = None,
     end: Optional[str] = None,
     path: str = "/Users/francescocaccia/Downloads/EQH saved.xlsx",
 ) -> pd.DataFrame:
-    """Return adjusted close prices (date × ticker), optionally filtered."""
+    """
+    Return adjusted close prices (date × ticker), optionally filtered.
+
+    Prefers equities/signals/returns.parquet (daily return panel) when present,
+    reconstructing a synthetic cumulative-price series so that callers' downstream
+    pct_change() reproduces the original returns exactly.  Falls back to the
+    Bloomberg Excel export when the parquet is absent.
+    """
+    if os.path.exists(_RETURNS_PARQUET):
+        ret = pd.read_parquet(_RETURNS_PARQUET)
+        prices = (1.0 + ret.fillna(0.0)).cumprod()
+        return _slice(prices, tickers, start, end)
     data = _cached_load(path)
     return _slice(data["prices"], tickers, start, end)
 
