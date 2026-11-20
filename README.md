@@ -1,143 +1,181 @@
 # Multi-Asset Systematic Trading Framework
 
-A modular, research-grade framework for systematic trading across **Equities, Rates, FX, Commodities and Credit**.  
-The strategy is signal-driven (momentum, mean reversion, carry), combined via portfolio optimization and evaluated through a walk-forward backtest.
+A research-grade signal framework for systematic trading across **Equities, Rates, FX and Commodities**.  
+Each asset class has a self-contained production pipeline that serialises PnL to parquet; a cross-asset blend layer combines the four sleeves into a single portfolio.
+
+IS/OOS split: **2020-12-31** (all asset classes; rates blend uses 2018-12-31).
 
 ---
 
-## Project Structure
+## Repository Layout
 
 ```
 .
-├── equities/
-│   ├── data.py          # Fetch prices & fundamentals
-│   └── signals.py       # Momentum, mean reversion, carry signals
-├── rates/
-│   ├── data.py          # Fetch yield curves & rate futures
-│   └── signals.py       # Momentum, mean reversion, carry signals
-├── fx/
-│   ├── data.py          # Fetch spot rates, forwards & IR differentials
-│   └── signals.py       # Momentum, mean reversion, carry signals
-├── commodities/
-│   ├── data.py          # Fetch futures prices & term structure
-│   └── signals.py       # Momentum, mean reversion, carry signals
-├── credit/
-│   ├── data.py          # Fetch CDS spreads & bond yields
-│   └── signals.py       # Momentum, mean reversion, carry signals
+├── core/
+│   ├── asset_blend.py      # Cross-asset inv-vol blend (monthly, 10% vol target)
+│   ├── main.py             # Full pipeline: all four sleeves → cross-asset blend
+│   ├── optimization.py     # Covariance estimation + mean-variance / risk-parity
+│   ├── performance.py      # Sharpe, MDD, Calmar, VaR, CVaR, hit rate …
+│   ├── pipeline_report.py  # IS/OOS tearsheet formatter
+│   └── signal_metrics.py   # Per-signal Sharpe / turnover helpers
 │
-├── optimization.py      # Portfolio optimization (mean-variance / risk parity / BL)
-├── constraints.py       # Hard & soft portfolio constraints
-├── backtest.py          # Walk-forward backtest engine
-├── performance.py       # Performance statistics & reporting
-└── main.py              # Orchestration — run everything from here
+├── rates/
+│   ├── production/
+│   │   ├── run.py                      # ← entry point: generates all rates parquets
+│   │   ├── ns_classic/                 # Nelson-Siegel MR signal
+│   │   │   ├── bootstrap.py            # OIS curve bootstrapping
+│   │   │   ├── ns_fit.py               # DV01-weighted NS regression + z-scores
+│   │   │   ├── signal.py               # build_dv01_positions (net-DV01 neutral)
+│   │   │   └── pnl.py                  # Full swap repricing backtest
+│   │   ├── momentum/                   # Daily TSMOM signal
+│   │   ├── carry/                      # Within-curve OIS carry
+│   │   └── data.py / ois_data.py       # Curve data loaders
+│   ├── signals/                        # ← parquet outputs (read by blend)
+│   │   ├── mean_reversion_pnl.parquet      date × market, bp
+│   │   ├── mean_reversion_dv01_pos.parquet date × (market, tenor)
+│   │   ├── mean_reversion_zscores.parquet  date × (market, tenor)
+│   │   ├── momentum_a_daily_pnl.parquet    date × market, bp
+│   │   ├── carry_ois_par_pnl.parquet       date × market, bp
+│   │   └── ns_factors.parquet / ret_d / rx_m …
+│   └── blend.py            # Rolling Ridge MSRR across the three signals
+│
+├── equities/
+│   ├── production/
+│   │   ├── pipeline.py     # ← entry point: signals + blend
+│   │   ├── signal_lib.py   # TSMOM, threshold MR, earnings revision
+│   │   ├── view_formation.py
+│   │   └── data.py / sectors.py
+│   ├── signals/            # ← parquet outputs
+│   └── blend.py
+│
+├── fx/
+│   ├── production/
+│   │   ├── run.py          # ← entry point: generates all FX parquets
+│   │   ├── signal_a.py     # Momentum (XS, f=9m h=1)
+│   │   ├── signal_d.py     # Carry (Dupuy E-only leverage)
+│   │   ├── signal_e.py     # Carry (XS + E3 aggregate de-risk)
+│   │   ├── ns_rv.py        # MR: NS LOO view-formation TS signal
+│   │   ├── ns_fwd.py       # NS forward curve fitting
+│   │   └── data.py / bloomberg.py
+│   ├── signals/            # ← parquet outputs
+│   └── blend.py
+│
+├── commodities/
+│   ├── production/
+│   │   ├── backtest.py     # ← entry point: signal comparison harness
+│   │   ├── signals.py      # TSMOM-252, XS carry enhanced, curvature
+│   │   └── data.py
+│   ├── signals/            # ← parquet outputs
+│   └── blend.py
+│
+└── tests/
+    ├── rates/
+    │   ├── ns_classic/     # 53 tests: bootstrap, swap PV, NS fit, leakage, net-DV01
+    │   └── carry/          # signal, returns, orthogonality, no-lookahead
+    ├── equities/           # blend tests
+    ├── fx/                 # blend tests
+    └── test_position_turnover.py   # cross-asset turnover sanity
 ```
 
 ---
 
-## Module Overview
+## Rates Pipeline
 
-### Asset Class Packages (`equities/`, `rates/`, `fx/`, `commodities/`, `credit/`)
+The rates sleeve is the most fully developed.  Run once to populate `rates/signals/`; all downstream queries read parquet.
 
-Each package is self-contained and follows the same interface:
-
-| File | Responsibility |
-|------|---------------|
-| `data.py` | Connect to the data vendor, fetch and clean raw market data, return `pd.DataFrame` objects indexed by date |
-| `signals.py` | Compute the three alpha signals and expose a `combined_signal()` function that returns a z-scored cross-sectional signal |
-
-#### Signals
-
-| Signal | Description |
-|--------|-------------|
-| **Momentum** | Returns over a trailing window (typically 12-1 months); long winners, short losers |
-| **Mean Reversion** | Short-term reversal relative to a medium-term moving average |
-| **Carry** | Asset-class-specific carry: dividend yield (equities), roll-down (rates), forward discount (FX), roll-yield (commodities), OAS (credit) |
-
-All signals are z-scored cross-sectionally before combination. The `combined_signal()` function accepts a `weights` dict to control the blend.
-
----
-
-### `optimization.py`
-
-Combines all per-asset-class signal views into target portfolio weights.
-
-Key functions:
-- `build_views(signals)` → expected return vector `mu` and uncertainty matrix `omega`
-- `estimate_covariance(returns)` → covariance matrix (sample / Ledoit-Wolf / EWM)
-- `optimize(mu, cov, constraints)` → optimal weight vector
-
-Supported objectives: `mean_variance`, `risk_parity`, `max_sharpe`.
-
----
-
-### `constraints.py`
-
-Defines and validates all portfolio constraints fed into the optimizer:
-
-| Constraint | Parameter |
-|-----------|-----------|
-| Gross leverage | `gross_leverage` (default 1.0) |
-| Net exposure | `net_exposure` tuple (min, max) |
-| Position limit | `position_limit` per instrument |
-| Asset class bounds | `asset_class_limits` dict |
-| Turnover limit | `turnover_limit` (requires current weights) |
-
----
-
-### `backtest.py`
-
-Walk-forward simulation engine:
-- Rebalances on a configurable schedule (`rebalance_freq`: daily / weekly / monthly / quarterly)
-- Applies one-way transaction costs in basis points
-- Records NAV, daily returns, weights and turnover for each period
-
----
-
-### `performance.py`
-
-Produces a full suite of performance statistics from NAV and return series:
-
-| Metric | Description |
-|--------|-------------|
-| Annualized Return | Geometric annualized return |
-| Annualized Volatility | Realized vol (252-day basis) |
-| Sharpe Ratio | Risk-adjusted return vs. risk-free rate |
-| Sortino Ratio | Downside-only volatility denominator |
-| Max Drawdown | Worst peak-to-trough decline |
-| Calmar Ratio | Ann. return / |Max Drawdown| |
-| Hit Rate | % of positive return days |
-| Avg Win/Loss | Average win over average loss |
-| Skewness / Kurtosis | Return distribution shape |
-| VaR (95%) | 1-day 95% Value at Risk |
-| CVaR / ES (95%) | Conditional VaR (expected shortfall) |
-
-Call `performance.summary(nav)` to get all metrics as a `pd.Series`.
-
----
-
-### `main.py`
-
-The single entry point. Edit the configuration block at the top to set:
-- `START` / `END` — backtest dates
-- `REBALANCE_FREQ` — rebalance frequency (pandas offset alias)
-- `TRANSACTION_COST_BPS` — one-way cost in basis points
-- `RISK_FREE_RATE` — annualized risk-free rate
-
-Then run:
+### 1. Generate parquets
 
 ```bash
-python main.py
+python -m rates.production.run
 ```
+
+Outputs (all in `rates/signals/`):
+
+| File | Shape | Description |
+|---|---|---|
+| `mean_reversion_pnl.parquet` | date × market | NS classic MR daily PnL, full swap repricing (bp) |
+| `mean_reversion_dv01_pos.parquet` | date × (market, tenor) | Held DV01 positions — TC proxy |
+| `mean_reversion_zscores.parquet` | date × (market, tenor) | NS residual z-scores |
+| `momentum_a_daily_pnl.parquet` | date × market | Daily TSMOM PnL, full repricing (bp) |
+| `carry_ois_par_pnl.parquet` | date × market | Within-curve OIS carry PnL, full repricing (bp) |
+| `ns_factors.parquet` | date × (market, factor) | NS level / slope / curvature |
+| `ret_d.parquet` | date × (market, tenor) | Daily constant-maturity returns (bp) |
+| `rx_m.parquet` | date × (market, tenor) | Monthly Sihvonen log excess returns (bp) |
+
+### 2. Run the blend
+
+```python
+from rates.blend import run_blend
+r_is, r_oos = run_blend()   # returns IS and OOS daily return Series
+```
+
+The blend applies:
+1. **Cross-market**: inverse-vol weights (IS σ, frozen) within each signal
+2. **Cross-signal**: rolling Ridge MSRR (lookback 252d, walk-forward) across MR / momentum / carry
+
+Transaction costs are deducted per signal from their respective position parquets:
+
+| Signal | TC formula | Units |
+|---|---|---|
+| Carry | `\|Δpos_dv01\| × h_bp` | bp |
+| Momentum | `\|Δpos\| × h_bp × eff_dur` | bp |
+| Mean reversion | `\|Δ(net_dv01)\| × h_bp` | bp — net across tenors, not tenor by tenor |
+
+### Key design decisions
+
+- **Full swap repricing** — PnL is computed from `swap_pv(K, T−dt, curve_t)`, not `−D × Δy`. Carry, roll-down and curve moves are captured in one number.
+- **Net-DV01 neutral MR** — z-scores are demeaned row-wise before position sizing so `Σ_i dv01_tgt_i = 0` at every rebalance. The DV01-weighted OLS condition `Σ_i w_i·z_i = 0` is a property of the NS fit and is distinct from the plain-sum neutrality enforced here.
+- **TC on net DV01** — within-market tenor rebalancing (NS shape adjustment) is free; cost is charged only on changes in total market allocation.
 
 ---
 
-## Data Vendors
+## Other Asset Class Pipelines
 
-Data sources are not yet configured. Each `data.py` module exposes a clean interface; swap in your preferred vendor by implementing the functions:
+### FX
 
-- Bloomberg / Refinitiv / FactSet via their Python APIs
-- `yfinance` or `pandas-datareader` for quick prototyping
-- Proprietary flat files / databases
+```bash
+python -m fx.production.run
+```
+
+Signals: momentum (XS f=9m h=1), carry (Dupuy leverage + E3 de-risk), MR (NS leave-one-out view-formation TS + fly).  Monthly and daily outputs in `fx/signals/`.
+
+### Equities
+
+```python
+from equities.production.pipeline import run_eq_prod
+run_eq_prod()
+```
+
+Signals: TSMOM, threshold mean reversion, earnings revision.  Outputs in `equities/signals/`.
+
+### Commodities
+
+```python
+from commodities.production.backtest import run_comparison
+run_comparison()
+```
+
+Signals: TSMOM-252, XS carry enhanced, curvature.  Outputs in `commodities/signals/`.
+
+---
+
+## Full Cross-Asset Pipeline
+
+```bash
+python -m core.main
+```
+
+Runs all four sleeves, then blends them with static inverse-vol weights (IS σ, frozen) targeting 10% annual vol.
+
+---
+
+## Tests
+
+```bash
+python -m pytest tests/
+```
+
+214 tests.  The rates suite (`tests/rates/`) covers bootstrap round-trips, swap PV sign conventions, NS fit properties, leakage audits, placebo Sharpe distribution, and net-DV01 neutrality.
 
 ---
 
@@ -146,33 +184,10 @@ Data sources are not yet configured. Each `data.py` module exposes a clean inter
 ```
 pandas
 numpy
-scipy          # optimization
-scikit-learn   # covariance estimation (Ledoit-Wolf)
+scipy
+scikit-learn
 ```
-
-Install with:
 
 ```bash
 pip install pandas numpy scipy scikit-learn
 ```
-
----
-
-## Performance Evaluation
-
-Once the backtest is implemented, the `performance.py` module provides a full tearsheet via `performance.summary(nav)`. Future additions will include:
-- Rolling Sharpe and drawdown charts
-- Factor attribution (signal contribution breakdown)
-- Benchmark-relative statistics (Information Ratio, Tracking Error, Beta)
-- Per-asset-class contribution to overall P&L
-
----
-
-## Roadmap
-
-- [ ] Implement data connectors (vendor TBD)
-- [ ] Implement signal logic per asset class
-- [ ] Implement optimizer (mean-variance baseline)
-- [ ] Implement backtest engine
-- [ ] Add performance charts and attribution
-- [ ] Add risk reporting (factor exposures, Greeks where applicable)
