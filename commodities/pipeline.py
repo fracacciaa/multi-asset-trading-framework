@@ -74,6 +74,13 @@ def run_commodities_pipeline(
     else:
         print(f"  reusing parquets in {sdir}")
 
+    # Per-signal per-instrument returns: F_i = w.shift(lag) * r, so r = F_i / w.shift(lag)
+    lag = (_b.BLEND_PARAMS.get("lag") or 1)
+    ret_panels: dict[str, pd.DataFrame] = {}
+    for sig, (w, F_i) in panels.items():
+        r_i = (F_i / w.shift(lag)).replace([float("inf"), float("-inf")], float("nan"))
+        ret_panels[sig] = r_i
+
     # ── stage 1: instruments ──────────────────────────────────────────────────
     market_rows: dict[tuple, dict] = {}
     R.header("STAGE 1 — INSTRUMENTS (per signal)", 22, cfg.sub)
@@ -85,7 +92,9 @@ def run_commodities_pipeline(
             if len(r) == 0 or not np.isfinite(sigma) or sigma < 1e-12:
                 continue
             p = w[[inst]]
-            row = R.metrics(r / sigma, lambda idx, p=p: R.pos_turnover(p, idx, cfg), cfg)
+            r_inst = ret_panels[sig][[inst]]
+            row = R.metrics(r / sigma,
+                            lambda idx, p=p, ri=r_inst: R.pos_turnover(p, idx, cfg, ri), cfg)
             market_rows[(sig, inst)] = row
             R.print_row(f"  {inst}", row, 22)
     print("=" * R.WIDTH)
@@ -103,7 +112,9 @@ def run_commodities_pipeline(
     signal_rows: dict[str, dict] = {}
     R.header("STAGE 2 — SIGNALS (inverse-vol across instruments, common dates)", 22, cfg.sub)
     for sig in F.columns:
-        row = R.metrics(F_n[sig], lambda idx, s=sig: R.pos_turnover(posw.get(s), idx, cfg), cfg)
+        row = R.metrics(F_n[sig],
+                        lambda idx, s=sig: R.pos_turnover(
+                            posw.get(s), idx, cfg, ret_panels.get(s)), cfg)
         signal_rows[sig] = row
         R.print_row(sig, row, 22)
     print("=" * R.WIDTH)
@@ -125,7 +136,8 @@ def run_commodities_pipeline(
         row = R.metrics(
             r,
             lambda idx, w=w_df, cols=cols: R.composite_turnover(
-                w, {k: posw[k] for k in cols if k in posw}, sigma_F, idx, cfg),
+                w, {k: posw[k] for k in cols if k in posw}, sigma_F, idx, cfg,
+                {k: ret_panels[k] for k in cols if k in ret_panels}),
             cfg,
         )
         label = " + ".join(cols)

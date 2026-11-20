@@ -5,8 +5,10 @@ Shared IS / OOS reporting helpers for the asset-class pipeline runners
 Conventions
   Sharpe    mean/std × √ann
   MDD       series pre-scaled to unit IS σ; compounded at `vol_target` (10% vol)
-  Turnover  single position panels: annualised Σ|Δpos| / mean gross position
-            composites: mean over days of Σ|Δ(scaled pos)| / Σ|scaled pos|, annualised
+  Turnover  drift-corrected: Σ|pos_t − pos_{t−1}·(1+r_t)| / mean_gross × ann
+            so a static signal rebalancing back to target registers non-zero TO.
+            Falls back to Σ|Δpos| / mean_gross × ann when no return panel is given.
+            composites: same formula applied to blend-weight-scaled positions.
 """
 
 from __future__ import annotations
@@ -59,7 +61,16 @@ def ann_sigma(r: pd.Series, cfg: ReportCfg) -> float:
     return float((is_r if len(is_r) >= cfg.min_obs else r).std() * np.sqrt(cfg.ann))
 
 
-def pos_turnover(pos: Optional[pd.DataFrame], idx: pd.Index, cfg: ReportCfg) -> float:
+def pos_turnover(pos: Optional[pd.DataFrame], idx: pd.Index, cfg: ReportCfg,
+                 ret: Optional[pd.DataFrame] = None) -> float:
+    """
+    Annualised one-way instrument-level position turnover over idx.
+
+    When ret (per-instrument returns, columns matching pos) is supplied the
+    numerator is |pos_t − pos_{t−1}·(1+r_t)|, measuring trades needed to get
+    from the drifted held position to the new target.  Without ret, falls back
+    to |Δpos| (raw signal diff).
+    """
     if pos is None or len(idx) == 0:
         return float("nan")
     p = pos.loc[idx[0]:idx[-1]].dropna(how="all")
@@ -68,7 +79,13 @@ def pos_turnover(pos: Optional[pd.DataFrame], idx: pd.Index, cfg: ReportCfg) -> 
     gross = p.abs().sum(axis=1).replace(0.0, np.nan).mean()
     if np.isnan(gross) or gross < 1e-12:
         return float("nan")
-    return float(p.diff().dropna(how="all").abs().sum(axis=1).mean() * cfg.ann / gross)
+    if ret is not None:
+        r = ret.reindex(index=p.index, columns=p.columns).fillna(0.0)
+        drifted = p.shift(1).mul(1.0 + r)
+        trade = (p - drifted).dropna(how="all").abs().sum(axis=1)
+    else:
+        trade = p.diff().dropna(how="all").abs().sum(axis=1)
+    return float(trade.mean() * cfg.ann / gross)
 
 
 def weight_positions(pos: pd.DataFrame, w: pd.Series) -> pd.DataFrame:
@@ -84,8 +101,15 @@ def composite_turnover(
     sigma: pd.Series,
     idx: pd.Index,
     cfg: ReportCfg,
+    ret: Optional[dict[str, pd.DataFrame]] = None,
 ) -> float:
-    """Turnover of Σ_k w_k(t)/σ_k · pos_k(t) over idx, with w_df the (T × K) blend weights."""
+    """
+    Turnover of Σ_k w_k(t)/σ_k · pos_k(t) over idx, with w_df the (T × K) blend weights.
+
+    When ret (mapping signal → per-instrument return panel) is supplied, applies
+    drift correction at the scaled-position level: compares each new scaled target
+    to the previous period's scaled position marked to market.
+    """
     idx = idx.intersection(w_df.dropna(how="any").index)
     if len(idx) == 0:
         return float("nan")
@@ -99,7 +123,12 @@ def composite_turnover(
         pk = posw[k].reindex(index=idx).fillna(0.0).values
         scaled = pk * w[k].values[:, None] / float(sigma[k])
         gross += np.abs(scaled).sum(axis=1)
-        delta[1:] += np.abs(np.diff(scaled, axis=0)).sum(axis=1)
+        if ret is not None and k in ret:
+            rk = ret[k].reindex(index=idx, columns=posw[k].columns).fillna(0.0).values
+            drifted_prev = scaled[:-1] * (1.0 + rk[1:])
+            delta[1:] += np.abs(scaled[1:] - drifted_prev).sum(axis=1)
+        else:
+            delta[1:] += np.abs(np.diff(scaled, axis=0)).sum(axis=1)
     with np.errstate(invalid="ignore", divide="ignore"):
         to = np.where(gross > 1e-12, delta / gross, np.nan)
     to = to[~np.isnan(to)]

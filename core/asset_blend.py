@@ -263,11 +263,16 @@ def _metrics(
     is_tvw: bool,
     vol_target: float = 0.10,
     freq: int = 12,
+    F: Optional[pd.DataFrame] = None,
 ) -> dict:
+    if is_tvw and w_df is not None:
+        to = _drift_to(w_df, F, freq) if F is not None else _tvw_turnover(w_df, freq)
+    else:
+        to = 0.0
     return {
         "sharpe":   _sharpe(r, freq),
         "mdd":      _mdd(r, vol_target, freq),
-        "turnover": _tvw_turnover(w_df, freq) if (is_tvw and w_df is not None) else 0.0,
+        "turnover": to,
         "n_months": int(r.dropna().shape[0]),
     }
 
@@ -392,8 +397,8 @@ def try_asset_blend(
         w_is_slice  = w_df.reindex(F_is.index).dropna()
         w_oos_slice = w_df.reindex(F_oos.index).dropna()
         result[mname] = {
-            "is":         _metrics(r_is,  w_is_slice,  True, vol_target),
-            "oos":        _metrics(r_oos, w_oos_slice, True, vol_target),
+            "is":         _metrics(r_is,  w_is_slice,  True, vol_target, F=F_is),
+            "oos":        _metrics(r_oos, w_oos_slice, True, vol_target, F=F_oos),
             "type":       "dynamic",
             "weights_is": w_is_slice.mean() if not w_is_slice.empty else pd.Series(dtype=float),
         }
@@ -763,11 +768,11 @@ def run_asset_blend(
 
     is_sr  = _sharpe(r_is)
     is_mdd = _mdd(r_is, vol_target)
-    is_to  = _tvw_turnover(w_is.dropna())
+    is_to  = _drift_to(w_is.dropna(), F_is)
 
     oos_sr  = _sharpe(r_oos)
     oos_mdd = _mdd(r_oos, vol_target)
-    oos_to  = _tvw_turnover(w_oos.dropna())
+    oos_to  = _drift_to(w_oos.dropna(), F_oos)
 
     w_is_avg  = w_is.dropna().mean()
     w_oos_avg = w_oos.dropna().mean()

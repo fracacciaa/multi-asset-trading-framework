@@ -117,7 +117,9 @@ def run_fx_pipeline(
             if len(r) == 0 or not np.isfinite(sigma) or sigma < 1e-12:
                 continue
             p = pos[sig][[pair]] if pair in pos[sig].columns else None
-            row = R.metrics(r / sigma, lambda idx, p=p: R.pos_turnover(p, idx, cfg), cfg)
+            r_pair = rx_m[[pair]] if pair in rx_m.columns else None
+            row = R.metrics(r / sigma,
+                            lambda idx, p=p, rp=r_pair: R.pos_turnover(p, idx, cfg, rp), cfg)
             market_rows[(sig, pair)] = row
             R.print_row(f"  {pair}", row, 22)
     print("=" * R.WIDTH)
@@ -136,7 +138,8 @@ def run_fx_pipeline(
     signal_rows: dict[str, dict] = {}
     R.header("STAGE 2 — SIGNALS (inverse-vol across pairs, common dates)", 22, cfg.sub)
     for sig in F.columns:
-        row = R.metrics(F_n[sig], lambda idx, s=sig: R.pos_turnover(posw.get(s), idx, cfg), cfg)
+        row = R.metrics(F_n[sig],
+                        lambda idx, s=sig: R.pos_turnover(posw.get(s), idx, cfg, rx_m), cfg)
         signal_rows[sig] = row
         R.print_row(sig, row, 22)
     print("=" * R.WIDTH)
@@ -149,6 +152,7 @@ def run_fx_pipeline(
     F_oos = F_n.loc[F_n.index > cfg.is_end]
     names = list(F.columns)
     subsets = [c for k in range(2, len(names) + 1) for c in itertools.combinations(names, k)]
+    ret_dict = {sig: rx_m for sig in posw}
     for subset in subsets:
         cols = list(subset)
         model = _b.RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
@@ -157,7 +161,8 @@ def run_fx_pipeline(
         row = R.metrics(
             r,
             lambda idx, w=w_all, cols=cols: R.composite_turnover(
-                w, {k: posw[k] for k in cols if k in posw}, sigma_F, idx, cfg),
+                w, {k: posw[k] for k in cols if k in posw}, sigma_F, idx, cfg,
+                {k: ret_dict[k] for k in cols if k in ret_dict}),
             cfg,
         )
         label = " + ".join(cols)
