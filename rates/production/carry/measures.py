@@ -249,7 +249,6 @@ def carry_rolldown_raw(
 
     DO NOT use outside of axis-9 of the experiment grid.
     """
-    import pandas as pd  # local import to avoid top-level dependency
 
     tau = np.asarray(tau, float)
     s = wide_row.dropna()

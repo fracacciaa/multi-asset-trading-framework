@@ -35,7 +35,6 @@ Returns: synthetic constant-maturity 10Y receiver swap
 """
 
 import re
-import numpy as np
 import pandas as pd
 from functools import lru_cache
 from typing import Optional

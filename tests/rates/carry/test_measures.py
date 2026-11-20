@@ -14,7 +14,6 @@ Covers every test specified in carry_signal_spec.md §11 test_measures.py:
 """
 
 import numpy as np
-import pytest
 
 from rates.production.ns_core import fit_ns
 from rates.production.carry.measures import (

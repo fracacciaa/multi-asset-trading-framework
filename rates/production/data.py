@@ -5,7 +5,6 @@ Parses Bloomberg wide-format Excel export (alternating date/rate column pairs).
 
 import re
 import pandas as pd
-import numpy as np
 from functools import lru_cache
 from typing import Optional
 

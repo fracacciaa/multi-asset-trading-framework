@@ -5,7 +5,6 @@ Combines cross-asset signals into target portfolio weights.
 
 import pandas as pd
 import numpy as np
-from typing import Optional
 
 
 def estimate_covariance(

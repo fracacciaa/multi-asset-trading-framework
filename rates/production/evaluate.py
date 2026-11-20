@@ -9,10 +9,9 @@ that multiple-testing correction is applied consistently.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
 
 
 def _deflated_sharpe(sr: float, n_trials: int, t: int, skew: float = 0.0, excess_kurt: float = 0.0) -> float:

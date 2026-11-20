@@ -35,7 +35,6 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from rates.production.ns_classic.ns_fit import dv01_weights
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -240,12 +239,6 @@ def vol_scale_k(
         # Daily portfolio variance: Σ_i z_i² × var_i  (diagonal approx)
         port_var = (z_scores ** 2 * ewma_var).sum(axis=1)
     else:
-        # Full EWMA covariance matrix: more accurate, noisier at high N
-        # Computed by iterating: expensive but exact
-        ewma_cov = dr.ewm(halflife=halflife, min_periods=min_periods).cov().shift(
-            level=0, periods=len(resids.columns)
-        )
-        # Fallback to diagonal if full cov is not easily computable
         ewma_var = (dr ** 2).ewm(halflife=halflife, min_periods=min_periods).mean().shift(1)
         port_var = (z_scores ** 2 * ewma_var).sum(axis=1)
 

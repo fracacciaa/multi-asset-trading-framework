@@ -3,7 +3,6 @@ Tests for equities/blend.py — all use synthetic deterministic fixtures.
 No Bloomberg dependency.
 """
 
-import math
 
 import numpy as np
 import pandas as pd
@@ -27,7 +26,6 @@ from equities.blend import (
     equal_weight,
     fit_static,
     inv_msfe_blend,
-    managed_return,
     msrr_ridge,
     pcr_blend,
     pls_blend,
@@ -473,7 +471,7 @@ def test_e_enet_selected_equal_weight():
 def test_inv_msfe_finite():
     """inv_msfe weights must be finite, sum to 1, and rank correctly."""
     rng = np.random.default_rng(33)
-    T, K = 300, 3
+    T, _ = 300, 3
     dates = pd.date_range("2018-01-01", periods=T, freq="B")
     F_mean = rng.standard_normal(T) * 0.01
     F_arr = np.column_stack([F_mean + rng.standard_normal(T) * e for e in [0.001, 0.01, 0.1]])

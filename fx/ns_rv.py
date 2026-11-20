@@ -29,7 +29,6 @@ All SR measured OOS (≥ 2019-01-01 by default).
 
 from __future__ import annotations
 
-import warnings
 from typing import Optional
 
 import numpy as np

@@ -1012,7 +1012,6 @@ def hrp_blend(F: pd.DataFrame) -> BlendWeights:
     """
     try:
         from scipy.cluster.hierarchy import linkage, leaves_list
-        from scipy.spatial.distance import squareform
     except ImportError as e:
         raise ImportError("scipy is required for hrp_blend.") from e
 

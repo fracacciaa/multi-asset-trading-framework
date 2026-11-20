@@ -27,10 +27,8 @@ Plus manifest.json.
 from __future__ import annotations
 
 import json
-import warnings
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from fx.production.data import (
@@ -52,7 +50,6 @@ from fx.ns_fwd import (
     _calibrate_lam,
     build_ns_loo_vfts_signal,
     LAM_GRID,
-    _TRAIN_END,
 )
 from fx.ns_rv import build_rv_signals, compute_halflife_table
 

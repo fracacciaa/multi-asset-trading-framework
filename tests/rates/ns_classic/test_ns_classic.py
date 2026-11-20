@@ -34,14 +34,12 @@ from rates.production.ns_classic.signal import (
     build_dv01_positions,
     compute_pnl,
     classic_ns_signal,
-    classic_ns_pnl,
 )
 from rates.production.ns_classic.pnl import (
     swap_schedule,
     swap_pv,
     par_rate,
     annuity_pv,
-    _row_to_curve,
 )
 
 
@@ -1038,19 +1036,7 @@ class TestSlopedCurveCarry:
         """
         K, ann, notional, t, df = self._setup()
 
-        # Independent approximation (all rates in decimal)
-        r_1Y   = par_rate(1.0,  t, df, _ACT360)   # funding proxy
-        r_10Y  = K                                  # K = par_rate(10Y)
-        r_9Y   = par_rate(9.0,  t, df, _ACT360)   # 9Y par rate
-
-        # For 9Y par, need 9Y knot.  t_arr has [1, 2, 5, 10], so 9Y is interpolated.
-        # Use par_rate on the available curve (log-DF interpolation handles it).
         dt     = 1.0 / 365.0
-        # carry = (K - r_1Y) × dt; roll-down = (K - r_9Y) × dt (approx for small dt)
-        # With DV01 = 1: total_bp = (carry + roll_down) × 100bp/% × dt
-        carry_approx    = (r_10Y - r_1Y) * dt * 100.0 * 1e4  # DV01=1, convert to bp
-        rolldown_approx = (r_10Y - r_9Y) * dt * 100.0 * 1e4
-
         T_rem = 10.0 - dt
         pv     = swap_pv(K, T_rem, t, df, _ACT360, notional=notional)
         pnl_actual = pv * 10_000.0
@@ -1064,8 +1050,6 @@ class TestSlopedCurveCarry:
         #   = (K - par_rate_T_rem) × 1e4
         # par_rate(T_rem) ≈ K - slope × dt  (roll-down) − carry_component
         # For a simple bound: just check the sign and rough magnitude
-        total_approx = (carry_approx + rolldown_approx)
-
         assert pnl_actual > 0
         assert abs(pnl_actual) > 0.0001, "P&L too small to be meaningful (< 0.0001bp)"
 

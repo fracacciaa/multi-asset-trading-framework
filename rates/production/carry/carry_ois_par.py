@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from rates.production.ois_data import fetch_ois_curves, OIS_MARKETS
+from rates.production.ois_data import fetch_ois_curves
 from rates.production.carry.carry_bonds import _dmod_par_vec, _interp_at_tenor_vec
 
 # ── Defaults ──────────────────────────────────────────────────────────────────

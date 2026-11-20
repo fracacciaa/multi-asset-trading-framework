@@ -27,7 +27,6 @@ each signal to a scalar series using the signal-specific cross-market blend meth
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional
 

@@ -11,13 +11,13 @@ import pandas as pd
 import pytest
 
 from equities.blend import (
-    BlendWeights, build_state_features,
+    build_state_features,
     equal_weight, sharpe_heuristic, msrr_ridge,
     enet_blend, c_enet_blend, e_enet_blend, inv_msfe_blend,
-    pcr_blend, pls_blend, pool_blend, fit_static,
+    pcr_blend, pls_blend, fit_static,
     MLMSRR, LinearDynamicBlend, GBRTBlend, RandomForestBlend, DMABlend,
 )
-from fx.blend import load_managed_returns, combined_return, SIGNAL_FILES, _SIGNALS_DIR
+from fx.blend import load_managed_returns, combined_return, SIGNAL_FILES
 
 _SIGNAL_NAMES = list(SIGNAL_FILES.keys())   # 6 production signals
 

@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional
 
-from rates.production.ois_data import fetch_ois_curves, OIS_SHEETS
+from rates.production.ois_data import fetch_ois_curves
 from rates.production.yc_builder import build_zero_curve
 
 # ── Daycount basis per curve (sheet name = curve_id) ─────────────────────────
@@ -293,7 +293,6 @@ def build_return_panels(
     zm_np      = zero_me.to_numpy(float) / 100.0   # (M, 70) annual cc decimal
     zm_cols    = zero_me.columns.to_numpy(float)    # TARGET_TENORS
     me_idx     = list(zero_me.index)
-    M          = len(me_idx)
 
     ns_arr  = np.array(SIHVONEN_MONTHS)            # [12,24,...,120]
     yrs_n   = ns_arr / 12.0                         # [1..10]

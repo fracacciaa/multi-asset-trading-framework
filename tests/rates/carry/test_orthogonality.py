@@ -22,15 +22,12 @@ Construction:
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from rates.production.ns_core import fit_ns
 from rates.production.carry.measures import (
     carry_rolldown_dur,
     carry_rolldown_raw,
-    approx_dv01,
 )
-from rates.production.carry.signal import carry_per_duration, xs_score, dv01_positions
 from rates.production.carry.returns import cm_total_return_bp, compute_dur_panel
 
 

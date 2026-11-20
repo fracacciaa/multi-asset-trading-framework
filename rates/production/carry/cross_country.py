@@ -31,7 +31,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .measures import carry_pickup, carry_rolldown_dur, carry_reprice, carry_forward, approx_dv01, CARRY_MEASURES
+from .measures import carry_pickup, carry_rolldown_dur, carry_reprice, carry_forward, approx_dv01
 from .config import CarryConfig
 
 

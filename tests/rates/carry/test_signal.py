@@ -37,7 +37,6 @@ class TestDv01Neutrality:
         carry = np.array([50.0, 80.0, 120.0, 150.0, 180.0])
         dur = np.array([approx_dv01(t, 0.03) for t in tenors])
 
-        score_s = pd.Series(carry, index=tenors)
         dur_s = pd.Series(dur, index=tenors)
 
         # Build duration-adjusted score and positions

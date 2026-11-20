@@ -65,7 +65,6 @@ def _apply_rolling(w_df: pd.DataFrame, F_norm: pd.DataFrame, F_raw: pd.DataFrame
 # ── main blend sweep ──────────────────────────────────────────────────────────
 
 from commodities.blend import build_signal_parquets, SIGNAL_FILES, _SIGNALS_DIR
-from pathlib import Path
 
 _missing = [_SIGNALS_DIR / f for f in SIGNAL_FILES.values() if not (_SIGNALS_DIR / f).exists()]
 if _missing:

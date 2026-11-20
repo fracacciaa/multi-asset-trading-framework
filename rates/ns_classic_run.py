@@ -12,8 +12,8 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from rates.production.ois_data        import fetch_ois_curves
-from rates.production.ns_classic.bootstrap import bootstrap_curves, _ACT360
-from rates.production.ns_classic.ns_fit    import select_lambda, fit_ns_panel
+from rates.production.ns_classic.bootstrap import bootstrap_curves
+from rates.production.ns_classic.ns_fit    import select_lambda
 from rates.production.ns_classic.signal    import (
     classic_ns_signal, build_dv01_positions, compute_pnl, vol_scale_k,
 )

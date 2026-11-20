@@ -5,7 +5,6 @@ Parses Bloomberg wide-format Excel exports and exposes price / fundamental DataF
 
 import os
 import pandas as pd
-import numpy as np
 from functools import lru_cache
 from typing import Optional
 

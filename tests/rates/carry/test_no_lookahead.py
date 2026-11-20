@@ -21,11 +21,10 @@ import pandas as pd
 import pytest
 
 from rates.production.ns_core import fit_ns
-from rates.production.carry.measures import carry_reprice, approx_dv01
-from rates.production.carry.signal import build_positions, carry_per_duration, xs_score
-from rates.production.carry.returns import cm_total_return_bp, compute_dur_panel
+from rates.production.carry.measures import carry_reprice
+from rates.production.carry.signal import build_positions
+from rates.production.carry.returns import compute_dur_panel
 from rates.production.carry.config import CarryConfig
-from rates.production.carry.experiment import run_carry_spec
 
 
 # ── Synthetic data generator ──────────────────────────────────────────────────
@@ -69,8 +68,6 @@ def _compute_carry_panel_minimal(
     Minimal carry panel computation (mirrors experiment._compute_carry_panel).
     Returns carry_df (bp), dur_df, fits dict.
     """
-    tenors = curves_pct.columns.to_numpy(float)
-    roll_floor = float(tenors[0])
     carry_rows, dur_rows, fits = [], [], {}
 
     for date in curves_pct.index:

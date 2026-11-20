@@ -129,9 +129,6 @@ def build_signal_e(
 
     fd   = fd_m.loc[common]
     rr25 = rr25_m.reindex(common) if not rr25_m.empty else pd.DataFrame(index=common)
-    rr10 = rr10_m.reindex(common) if not rr10_m.empty else pd.DataFrame(index=common)
-    bf25 = bf25_m.reindex(common) if not bf25_m.empty else pd.DataFrame(index=common)
-    bf10 = bf10_m.reindex(common) if not bf10_m.empty else pd.DataFrame(index=common)
     atm  = atm_m.reindex(common)  if not atm_m.empty  else pd.DataFrame(index=common)
 
     w_base = carry_weights(fd, n=n)

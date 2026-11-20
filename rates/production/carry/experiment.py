@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -33,12 +33,12 @@ from rates.production.ois_data import fetch_ois_curves
 from rates.production.evaluate import SpecResult
 from .config import CarryConfig
 from .measures import (
-    approx_dv01, carry_pickup, carry_rolldown_dur,
+    carry_pickup, carry_rolldown_dur,
     carry_reprice, carry_forward, carry_rolldown_raw,
 )
 from .returns import cm_total_return_bp, compute_dur_panel, pnl_book
 from .signal import (
-    carry_per_duration, xs_score, dv01_positions, build_positions,
+    build_positions,
 )
 
 

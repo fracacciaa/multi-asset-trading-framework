@@ -171,7 +171,6 @@ def fit_ns_batch(
     tau = np.asarray(tau, float)
     Y   = np.asarray(Y,   float)
     T, N = Y.shape
-    k = NFACTORS[basis]
 
     X    = LOADINGS[basis](tau, lam)            # (N, k)
     G    = np.linalg.inv(X.T @ X)              # (k, k) — same for every date

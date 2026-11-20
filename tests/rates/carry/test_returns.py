@@ -9,11 +9,9 @@ Covers carry_signal_spec.md §11 test_returns.py:
 """
 
 import numpy as np
-import pandas as pd
-import pytest
 
 from rates.production.ns_core import fit_ns, NSFit
-from rates.production.carry.measures import approx_dv01, carry_reprice
+from rates.production.carry.measures import carry_reprice
 from rates.production.carry.returns import cm_total_return_bp, compute_dur_panel, pnl_book
 
 

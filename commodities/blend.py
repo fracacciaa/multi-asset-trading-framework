@@ -314,7 +314,6 @@ def _expanding_ols_weights(F: pd.DataFrame, min_obs: int = 252) -> pd.DataFrame:
     vals = F.values.astype(float)
     T, K = vals.shape
     out = np.full((T, K), np.nan)
-    ones = np.ones(min_obs)
     for t in range(min_obs, T):
         Ft = vals[:t]
         ones_t = np.ones(t)
