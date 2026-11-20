@@ -109,8 +109,12 @@ def build_dv01_positions(
     """
     Convert z-scores to DV01-equivalent positions.
 
-    dv01_target_i = −k × z_score_i   (payer-positive convention)
+    dv01_target_i = −k × (z_score_i − mean_z)   (payer-positive convention)
     notional_i    = dv01_target_i / annuity_i
+
+    Row-wise demeaning ensures Σ_i dv01_target_i = 0 at every date, making the
+    book genuinely net-DV01 neutral (plain-sum neutral, not only DV01-metric
+    neutral).  The DV01-weighted OLS condition Σ_i w_i·z_i = 0 is preserved.
 
     Parameters
     ----------
@@ -125,7 +129,12 @@ def build_dv01_positions(
     """
     tenors     = z_scores.columns.to_numpy(dtype=float)
     ann        = _annuity(zeros, tenors).reindex(z_scores.index)
-    dv01_tgt   = -k * z_scores
+    # Demean row-wise: Σ_i (z_i − mean_z) = 0 ⟹ Σ_i dv01_tgt_i = 0 at each date.
+    # The DV01-weighted OLS orthogonality from ns_fit is preserved; this only
+    # removes the residual plain-sum directional leg that earns near-zero alpha
+    # OOS while generating all transaction cost.
+    z_demeaned = z_scores.sub(z_scores.mean(axis=1), axis=0)
+    dv01_tgt   = -k * z_demeaned
     return dv01_tgt, ann
 
 

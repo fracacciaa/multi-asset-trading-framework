@@ -1147,3 +1147,63 @@ class TestAdditivity:
             atol=1e-10,
             err_msg="Sub-portfolio P&L sum ≠ total P&L — index alignment or aggregation bug",
         )
+
+
+# ── 9. Net DV01 neutrality ────────────────────────────────────────────────────
+
+class TestNetDV01Neutrality:
+    """
+    Plain-sum net DV01 must be zero at every date after build_dv01_positions.
+
+    test_dv01_weighted_orthogonality (TestNSFit) verifies the DV01-metric FOC:
+      Σ_i w_i·z_i = 0.  That is an algebraic identity of weighted OLS and passes
+    regardless of the plain sum Σ_i z_i.  These tests check the plain sum, which
+    is the quantity that drives net market DV01 and therefore transaction cost.
+
+    The gap between the two tests is exactly what allowed a 0.06-Sharpe parallel
+    exposure to ride inside a "factor-neutral" book and generate 343 bp/yr of cost
+    against 310 bp/yr of gross return.
+
+    Note: row-wise demeaning does NOT exactly preserve the DV01-weighted FOC
+    (X^T diag(w)(z − mean_z) = −mean_z·Σ_i w_i ≠ 0 in general).  In practice
+    mean_z ≈ 0 for standardised z-scores, so the residual DV01-metric level
+    exposure is small.  The DV01-weighted orthogonality is not re-tested here.
+    """
+
+    def test_net_dv01_zero_per_row(self):
+        """
+        build_dv01_positions demeaning gives Σ_i dv01_tgt_i = 0 on every live date.
+        """
+        zeros   = _make_zero_panel(n_days=300)
+        lam     = 2.5
+        burn_in = 60
+
+        z_scores, _, _ = classic_ns_signal(zeros, lam, burn_in=burn_in)
+        dv01_tgt, _    = build_dv01_positions(z_scores, zeros, k=1.0)
+
+        net = dv01_tgt.sum(axis=1).dropna()
+        assert len(net) > 50, "too few live dates to be meaningful"
+        np.testing.assert_allclose(
+            net.values, 0.0, atol=1e-10,
+            err_msg="Σ_i dv01_tgt_i ≠ 0: net-DV01 parallel exposure not zeroed",
+        )
+
+    def test_net_dv01_zero_despite_nonzero_z_sum(self):
+        """
+        z-scores with a large positive plain sum still produce zero net DV01.
+        Confirms the fix is effective when the signal has a systematic level bias.
+        """
+        rng    = np.random.default_rng(99)
+        dates  = pd.date_range("2015-01-01", periods=50, freq="B")
+        tenors = pd.Index([2.0, 5.0, 10.0, 30.0], dtype=float)
+        # Shift mean to +2 so Σ_i z_i ≈ 8 without demeaning
+        z     = pd.DataFrame(rng.normal(0, 1, (50, 4)) + 2.0, index=dates, columns=tenors)
+        zeros = pd.DataFrame(np.full((50, 4), 3.0),            index=dates, columns=tenors)
+
+        dv01_tgt, _ = build_dv01_positions(z, zeros, k=1.0)
+        net = dv01_tgt.sum(axis=1)
+        np.testing.assert_allclose(
+            net.values, 0.0, atol=1e-10,
+            err_msg="Demeaning did not zero net DV01 for shifted z-scores",
+        )
+

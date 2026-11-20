@@ -305,11 +305,16 @@ def classic_ns_pnl_repriced(
             daily_pnl = 0.0
             held_row  = {}
 
+            # Demean z over valid tenors so Σ_i dv01_tgt_i = 0 at each sizing step.
+            _vz = [float(z_t1[c]) for c in z_t1.dropna().index
+                   if float(c) >= min_tenor and np.isfinite(float(z_t1[c]))]
+            z_mean = float(np.mean(_vz)) if _vz else 0.0
+
             for col in z_t1.dropna().index:
                 T = float(col)
                 if T < min_tenor:
                     continue
-                z_val = float(z_t1[col])
+                z_val = float(z_t1[col]) - z_mean
                 if not np.isfinite(z_val):
                     continue
 
@@ -390,11 +395,15 @@ def classic_ns_pnl_repriced(
             if z_t1 is not None and not z_t1.isna().all() and np.isfinite(k_t1):
                 new_held: dict = {}
                 new_dv01: dict = {}
+                # Demean z over valid tenors so Σ_i dv01_tgt_i = 0 at this rebalance.
+                _vz = [float(z_t1[c]) for c in z_t1.dropna().index
+                       if float(c) >= min_tenor and np.isfinite(float(z_t1[c]))]
+                z_mean = float(np.mean(_vz)) if _vz else 0.0
                 for col in z_t1.dropna().index:
                     T = float(col)
                     if T < min_tenor:
                         continue
-                    z_val = float(z_t1[col])
+                    z_val = float(z_t1[col]) - z_mean
                     if not np.isfinite(z_val):
                         continue
                     K_new = par_rate(T, t_t, df_t, tau_fn)
