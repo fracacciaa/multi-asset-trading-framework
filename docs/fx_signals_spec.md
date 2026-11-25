@@ -1,4 +1,4 @@
-chen now# Build spec: five FX signals from spot, forwards and the option surface
+# Build spec: five FX signals from spot, forwards and the option surface
 
 Raw signal construction only. No backtest harness, no PnL attribution, no spec
 grid. The deliverable is five signal panels indexed by (date, pair), plus the
