@@ -1147,25 +1147,23 @@ def run_assets_tc(
 
     # ── 4. Print results ──────────────────────────────────────────────────────
     W = 80
-    for method in ["Inverse vol"]:
-        sub = df[df["Method"] == method]
-        label = "STATIC INVERSE-VOL — IS-frozen weights; only cost deducted"
-        print("\n" + "=" * W)
-        print(f"  MULTI-ASSET TC SWEEP — {label}")
-        print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  vol target={vol_target*100:.0f}%")
-        print("=" * W)
-        print(f"  {'Scenario':<12}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>7}")
-        print("  " + "─" * (W - 2))
-        prev = None
-        for _, row in sub.iterrows():
-            if prev is not None and row["Scenario"] != prev:
-                print("  " + "─" * (W - 2))
-            prev = row["Scenario"]
-            sr  = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])  else "   n/a"
-            mdd = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "   n/a"
-            to  = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])      else "   n/a"
-            print(f"  {row['Scenario']:<12}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>7}")
-        print("=" * W)
+    label = "STATIC INVERSE-VOL — IS-frozen weights; only cost deducted"
+    print("\n" + "=" * W)
+    print(f"  MULTI-ASSET TC SWEEP — {label}")
+    print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  vol target={vol_target*100:.0f}%")
+    print("=" * W)
+    print(f"  {'Scenario':<12}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>7}")
+    print("  " + "─" * (W - 2))
+    prev = None
+    for _, row in df.iterrows():
+        if prev is not None and row["Scenario"] != prev:
+            print("  " + "─" * (W - 2))
+        prev = row["Scenario"]
+        sr  = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])  else "   n/a"
+        mdd = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "   n/a"
+        to  = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])      else "   n/a"
+        print(f"  {row['Scenario']:<12}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>7}")
+    print("=" * W)
 
     # ── Scenario mapping table ────────────────────────────────────────────────
     scen_names = list(scenarios.keys())
@@ -1277,34 +1275,33 @@ def run_asset_tc(
     if verbose:
         scen_order = ["gross"] + list(scenarios.keys())
         W = 80
-        for method in ["Inverse vol"]:
-            label = "STATIC INVERSE-VOL — IS-frozen weights; only cost propagated"
-            sub = all_metrics[all_metrics["Method"] == method]
-            print("\n" + "=" * W)
-            print(f"  CROSS-ASSET TC ANALYSIS — {label}")
-            print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}"
-                  f"  |  vol target={vol_target*100:.0f}%")
-            print("=" * W)
-            print(f"  {'Scenario':<16}  {'Period':<6}"
-                  f"  {'Sharpe':>8}  {'MDD':>8}  {'TO':>7}")
-            print("  " + "─" * (W - 2))
-            prev = None
-            for scen in scen_order:
-                rows = sub[sub["Scenario"] == scen]
-                if rows.empty:
-                    continue
-                if prev is not None:
-                    print("  " + "─" * (W - 2))
-                prev = scen
-                for _, row in rows.iterrows():
-                    tag = " [prod]" if scen == "scenario 2" else ""
-                    label_scen = f"{scen}{tag}"
-                    sr  = f"{row['Sharpe']:+.2f}"  if np.isfinite(row["Sharpe"])  else "   n/a"
-                    mdd = f"{row['MDD_pct']:.1f}%"  if np.isfinite(row["MDD_pct"]) else "   n/a"
-                    to  = f"{row['TO']:.2f}x"       if np.isfinite(row["TO"])      else "    —"
-                    print(f"  {label_scen:<16}  {row['Period']:<6}"
-                          f"  {sr:>8}  {mdd:>8}  {to:>7}")
-            print("=" * W)
+        label = "STATIC INVERSE-VOL — IS-frozen weights; only cost propagated"
+        sub = all_metrics[all_metrics["Method"] == "Inverse vol"]
+        print("\n" + "=" * W)
+        print(f"  CROSS-ASSET TC ANALYSIS — {label}")
+        print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}"
+              f"  |  vol target={vol_target*100:.0f}%")
+        print("=" * W)
+        print(f"  {'Scenario':<16}  {'Period':<6}"
+              f"  {'Sharpe':>8}  {'MDD':>8}  {'TO':>7}")
+        print("  " + "─" * (W - 2))
+        prev = None
+        for scen in scen_order:
+            rows = sub[sub["Scenario"] == scen]
+            if rows.empty:
+                continue
+            if prev is not None:
+                print("  " + "─" * (W - 2))
+            prev = scen
+            for _, row in rows.iterrows():
+                tag = " [prod]" if scen == "scenario 2" else ""
+                label_scen = f"{scen}{tag}"
+                sr  = f"{row['Sharpe']:+.2f}"  if np.isfinite(row["Sharpe"])  else "   n/a"
+                mdd = f"{row['MDD_pct']:.1f}%"  if np.isfinite(row["MDD_pct"]) else "   n/a"
+                to  = f"{row['TO']:.2f}x"       if np.isfinite(row["TO"])      else "    —"
+                print(f"  {label_scen:<16}  {row['Period']:<6}"
+                      f"  {sr:>8}  {mdd:>8}  {to:>7}")
+        print("=" * W)
 
         # Sharpe degradation summary
         print()
