@@ -204,7 +204,7 @@ This runs all four production pipelines in order and rewrites `*/signals/`.  `co
 python -m core.main
 ```
 
-Runs all four sleeves, then blends them with static inverse-vol weights (IS σ, frozen) targeting 10% annual vol.
+Runs all four sleeves, then blends them with static inverse-vol capital weights on raw sleeve returns (w ∝ 1/σ_IS, frozen) targeting 10% annual vol.
 
 ---
 

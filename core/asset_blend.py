@@ -24,8 +24,9 @@ IS/OOS split: IS ≤ IS_END = "2020-12-31", OOS > IS_END.
 Blend methods
 -------------
 Static (IS-fitted once, constant thereafter):
-    equal_weight   — 1/4 to each asset class  (DeMiguel et al. 2009)
-    inv_vol        — 1/σ_k naïve risk parity  (Moskowitz et al. 2012)
+    equal_weight   — 1/4 of capital to each asset class  (DeMiguel et al. 2009)
+    inv_vol        — capital weights ∝ 1/σ_k on raw sleeve returns, naïve risk parity
+                     (Moskowitz et al. 2012); same definition as run_assets_tc
     erc            — Equal Risk Contribution  (Maillard et al. 2010)
     sh_p1          — Sharpe heuristic  weight ∝ max(0, SR_k)
     msrr_ols       — MSRR OLS  b = M⁻¹ μ
@@ -169,6 +170,18 @@ def _apply_tvw(F: pd.DataFrame, w_df: pd.DataFrame) -> pd.Series:
     norm = w.abs().sum(axis=1).replace(0.0, np.nan)
     w = w.div(norm, axis=0)
     return (F.loc[idx] * w).sum(axis=1)
+
+
+def _inv_vol_weights(F_is_raw: pd.DataFrame) -> pd.Series:
+    """Capital weights w_k ∝ 1/σ_k on raw (un-normalised) IS sleeve returns, summing to 1."""
+    w = inv_vol_blend(F_is_raw).weights
+    return w / w.sum()
+
+
+def _vol_scale(r_is: pd.Series, vol_target: float, freq: int = 12) -> float:
+    """Factor that scales r_is to vol_target annual vol; 1.0 if vol is undefined."""
+    vol = r_is.dropna().std() * np.sqrt(freq)
+    return float(vol_target / vol) if np.isfinite(vol) and vol > 1e-12 else 1.0
 
 
 def _sharpe(r: pd.Series, freq: int = 12) -> float:
@@ -336,7 +349,8 @@ def try_asset_blend(
     names     = list(F_is.columns)
 
     # ── 3. Static methods (IS-fitted, constant weights) ────────────────────────
-    # equal_weight and inv_vol operate on raw returns; others need vol-normalised.
+    # equal_weight and inv_vol operate on raw returns (inv_vol → capital weights
+    # ∝ 1/σ_IS, same definition as run_assets_tc); others need vol-normalised.
 
     static_blends_raw: dict[str, BlendWeights] = {
         "equal_weight": equal_weight(names),
@@ -375,15 +389,18 @@ def try_asset_blend(
 
     result: dict = {}
 
+    # Every method is rescaled to vol_target IS vol so "MDD at vol target" is comparable.
     for mname, bw in static_blends_raw.items():
         r_is  = _apply_static(F_is_raw, bw)
         r_oos = _apply_static(F_oos_raw, bw)
+        k = _vol_scale(r_is, vol_target)
+        r_is, r_oos = r_is * k, r_oos * k
         w_norm = bw.weights.reindex(names).fillna(0.0)
         total  = w_norm.abs().sum()
         w_norm = w_norm / total if total > 1e-12 else w_norm
         result[mname] = {
-            "is":         _metrics(r_is,  None, False, vol_target),
-            "oos":        _metrics(r_oos, None, False, vol_target),
+            "is":         _metrics(r_is,  None, False, 1.0),
+            "oos":        _metrics(r_oos, None, False, 1.0),
             "type":       "static",
             "weights_is": w_norm,
         }
@@ -391,12 +408,14 @@ def try_asset_blend(
     for mname, bw in static_blends_norm.items():
         r_is  = _apply_static(F_is,  bw)
         r_oos = _apply_static(F_oos, bw)
+        k = _vol_scale(r_is, vol_target)
+        r_is, r_oos = r_is * k, r_oos * k
         w_norm = bw.weights.reindex(names).fillna(0.0)
         total  = w_norm.abs().sum()
         w_norm = w_norm / total if total > 1e-12 else w_norm
         result[mname] = {
-            "is":         _metrics(r_is,  None, False, vol_target),
-            "oos":        _metrics(r_oos, None, False, vol_target),
+            "is":         _metrics(r_is,  None, False, 1.0),
+            "oos":        _metrics(r_oos, None, False, 1.0),
             "type":       "static",
             "weights_is": w_norm,
         }
@@ -404,11 +423,13 @@ def try_asset_blend(
     for mname, w_df in dynamic_blends.items():
         r_is  = _apply_tvw(F_is,  w_df)
         r_oos = _apply_tvw(F_oos, w_df)
+        k = _vol_scale(r_is, vol_target)
+        r_is, r_oos = r_is * k, r_oos * k
         w_is_slice  = w_df.reindex(F_is.index).dropna()
         w_oos_slice = w_df.reindex(F_oos.index).dropna()
         result[mname] = {
-            "is":         _metrics(r_is,  w_is_slice,  True, vol_target, F=F_is),
-            "oos":        _metrics(r_oos, w_oos_slice, True, vol_target, F=F_oos),
+            "is":         _metrics(r_is,  w_is_slice,  True, 1.0, F=F_is),
+            "oos":        _metrics(r_oos, w_oos_slice, True, 1.0, F=F_oos),
             "type":       "dynamic",
             "weights_is": w_is_slice.mean() if not w_is_slice.empty else pd.Series(dtype=float),
         }
@@ -507,7 +528,7 @@ def _print_table(
     names = list(result[list(result.keys())[0]]["weights_is"].index)
     cw, hw = 13, 18
     print()
-    print("  Avg IS blend weights")
+    print("  Avg IS blend weights (equal_weight / inv_vol: raw capital weights; others: on vol-normalised sleeves)")
     print("  " + "─" * (hw + cw * len(names) + 2))
     print(f"  {'Method':<{hw}}" + "".join(f"  {n:>{cw}}" for n in names))
     print("  " + "─" * (hw + cw * len(names) + 2))
@@ -663,7 +684,7 @@ def run_asset_blend(
     verbose:    bool  = True,
 ) -> pd.Series:
     """
-    Production cross-asset blend: rolling MSRR Ridge.
+    Cross-asset blend using rolling MSRR Ridge (alternative to production inv-vol).
 
     Combines the four asset-class composite return series into a single
     multi-asset portfolio using a rolling-window Ridge MSRR blend, refitted
@@ -740,7 +761,7 @@ def run_asset_blend(
         W = 60
         print()
         print("=" * W)
-        print("  MULTI-ASSET PRODUCTION  —  Rolling MSRR Ridge")
+        print("  MULTI-ASSET BLEND  —  Rolling MSRR Ridge")
         print(f"  lookback={lookback}m  λ={lam}  vol target={vol_target*100:.0f}%")
         print(f"  IS : {F_is.index[0].strftime('%Y-%m')} → {F_is.index[-1].strftime('%Y-%m')}"
               f"  ({len(r_is)} months)")
@@ -872,13 +893,15 @@ def compare_blend_methods(
     verbose:    bool  = True,
 ) -> pd.DataFrame:
     """
-    Compare three cross-asset blend methods side-by-side: Sharpe, MDD, TO.
+    Compare four cross-asset blend methods side-by-side: Sharpe, MDD, TO.
 
     Methods
     -------
     Rolling OLS MSRR   rolling lookback=36m refit on full IS+OOS timeline
-    Rolling Ridge MSRR same rolling window with L2 penalty — PRODUCTION method
+    Rolling Ridge MSRR same rolling window with L2 penalty
     Static Ridge MSRR  IS-fit once with ridge, constant weights thereafter
+    Inverse vol        static inv-vol weights (IS σ, frozen) — PRODUCTION method
+                       (this is the blend used by run_assets_tc)
 
     Monthly frequency; Sharpe annualised with √12.
     MDD at exactly vol_target (r scaled to vol_target annual vol).
@@ -910,7 +933,7 @@ def compare_blend_methods(
         RollingMSRR(penalty="ols", lookback=lookback, min_obs=min_obs)._roll(F_full)
     )
 
-    # ── Method 2: Rolling Ridge (PRODUCTION) ─────────────────────────────────
+    # ── Method 2: Rolling Ridge ───────────────────────────────────────────────
     w_ridge = _normalise_w(
         RollingMSRR(penalty="ridge", lam=ridge_lam,
                     lookback=lookback, min_obs=min_obs)._roll(F_full)
@@ -925,10 +948,20 @@ def compare_blend_methods(
         columns=F_full.columns,
     )
 
+    # ── Method 4: Inverse vol (PRODUCTION) ───────────────────────────────────
+    inv_sigma = 1.0 / F_is.std()
+    w_iv_s    = inv_sigma / inv_sigma.sum()
+    w_inv_vol = pd.DataFrame(
+        np.tile(w_iv_s.reindex(F_full.columns).values, (len(F_full), 1)),
+        index=F_full.index,
+        columns=F_full.columns,
+    )
+
     methods = {
-        "Rolling OLS":          w_ols,
-        "Rolling Ridge [prod]": w_ridge,
-        "Static Ridge":         w_static,
+        "Rolling OLS":        w_ols,
+        "Rolling Ridge":      w_ridge,
+        "Static Ridge":       w_static,
+        "Inverse vol [prod]": w_inv_vol,
     }
 
     records = []
@@ -994,9 +1027,10 @@ def run_assets_tc(
     Full cross-asset TC sweep: metrics table + monthly return timeseries.
 
     Cross-asset blend: static inverse-vol (risk parity ignoring correlations).
-    Each sleeve is scaled by its IS σ, weights are w_k ∝ 1/σ_k of the scaled
-    sleeves (frozen on IS, hence constant), and the portfolio is scaled once so
-    its gross IS vol equals vol_target.  The same weights and scale are used for
+    Weights are capital weights w_k ∝ 1/σ_k on the raw sleeve returns (frozen on
+    IS, hence constant; same definition as the "inv_vol" row of try_asset_blend),
+    and the portfolio is scaled once so its gross IS vol equals vol_target.
+    The same weights and scale are used for
     every TC scenario, so only the per-asset-class cost differs; constant
     weights incur no cross-asset rebalancing cost.
 
@@ -1053,17 +1087,11 @@ def run_assets_tc(
     F_free_is_raw  = F_free_all.loc[F_free_all.index <= is_end]
     F_free_oos_raw = F_free_all.loc[F_free_all.index >= oos_start]
 
-    sigma_free = F_free_is_raw.std() * np.sqrt(12)
-    sigma_free = sigma_free.replace(0.0, np.nan)
-    F_free_is  = F_free_is_raw.div(sigma_free)
-    F_free_oos = F_free_oos_raw.div(sigma_free)
+    w_static = _inv_vol_weights(F_free_is_raw)
+    w_is  = pd.DataFrame([w_static.values] * len(F_free_is_raw),  index=F_free_is_raw.index,  columns=F_free_is_raw.columns)
+    w_oos = pd.DataFrame([w_static.values] * len(F_free_oos_raw), index=F_free_oos_raw.index, columns=F_free_oos_raw.columns)
 
-    inv_sigma = 1.0 / F_free_is.std()
-    w_static  = inv_sigma / inv_sigma.sum()
-    w_is  = pd.DataFrame([w_static.values] * len(F_free_is),  index=F_free_is.index,  columns=F_free_is.columns)
-    w_oos = pd.DataFrame([w_static.values] * len(F_free_oos), index=F_free_oos.index, columns=F_free_oos.columns)
-
-    r_gross_raw = pd.concat([_apply_tvw(F_free_is, w_is), _apply_tvw(F_free_oos, w_oos)]).sort_index()
+    r_gross_raw = pd.concat([_apply_tvw(F_free_is_raw, w_is), _apply_tvw(F_free_oos_raw, w_oos)]).sort_index()
     scale = vol_target / (r_gross_raw.loc[r_gross_raw.index <= is_end].std() * np.sqrt(12))
     r_gross = (r_gross_raw * scale).rename("gross")
 
@@ -1092,12 +1120,9 @@ def run_assets_tc(
         if len(F_tc_is_raw) < 12 or F_tc_oos_raw.empty:
             continue
 
-        # Normalise with the TC-free IS σ; weights and scale are frozen.
-        F_tc_is_n  = F_tc_is_raw.div(sigma_free)
-        F_tc_oos_n = F_tc_oos_raw.div(sigma_free)
-
-        r_is_f  = _apply_tvw(F_tc_is_n,  w_is.reindex(F_tc_is_n.index))  * scale
-        r_oos_f = _apply_tvw(F_tc_oos_n, w_oos.reindex(F_tc_oos_n.index)) * scale
+        # Weights (TC-free IS σ) and scale are frozen; only the sleeve returns carry cost.
+        r_is_f  = _apply_tvw(F_tc_is_raw,  w_is.reindex(F_tc_is_raw.index))  * scale
+        r_oos_f = _apply_tvw(F_tc_oos_raw, w_oos.reindex(F_tc_oos_raw.index)) * scale
 
         for period, r, w in [
             ("IS",  r_is_f,  w_is),
