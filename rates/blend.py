@@ -592,8 +592,11 @@ def tc_sweep_rates(
     def _apply_mkt_weights(pnl_df: pd.DataFrame, sig: str) -> pd.Series:
         if sig in _mkt_weights:
             w = _mkt_weights[sig]
-            return (pnl_df[w.index] * w).sum(axis=1, min_count=len(w))
-        return pnl_df[common_mkts].sum(axis=1)
+            avail = pnl_df[w.index].notna()
+            w_avail_sum = avail.multiply(w).sum(axis=1)
+            weighted_sum = (pnl_df[w.index] * w).sum(axis=1, min_count=1)
+            return weighted_sum / w_avail_sum.replace(0.0, np.nan)
+        return pnl_df[common_mkts].sum(axis=1, min_count=1)
 
     # ── TC-free baseline: fit Rolling Ridge ONCE for fixed-weight method ──────
     F_free = pd.DataFrame(
