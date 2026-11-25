@@ -868,9 +868,11 @@ def tc_sweep_comm_actual(
 
         F_k_net[t] = F_k[t] - Σ_i ( spread_i × |Δw_eff_k[i,t]| )
 
-    Vol-normalisation uses TC-gross IS σ (same denominator across scenarios, so
-    blend weights are comparable across spread levels).  Ridge MSRR blend weights
-    are re-fitted on TC-net IS returns for each scenario.
+    Vol-normalisation uses TC-gross IS σ (same denominator across scenarios).
+    Ridge MSRR blend weights are fitted ONCE on TC-free IS normalised returns
+    and held constant across all scenarios — matching the "Fixed weights"
+    convention in rates and FX TC sweeps.  Only the per-instrument TC cost
+    changes across scenarios.
 
     Parameters
     ----------
@@ -891,11 +893,6 @@ def tc_sweep_comm_actual(
                                 Blend_w_curv]
     When _collect_returns=True returns (df, returns_df) where returns_df has
     MultiIndex columns ("Fixed weights", scenario_name).
-
-    Blend weights are fitted ONCE on TC-free IS normalised returns (zero TC
-    deduction) and held constant across all scenarios — matching the "Fixed
-    weights" convention in rates and FX TC sweeps.  Only the per-instrument
-    TC cost changes across scenarios.
     """
     if scenarios is None:
         scenarios = TC_SCENARIOS_COMM
