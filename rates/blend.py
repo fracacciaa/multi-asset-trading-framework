@@ -79,8 +79,8 @@ _POS_FILES: dict[str, str] = {
     "mean_reversion": "mean_reversion_dv01_pos.parquet",
 }
 
-IS_END    = "2018-12-31"
-OOS_START = "2019-01-01"
+IS_END    = "2020-12-31"
+OOS_START = "2021-01-01"
 
 # ── Market-specific TC scenarios ─────────────────────────────────────────────
 # Half-spread estimates in bp of yield, one-way, per OIS market.

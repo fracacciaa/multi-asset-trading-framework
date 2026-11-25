@@ -14,8 +14,8 @@ from rates.production.ns_classic.ns_fit import select_lambda
 from rates.production.ns_classic.pnl import classic_ns_pnl_repriced
 from rates.production.ois_data import fetch_ois_curves
 
-IS_END    = "2018-12-31"
-OOS_START = "2019-01-01"
+IS_END    = "2020-12-31"
+OOS_START = "2021-01-01"
 MARKETS   = ["US", "EUR", "UK", "Japan", "Canada", "Australia"]
 H_BEST = {"US": 0.25, "EUR": 0.50, "UK": 0.50, "Japan": 0.50, "Canada": 0.50, "Australia": 1.00}
 H_BASE = {"US": 0.75, "EUR": 1.00, "UK": 1.50, "Japan": 2.00, "Canada": 1.25, "Australia": 2.00}
