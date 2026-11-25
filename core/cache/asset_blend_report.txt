@@ -1,0 +1,31 @@
+Generated: 2026-11-25 02:04 UTC
+IS <= 2020-12-31  |  OOS >= 2021-01-01  |  10% vol target
+
+
+Loading asset-class composite returns …
+  loading equities composite return …
+  building rates composite return …
+  building FX composite return …
+  building commodities composite return …
+
+============================================================
+  MULTI-ASSET PRODUCTION  —  Rolling MSRR Ridge
+  lookback=36m  λ=0.01  vol target=10%
+  IS : 2017-10 → 2020-12  (15 months)
+  OOS: 2021-01 → 2026-08  (68 months)
+============================================================
+                                    IS           OOS
+  ──────────────────────────────────────────────────────────
+  Sharpe (ann)                   +3.30         +4.67
+  MDD                           +0.00%        -1.13%
+  Turnover (ann)                  3.7x          2.3x
+============================================================
+
+  Avg blend weights
+                      IS avg     OOS avg
+  ──────────────────────────────────────
+  equities              7.3%       19.5%
+  rates                64.0%       49.1%
+  fx                   17.1%       16.9%
+  commodities          -2.3%        9.6%
+  ──────────────────────────────────────
