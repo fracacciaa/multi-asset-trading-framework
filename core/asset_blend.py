@@ -949,8 +949,8 @@ def compare_blend_methods(
     )
 
     # ── Method 4: Inverse vol (PRODUCTION) ───────────────────────────────────
-    inv_sigma = 1.0 / F_is.std()
-    w_iv_s    = inv_sigma / inv_sigma.sum()
+    # Capital weights on raw sleeve returns (same as run_assets_tc / try_asset_blend).
+    w_iv_s    = _inv_vol_weights(F_is_raw)
     w_inv_vol = pd.DataFrame(
         np.tile(w_iv_s.reindex(F_full.columns).values, (len(F_full), 1)),
         index=F_full.index,
@@ -966,17 +966,19 @@ def compare_blend_methods(
 
     records = []
     for method_name, w_full in methods.items():
+        F_i, F_o = (F_is_raw, F_oos_raw) if method_name.startswith("Inverse vol") else (F_is, F_oos)
+        k = _vol_scale(_apply_tvw(F_i, w_full.reindex(F_i.index)), vol_target)
         for period, F, w in [
-            ("IS",  F_is,  w_full.reindex(F_is.index)),
-            ("OOS", F_oos, w_full.reindex(F_oos.index)),
+            ("IS",  F_i, w_full.reindex(F_i.index)),
+            ("OOS", F_o, w_full.reindex(F_o.index)),
         ]:
-            r  = _apply_tvw(F, w)
+            r  = _apply_tvw(F, w) * k
             to = _drift_to(w, F)
             records.append({
                 "Method": method_name,
                 "Period": period,
                 "Sharpe": _sharpe(r),
-                "MDD":    _mdd(r, vol_target) * 100,
+                "MDD":    _mdd(r, 1.0) * 100,
                 "TO":     to,
             })
 
