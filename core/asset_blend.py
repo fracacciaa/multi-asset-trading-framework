@@ -30,7 +30,6 @@ Static (IS-fitted once, constant thereafter):
     sh_p1          — Sharpe heuristic  weight ∝ max(0, SR_k)
     msrr_ols       — MSRR OLS  b = M⁻¹ μ
     msrr_ridge     — MSRR Ridge  b = (M + λI)⁻¹ μ
-    hrp            — Hierarchical Risk Parity (López de Prado 2016)
 
 Dynamic (time-varying weights, monthly refit):
     rolling_msrr   — Rolling OLS MSRR  (lookback=36m default)
@@ -58,7 +57,6 @@ from equities.blend import (
     equal_weight,
     inv_vol_blend,
     erc_blend,
-    hrp_blend,
     sharpe_heuristic,
     msrr_ridge,
     RollingMSRR,
@@ -346,7 +344,6 @@ def try_asset_blend(
         "sh_p1":        sharpe_heuristic(F_is, power=1),
         "msrr_ols":     msrr_ridge(F_is, lam=0.0),
         "msrr_ridge":   msrr_ridge(F_is, lam=0.01),
-        "hrp":          hrp_blend(F_is),
     }
 
     # ── 4. Dynamic methods (time-varying weights) ──────────────────────────────
@@ -1144,7 +1141,7 @@ def run_assets_tc(
                 "Scenario": scenario_name,
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r, vol_target) * 100,
+                "MDD_pct":  _mdd(r, 1.0) * 100,
                 "TO":       _portfolio_to(w, to_df, r.index),
             })
 
@@ -1275,7 +1272,7 @@ def run_asset_tc(
             "Scenario": "gross",
             "Period":   period,
             "Sharpe":   _sharpe(r),
-            "MDD_pct":  _mdd(r, vol_target) * 100,
+            "MDD_pct":  _mdd(r, 1.0) * 100,
             "TO":       gross_to,
         })
 

@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 
 from commodities.blend import load_managed_returns, IS_END, OOS_START
 from equities.blend import (
-    equal_weight, inv_vol_blend, erc_blend, hrp_blend,
+    equal_weight, inv_vol_blend, erc_blend,
     sharpe_heuristic, msrr_ridge, msrr_lasso, RollingMSRR,
     inv_msfe_blend, pcr_blend, pls_blend,
 )
@@ -120,7 +120,6 @@ static_methods = [
     ("Equal weight",     lambda: equal_weight(list(F_is.columns))),
     ("Inv-vol",          lambda: inv_vol_blend(F_is)),
     ("ERC",              lambda: erc_blend(F_is)),
-    ("HRP",              lambda: hrp_blend(F_is)),
     ("Sharpe heuristic", lambda: sharpe_heuristic(F_is)),
     ("Static Ridge",     lambda: msrr_ridge(F_is, lam=0.01)),
     ("Static Lasso",     lambda: msrr_lasso(F_is, lam=0.01)),

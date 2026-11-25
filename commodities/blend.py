@@ -41,7 +41,6 @@ from equities.blend import (                                        # noqa: F401
     equal_weight,
     inv_vol_blend,
     erc_blend,
-    hrp_blend,
     sharpe_heuristic,
     msrr_ridge,
     msrr_lasso,

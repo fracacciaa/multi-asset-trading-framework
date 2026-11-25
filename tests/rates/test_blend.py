@@ -136,7 +136,7 @@ def test_fit_static_rates(synthetic_F):
         enet_alpha=1e-4,
     )
     expected_keys = {
-        "equal_weight", "inv_vol", "erc", "hrp",
+        "equal_weight", "inv_vol", "erc",
         "sh_p1", "sh_p2", "msrr_ols", "msrr_ridge",
         "enet", "lasso", "c_enet", "e_enet", "e_lasso",
         "inv_msfe", "pcr", "pls",

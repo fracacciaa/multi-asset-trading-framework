@@ -15,7 +15,6 @@ Static blend methods (return BlendWeights):
     equal_weight        — 1/K on each signal (benchmark)
     inv_vol_blend       — 1/σ_k naïve risk parity (Moskowitz et al. 2012)
     erc_blend           — Equal Risk Contribution (Maillard, Roncalli & Teïletche 2010)
-    hrp_blend           — Hierarchical Risk Parity (López de Prado 2016)
     sharpe_heuristic    — weight by max(0, Sharpe_k)^p (benchmark)
     msrr_ridge          — Ridge MSRR: b = (M + λI)⁻¹ μ
     enet_blend          — Elastic Net / LASSO blend (Gu et al. 2020)
@@ -322,7 +321,7 @@ def fit_static(
     Convenience: fit all static combination methods on a single training window.
 
     Returns a dict with keys (static methods only; dynamic methods require separate fit):
-        equal_weight, inv_vol, erc, hrp  (risk-parity family)
+        equal_weight, inv_vol, erc  (risk-parity family)
         sh_p1, sh_p2, msrr_ols, msrr_ridge  (Sharpe / MSRR family)
         enet, lasso, c_enet, e_enet, e_lasso, inv_msfe, pcr, pls  (penalised / dim-red)
     """
@@ -332,7 +331,6 @@ def fit_static(
         "equal_weight": equal_weight(names),
         "inv_vol":      inv_vol_blend(F),
         "erc":          erc_blend(F),
-        "hrp":          hrp_blend(F),
         "sh_p1":        sharpe_heuristic(F, power=1),
         "sh_p2":        sharpe_heuristic(F, power=2),
         "msrr_ols":     msrr_ridge(F, lam=0.0),
@@ -995,69 +993,6 @@ def erc_blend(F: pd.DataFrame) -> BlendWeights:
         {"converged": bool(best.success), "obj_val": float(best.fun)},
     )
 
-
-def hrp_blend(F: pd.DataFrame) -> BlendWeights:
-    """
-    Hierarchical Risk Parity (López de Prado 2016).
-
-    Three-step algorithm:
-      1. Distance matrix:  d_ij = sqrt((1 − ρ_ij) / 2)
-      2. Single-linkage hierarchical clustering → quasi-diagonalised leaf order
-      3. Recursive bisection: capital is split between adjacent clusters in
-         inverse proportion to their IVP variance (each sub-cluster is treated
-         as an inverse-variance portfolio for sizing purposes).
-
-    Avoids inverting the covariance matrix — more stable out-of-sample than MVO
-    when correlations are noisy or the number of assets is small relative to history.
-    """
-    try:
-        from scipy.cluster.hierarchy import linkage, leaves_list
-    except ImportError as e:
-        raise ImportError("scipy is required for hrp_blend.") from e
-
-    names    = list(F.columns)
-    corr     = F.corr().fillna(0.0).values   # NaN → 0 (uncorrelated) for near-constant columns
-    np.fill_diagonal(corr, 1.0)
-    cov      = F.cov().fillna(0.0).values
-    K        = len(names)
-
-    # 1. Distance matrix d_ij = sqrt((1 − ρ_ij) / 2)
-    dist = np.sqrt(np.clip((1.0 - corr) / 2.0, 0.0, 1.0))
-    dist = (dist + dist.T) / 2.0   # symmetrise to guard against float rounding
-    np.fill_diagonal(dist, 0.0)
-    # Extract upper triangle as condensed form — squareform's square→condensed path
-    # rejects matrices with floating-point asymmetry, so bypass it.
-    condensed = dist[np.triu_indices(K, k=1)]
-
-    # 2. Single-linkage clustering → sorted leaf order
-    link     = linkage(condensed, method="single")
-    sort_idx = list(leaves_list(link))
-
-    # 3. Recursive bisection
-    def _cluster_var(items: list) -> float:
-        sub  = cov[np.ix_(items, items)]
-        ivp  = 1.0 / np.maximum(np.diag(sub), 1e-14)
-        ivp /= ivp.sum()
-        return float(ivp @ sub @ ivp)
-
-    w        = np.ones(K)
-    clusters = [sort_idx]
-
-    while clusters:
-        next_clusters: list = []
-        for cl in clusters:
-            if len(cl) < 2:
-                continue
-            mid         = len(cl) // 2
-            left, right = cl[:mid], cl[mid:]
-            v_l, v_r    = _cluster_var(left), _cluster_var(right)
-            alpha       = 1.0 - v_l / (v_l + v_r)   # weight to left
-            w[left]    *= alpha
-            w[right]   *= (1.0 - alpha)
-            next_clusters += [left, right]
-        clusters = [c for c in next_clusters if len(c) > 1]
-
-    return BlendWeights(pd.Series(w / w.sum(), index=names), "hrp")
 
 
 # ── Preprocessing utility ──────────────────────────────────────────────────────
