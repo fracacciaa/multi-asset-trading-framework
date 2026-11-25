@@ -891,6 +891,11 @@ def tc_sweep_comm_actual(
                                 Blend_w_curv]
     When _collect_returns=True returns (df, returns_df) where returns_df has
     MultiIndex columns ("Fixed weights", scenario_name).
+
+    Blend weights are fitted ONCE on TC-free IS normalised returns (zero TC
+    deduction) and held constant across all scenarios — matching the "Fixed
+    weights" convention in rates and FX TC sweeps.  Only the per-instrument
+    TC cost changes across scenarios.
     """
     if scenarios is None:
         scenarios = TC_SCENARIOS_COMM
@@ -915,6 +920,11 @@ def tc_sweep_comm_actual(
     # TC-gross IS σ — fixed denominator across all scenarios (no look-ahead)
     sigma = F_is_raw.std() * np.sqrt(252)
     sigma = sigma.replace(0.0, np.nan)
+
+    # Fit Ridge MSRR once on TC-free IS (zero TC deduction) so blend weights
+    # are fixed across scenarios — consistent with rates and FX "Fixed weights".
+    bw_fixed = msrr_ridge(F_is_raw.div(sigma), lam=lam)
+    w_fixed = bw_fixed.weights / bw_fixed.weights.abs().sum()
 
     # Print header
     names = list(F.columns)
@@ -979,16 +989,12 @@ def tc_sweep_comm_actual(
         F_is_n  = F_is_net.div(sigma)
         F_oos_n = F_oos_net.div(sigma)
 
-        # Fit Ridge MSRR on TC-net IS normalised returns
-        bw = msrr_ridge(F_is_n, lam=lam)
-        w_static = bw.weights / bw.weights.abs().sum()
-
         w_is = pd.DataFrame(
-            np.tile(w_static.reindex(F_is_n.columns).values, (len(F_is_n), 1)),
+            np.tile(w_fixed.reindex(F_is_n.columns).values, (len(F_is_n), 1)),
             index=F_is_n.index, columns=F_is_n.columns,
         )
         w_oos = pd.DataFrame(
-            np.tile(w_static.reindex(F_oos_n.columns).values, (len(F_oos_n), 1)),
+            np.tile(w_fixed.reindex(F_oos_n.columns).values, (len(F_oos_n), 1)),
             index=F_oos_n.index, columns=F_oos_n.columns,
         )
 
@@ -1000,7 +1006,7 @@ def tc_sweep_comm_actual(
                 pd.concat([r_is, r_oos]).sort_index()
             )
 
-        blended_tc = sum(abs(float(w_static[k])) * ann_tc[k] for k in names)
+        blended_tc = sum(abs(float(w_fixed[k])) * ann_tc[k] for k in names)
 
         # Print per-signal TC row
         line = f"  {scenario_name:<10}"
@@ -1009,7 +1015,7 @@ def tc_sweep_comm_actual(
         line += f"  {blended_tc:>11.1f}b"
         print(line)
 
-        blend_w = {f"Blend_w_{_abbrev.get(k, k[:6])}": float(w_static[k]) for k in names}
+        blend_w = {f"Blend_w_{_abbrev.get(k, k[:6])}": float(w_fixed[k]) for k in names}
         tc_cols  = {f"TC_{_abbrev.get(k, k[:6])}_bps": ann_tc[k] for k in names}
 
         for period, r, w_df, F_n in [("IS", r_is, w_is, F_is_n), ("OOS", r_oos, w_oos, F_oos_n)]:
