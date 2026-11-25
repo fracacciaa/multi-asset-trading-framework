@@ -831,9 +831,9 @@ def run_asset_blend(
             fig.tight_layout()
             out_path = Path(__file__).parent / "asset_blend_composite.png"
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
             if verbose:
                 print(f"  Chart saved → {out_path}")
-            plt.show()
 
         except Exception as e:
             if verbose:
@@ -1370,9 +1370,9 @@ def run_asset_tc(
             fig.tight_layout()
             out_path = Path(__file__).parent / "asset_tc_composite.png"
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
             if verbose:
                 print(f"\n  Chart saved → {out_path}")
-            plt.show()
 
         except Exception as e:
             if verbose:
