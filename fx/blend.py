@@ -690,18 +690,16 @@ def tc_sweep_fx(
             continue
 
         # ── Method 1: Fixed weights — TC-free Ridge, only deduct cost ─────────
-        F_tc_is_n  = F_tc_is.div(sigma_free)
-        F_tc_oos_n = F_tc_oos.div(sigma_free)
-        C_is_f  = C_tc.loc[F_tc_is_n.index].div(sigma_free)
-        C_oos_f = C_tc.loc[F_tc_oos_n.index].div(sigma_free)
-        r_is_f  = _net_return(F_free_is_n.loc[F_tc_is_n.index], C_is_f,
-                              w_is_fixed.reindex(F_tc_is_n.index))
-        r_oos_f = _net_return(F_free_oos_n.loc[F_tc_oos_n.index], C_oos_f,
-                              w_oos_fixed.reindex(F_tc_oos_n.index))
+        C_is_f  = C_tc.loc[F_tc_is.index].div(sigma_free)
+        C_oos_f = C_tc.loc[F_tc_oos.index].div(sigma_free)
+        r_is_f  = _net_return(F_free_is_n.loc[F_tc_is.index], C_is_f,
+                              w_is_fixed.reindex(F_tc_is.index))
+        r_oos_f = _net_return(F_free_oos_n.loc[F_tc_oos.index], C_oos_f,
+                              w_oos_fixed.reindex(F_tc_oos.index))
 
         for period, r, w, t0, t1 in [
-            ("IS",  r_is_f,  w_is_fixed,  F_tc_is_n.index[0],  F_tc_is_n.index[-1]),
-            ("OOS", r_oos_f, w_oos_fixed, F_tc_oos_n.index[0], F_tc_oos_n.index[-1]),
+            ("IS",  r_is_f,  w_is_fixed,  F_tc_is.index[0],  F_tc_is.index[-1]),
+            ("OOS", r_oos_f, w_oos_fixed, F_tc_oos.index[0], F_tc_oos.index[-1]),
         ]:
             records.append({
                 "Method":   "Fixed weights",
@@ -721,25 +719,23 @@ def tc_sweep_fx(
 
     # ── Print results ─────────────────────────────────────────────────────────
     W = 80
-    for method in ["Fixed weights"]:
-        sub = df[df["Method"] == method]
-        label = "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
-        print("\n" + "=" * W)
-        print(f"  FX  |  {label}")
-        print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  vol target={vol_target*100:.0f}%  |  monthly")
-        print("=" * W)
-        print(f"  {'Scenario':<12}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>8}")
-        print("  " + "─" * (W - 2))
-        prev_scen = None
-        for _, row in sub.iterrows():
-            if prev_scen is not None and row["Scenario"] != prev_scen:
-                print("  " + "─" * (W - 2))
-            prev_scen = row["Scenario"]
-            sr  = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])   else "   n/a"
-            mdd = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "    n/a"
-            to  = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])       else "   n/a"
-            print(f"  {row['Scenario']:<12}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>8}")
-        print("=" * W)
+    label = "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
+    print("\n" + "=" * W)
+    print(f"  FX  |  {label}")
+    print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  vol target={vol_target*100:.0f}%  |  monthly")
+    print("=" * W)
+    print(f"  {'Scenario':<12}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>8}")
+    print("  " + "─" * (W - 2))
+    prev_scen = None
+    for _, row in df.iterrows():
+        if prev_scen is not None and row["Scenario"] != prev_scen:
+            print("  " + "─" * (W - 2))
+        prev_scen = row["Scenario"]
+        sr  = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])   else "   n/a"
+        mdd = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "    n/a"
+        to  = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])       else "   n/a"
+        print(f"  {row['Scenario']:<12}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>8}")
+    print("=" * W)
 
     # ── TC table ──────────────────────────────────────────────────────────────
     all_pairs = sorted({p for s in scenarios.values() for p in s})

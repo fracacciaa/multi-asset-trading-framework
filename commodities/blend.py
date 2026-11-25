@@ -741,33 +741,31 @@ def tc_sweep_comm(
 
     # ── Print table ───────────────────────────────────────────────────────────
     W = 82
-    for method in ["Fixed weights"]:
-        sub = df[df["Method"] == method]
-        label = "FIXED WEIGHTS (Static Ridge, IS-fitted) — only TC cost deducted"
-        print("\n" + "=" * W)
-        print(f"  COMMODITIES TC SWEEP — {label}")
-        print(f"  IS ≤ {is_end}   |   OOS ≥ {oos_start}   |   λ={lam}")
-        print(f"  TC = estimated annual drag (bps/yr) = approx. instrument spread × annual TO")
-        print("=" * W)
+    label = "FIXED WEIGHTS (Static Ridge, IS-fitted) — only TC cost deducted"
+    print("\n" + "=" * W)
+    print(f"  COMMODITIES TC SWEEP — {label}")
+    print(f"  IS ≤ {is_end}   |   OOS ≥ {oos_start}   |   λ={lam}")
+    print(f"  TC = estimated annual drag (bps/yr) = approx. instrument spread × annual TO")
+    print("=" * W)
+    print(
+        f"  {'Scenario':<10}  {'TC (bps/yr)':>12}  {'Period':<6}"
+        f"  {'Sharpe':>8}  {'MDD':>8}  {'Blend TO':>9}"
+    )
+    print("  " + "─" * (W - 2))
+    prev = None
+    for _, row in df.iterrows():
+        if prev is not None and row["Scenario"] != prev:
+            print("  " + "─" * (W - 2))
+        prev = row["Scenario"]
+        tc_v = scenarios[row["Scenario"]]
+        sr   = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])  else "   n/a"
+        mdd  = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "   n/a"
+        to_s = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])      else "   n/a"
         print(
-            f"  {'Scenario':<10}  {'TC (bps/yr)':>12}  {'Period':<6}"
-            f"  {'Sharpe':>8}  {'MDD':>8}  {'Blend TO':>9}"
+            f"  {row['Scenario']:<10}  {tc_v:>12.1f}  {row['Period']:<6}"
+            f"  {sr:>8}  {mdd:>8}  {to_s:>9}"
         )
-        print("  " + "─" * (W - 2))
-        prev = None
-        for _, row in sub.iterrows():
-            if prev is not None and row["Scenario"] != prev:
-                print("  " + "─" * (W - 2))
-            prev = row["Scenario"]
-            tc_v = scenarios[row["Scenario"]]
-            sr   = f"{row['Sharpe']:+.2f}"   if not np.isnan(row["Sharpe"])  else "   n/a"
-            mdd  = f"{row['MDD_pct']:.1f}%"  if not np.isnan(row["MDD_pct"]) else "   n/a"
-            to_s = f"{row['TO']:.2f}x"       if not np.isnan(row["TO"])      else "   n/a"
-            print(
-                f"  {row['Scenario']:<10}  {tc_v:>12.1f}  {row['Period']:<6}"
-                f"  {sr:>8}  {mdd:>8}  {to_s:>9}"
-            )
-        print("=" * W)
+    print("=" * W)
 
     if _collect_returns:
         returns_df = pd.DataFrame(_returns_dict)
