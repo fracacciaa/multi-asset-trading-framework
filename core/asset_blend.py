@@ -336,10 +336,14 @@ def try_asset_blend(
     names     = list(F_is.columns)
 
     # ── 3. Static methods (IS-fitted, constant weights) ────────────────────────
+    # equal_weight and inv_vol operate on raw returns; others need vol-normalised.
 
-    static_blends: dict[str, BlendWeights] = {
+    static_blends_raw: dict[str, BlendWeights] = {
         "equal_weight": equal_weight(names),
-        "inv_vol":      inv_vol_blend(F_is),
+        "inv_vol":      inv_vol_blend(F_is_raw),
+    }
+
+    static_blends_norm: dict[str, BlendWeights] = {
         "erc":          erc_blend(F_is),
         "sh_p1":        sharpe_heuristic(F_is, power=1),
         "msrr_ols":     msrr_ridge(F_is, lam=0.0),
@@ -371,7 +375,20 @@ def try_asset_blend(
 
     result: dict = {}
 
-    for mname, bw in static_blends.items():
+    for mname, bw in static_blends_raw.items():
+        r_is  = _apply_static(F_is_raw, bw)
+        r_oos = _apply_static(F_oos_raw, bw)
+        w_norm = bw.weights.reindex(names).fillna(0.0)
+        total  = w_norm.abs().sum()
+        w_norm = w_norm / total if total > 1e-12 else w_norm
+        result[mname] = {
+            "is":         _metrics(r_is,  None, False, vol_target),
+            "oos":        _metrics(r_oos, None, False, vol_target),
+            "type":       "static",
+            "weights_is": w_norm,
+        }
+
+    for mname, bw in static_blends_norm.items():
         r_is  = _apply_static(F_is,  bw)
         r_oos = _apply_static(F_oos, bw)
         w_norm = bw.weights.reindex(names).fillna(0.0)
