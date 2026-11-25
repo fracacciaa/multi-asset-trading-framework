@@ -1066,7 +1066,7 @@ def run_assets_tc(
 
     from rates.blend       import tc_sweep_rates
     from fx.blend          import tc_sweep_fx
-    from commodities.blend import tc_sweep_comm
+    from commodities.blend import tc_sweep_comm_actual as tc_sweep_comm
     from equities.blend import tc_sweep_eq
 
     # ── 1. Run per-asset TC sweeps, suppress their print output ──────────────

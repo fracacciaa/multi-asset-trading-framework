@@ -853,7 +853,8 @@ def tc_sweep_comm_actual(
     oos_start: str = OOS_START,
     vol_target: float = 0.10,
     lam: float = 0.01,
-) -> pd.DataFrame:
+    _collect_returns: bool = False,
+) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """
     TC sensitivity sweep using actual per-signal, per-instrument turnover.
 
@@ -888,6 +889,8 @@ def tc_sweep_comm_actual(
                                 Blended_TC_bps, TC_tsmom_bps, TC_carry_bps,
                                 TC_curv_bps, Blend_w_tsmom, Blend_w_carry,
                                 Blend_w_curv]
+    When _collect_returns=True returns (df, returns_df) where returns_df has
+    MultiIndex columns ("Fixed weights", scenario_name).
     """
     if scenarios is None:
         scenarios = TC_SCENARIOS_COMM
@@ -948,6 +951,7 @@ def tc_sweep_comm_actual(
         return float((cum / cum.cummax() - 1).min() * 100)
 
     records = []
+    _returns_dict: dict[tuple, pd.Series] = {}
 
     for scenario_name, spread_map in scenarios.items():
 
@@ -990,6 +994,11 @@ def tc_sweep_comm_actual(
 
         r_is  = (F_is_n  * w_is).sum(axis=1)
         r_oos = (F_oos_n * w_oos).sum(axis=1)
+
+        if _collect_returns:
+            _returns_dict[("Fixed weights", scenario_name)] = (
+                pd.concat([r_is, r_oos]).sort_index()
+            )
 
         blended_tc = sum(abs(float(w_static[k])) * ann_tc[k] for k in names)
 
@@ -1049,7 +1058,10 @@ def tc_sweep_comm_actual(
             print(line)
     print("=" * W)
 
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    if _collect_returns:
+        return df, pd.DataFrame(_returns_dict)
+    return df
 
 
 def compare_blend_methods(
