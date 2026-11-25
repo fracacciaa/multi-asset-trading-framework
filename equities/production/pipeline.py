@@ -732,7 +732,7 @@ def run_eq_prod(
 
 
 def tc_sweep_eq(
-    tc_bps_list: list = (0.25, 0.5, 1.0),
+    tc_bps_list: list = (0.25, 1.0, 2.0),
     is_end: str = IS_END,
     oos_start: str = OOS_START,
     rebuild: bool = False,
@@ -829,7 +829,7 @@ def tc_sweep_eq(
 
 
 def run_eq_tc(
-    tc_bps_list: list = (0.25, 0.5, 1.0),
+    tc_bps_list: list = (0.25, 1.0, 2.0),
     is_end: str = IS_END,
     oos_start: str = OOS_START,
     rebuild: bool = False,
