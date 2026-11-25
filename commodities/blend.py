@@ -10,10 +10,10 @@ Pipeline position:
     blend weights  →  combined portfolio return
 
 Signals (production, from commodities/signals/):
-    tsmom_252        tsmom_252_pnl.parquet        TS momentum 252-day (sign)
+    momentum         momentum_pnl.parquet         TS momentum 252-day (sign)
     xs_carry         xs_carry_pnl.parquet          XS tenor-normalised F1/F2 carry
-    xs_carry_enh     xs_carry_enh_pnl.parquet      XS carry + seasonal/sector/roll
-    curvature        curvature_pnl.parquet         NS butterfly (F1+F4-2*F2)
+    carry            carry_pnl.parquet             XS carry + seasonal/sector/roll
+    mean_reversion   mean_reversion_pnl.parquet    NS butterfly (F1+F4-2*F2)
 
 Managed-return convention: for each signal k and commodity i,
     w_k[i,t] = signal_k[i,t] × target_vol / sigma_hat[i,t]   (vol-targeted)
@@ -36,6 +36,7 @@ import pandas as pd
 
 # ── Re-export every blend algorithm from the equities layer ──────────────────
 from core.asset_blend import _drift_to
+from equities.blend import SIGNAL_VOL_TARGET
 from equities.blend import (                                        # noqa: F401
     BlendWeights,
     equal_weight,
@@ -133,16 +134,16 @@ _SIGNALS_DIR = Path(__file__).parent / "signals"
 # managed-return parquets.  "equal" sums the per-instrument managed returns;
 # "static_ridge" fits ridge MSRR once on IS instrument returns and freezes the weights.
 CROSS_INSTRUMENT_BLEND: dict[str, str] = {
-    "tsmom_252":    "inv_vol",
-    "xs_carry_enh": "inv_vol",
-    "curvature":    "inv_vol",
+    "momentum":       "inv_vol",
+    "carry":          "inv_vol",
+    "mean_reversion": "inv_vol",
 }
 _CROSS_INSTR_MIN_OBS: int = 252   # min IS observations for an instrument to be included
 
 SIGNAL_FILES: dict[str, str] = {
-    "tsmom_252":    "tsmom_252_pnl.parquet",
-    "xs_carry_enh": "xs_carry_enh_pnl.parquet",
-    "curvature":    "curvature_pnl.parquet",
+    "momentum":       "momentum_pnl.parquet",
+    "carry":          "carry_pnl.parquet",
+    "mean_reversion": "mean_reversion_pnl.parquet",
 }
 
 # Production pipeline parameters (must match those used in build_signal_parquets).
@@ -230,9 +231,9 @@ def _signal_panels(
 
     # Map from _build_signals keys → SIGNAL_FILES keys
     _key_map = {
-        "tsmom_252":         "tsmom_252",
-        "xs_carry_enh_f1f2": "xs_carry_enh",
-        "curvature":         "curvature",
+        "tsmom_252":         "momentum",
+        "xs_carry_enh_f1f2": "carry",
+        "curvature":         "mean_reversion",
     }
 
     panels: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
@@ -434,7 +435,7 @@ def run_comm_blend(
     F_is_raw  = F.loc[F.index <= is_end]
     F_oos_raw = F.loc[F.index >  is_end]
 
-    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = F_is_raw.std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
     F_is  = F_is_raw.div(sigma)
     F_oos = F_oos_raw.div(sigma)
@@ -474,7 +475,7 @@ def run_commodities_blend(
     Full commodities pipeline: build signals → static Ridge MSRR blend.
 
     Step 1 — Signal pipeline (commodities/blend.build_signal_parquets):
-        Computes vol-scaled managed returns for tsmom_252, xs_carry_enh, and
+        Computes vol-scaled managed returns for momentum, carry, and
         curvature and writes them to commodities/signals/.  Skipped when
         rebuild_signals=False and all three parquets already exist.
 
@@ -647,12 +648,12 @@ def export_signals(
         "params":    params or BLEND_PARAMS,
         "files": {
             k: v for k, v in {
-                "tsmom_252_pnl":        "date × 1; aggregated managed return (daily)",
-                "xs_carry_enh_pnl":     "date × 1; aggregated managed return (daily)",
-                "curvature_pnl":        "date × 1; aggregated managed return (daily)",
-                "tsmom_252_positions":        "date × instrument; vol-scaled eff. weight panel",
-                "xs_carry_enh_positions":     "date × instrument; vol-scaled eff. weight panel",
-                "curvature_positions":        "date × instrument; vol-scaled eff. weight panel",
+                "momentum_pnl":         "date × 1; aggregated managed return (daily)",
+                "carry_pnl":            "date × 1; aggregated managed return (daily)",
+                "mean_reversion_pnl":   "date × 1; aggregated managed return (daily)",
+                "momentum_positions":         "date × instrument; vol-scaled eff. weight panel",
+                "carry_positions":            "date × instrument; vol-scaled eff. weight panel",
+                "mean_reversion_positions":   "date × instrument; vol-scaled eff. weight panel",
                 "combined_positions":   "date × instrument; blend-weighted combined position",
             }.items()
         },
@@ -711,7 +712,7 @@ def tc_sweep_comm(
     F_oos_raw = F.loc[F.index >= oos_start]
 
     # IS annualized vol — computed on TC-free raw returns, used for all scenarios
-    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = F_is_raw.std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
 
     # TC-free vol-normalised managed returns
@@ -745,7 +746,8 @@ def tc_sweep_comm(
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _blend_to(w_df: pd.DataFrame, F_n: pd.DataFrame) -> float:
-        return _drift_to(w_df, F_n * vol_target, freq=252, l1_norm=True)
+        # F_n is already at SIGNAL_VOL_TARGET annual vol; no further rescaling.
+        return _drift_to(w_df, F_n, freq=252, l1_norm=True)
 
     records = []
     _returns_dict: dict[tuple, pd.Series] = {}
@@ -915,7 +917,7 @@ def tc_sweep_comm_actual(
     F_oos_raw = F.loc[F.index >= oos_start]
 
     # TC-gross IS σ — fixed denominator across all scenarios (no look-ahead)
-    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = F_is_raw.std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
 
     # Fit Ridge MSRR once on TC-free IS (zero TC deduction) so blend weights
@@ -925,7 +927,7 @@ def tc_sweep_comm_actual(
 
     # Print header
     names = list(F.columns)
-    _abbrev = {"tsmom_252": "tsmom", "xs_carry_enh": "carry", "curvature": "curv"}
+    _abbrev = {"momentum": "mom", "carry": "carry", "mean_reversion": "mr"}
     abbrevs = [_abbrev.get(n, n[:6]) for n in names]
 
     W = 90
@@ -1021,7 +1023,7 @@ def tc_sweep_comm_actual(
                 "Period":         period,
                 "Sharpe":         _sharpe(r),
                 "MDD_pct":        _mdd(r),
-                "Blend_TO":       _drift_to(w_df, F_n * vol_target, freq=252, l1_norm=True),
+                "Blend_TO":       _drift_to(w_df, F_n, freq=252, l1_norm=True),
                 "Blended_TC_bps": blended_tc,
             }
             rec.update(tc_cols)
@@ -1098,7 +1100,7 @@ def compare_blend_methods(
     F_is_raw  = F.loc[F.index <= is_end]
     F_oos_raw = F.loc[F.index >  is_end]
 
-    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = F_is_raw.std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
     F_is  = F_is_raw.div(sigma)
     F_oos = F_oos_raw.div(sigma)
@@ -1120,7 +1122,8 @@ def compare_blend_methods(
 
     def _blend_weight_to(w_df: pd.DataFrame, F_n: pd.DataFrame) -> float:
         """Drift-corrected annual one-way turnover of L1-normalised blend weights."""
-        return _drift_to(w_df, F_n * vol_target, freq=252, l1_norm=True)
+        # F_n is already at SIGNAL_VOL_TARGET annual vol; no further rescaling.
+        return _drift_to(w_df, F_n, freq=252, l1_norm=True)
 
     def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:
         norm = w_raw.abs().sum(axis=1).replace(0.0, np.nan)

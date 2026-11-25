@@ -5,13 +5,13 @@ run_fx_pipeline() (1) rebuilds the signal parquets, then prints Sharpe, MDD and
 turnover for IS (≤ blend.IS_END) and OOS (≥ blend.OOS_START) at four levels:
 
   1. markets     per signal × per currency pair
-  2. signals     inverse-vol cross-pair blend of each signal (momentum, mr_ns_loo, carry_xs)
+  2. signals     inverse-vol cross-pair blend of each signal (momentum, mean_reversion, carry)
   3. composites  rolling-Ridge blends of every subset (≥2) of the signals
   4. TC-aware    tc_sweep_fx scenarios (best / base / worst), fixed weights
 
 Conventions: see core/pipeline_report.py.  Positions are month-end snapshots
-(mr_ns_loo positions are sampled at the last business day of each month, as in
-run_fx_prod), so mr_ns_loo turnover excludes intra-month trading.  Signal and
+(mean_reversion positions are sampled at the last business day of each month, as in
+run_fx_prod), so mean_reversion turnover excludes intra-month trading.  Signal and
 composite turnover use positions scaled by the inv-vol pair weights; the TC
 table's turnover comes from tc_sweep_fx, which applies the same pair weights.
 """
@@ -91,14 +91,14 @@ def run_fx_pipeline(
     # as load_monthly_managed_returns)
     pos = {
         "momentum":  pos_mom,
-        "mr_ns_loo": pos_mr_d.resample("BME").last(),
-        "carry_xs":  pos_cxs,
+        "mean_reversion": pos_mr_d.resample("BME").last(),
+        "carry":  pos_cxs,
     }
     mr_live = pos_mr_d.notna().resample("BME").max().astype(bool)
     pnl = {
         "momentum":  pos_mom.shift(1) * rx_m.reindex(columns=pos_mom.columns),
-        "mr_ns_loo": (pos_mr_d * rx_d.reindex(columns=pos_mr_d.columns)).resample("BME").sum(),
-        "carry_xs":  pos_cxs.shift(1) * rx_m.reindex(columns=pos_cxs.columns),
+        "mean_reversion": (pos_mr_d * rx_d.reindex(columns=pos_mr_d.columns)).resample("BME").sum(),
+        "carry":  pos_cxs.shift(1) * rx_m.reindex(columns=pos_cxs.columns),
     }
     if pairs is not None:
         pnl = {k: v[[p for p in pairs if p in v.columns]] for k, v in pnl.items()}
@@ -110,7 +110,7 @@ def run_fx_pipeline(
         print(f"  [{sig}]")
         for pair in df.columns:
             r = df[pair]
-            if sig == "mr_ns_loo":
+            if sig == "mean_reversion":
                 r = r.where(mr_live[pair].reindex(r.index).fillna(False))
             r = r.dropna()
             sigma = R.ann_sigma(r, cfg)

@@ -127,22 +127,61 @@ def test_sharpe_heuristic_power2_more_concentrated():
 
 # ── ridge MSRR ──────────────────────────────────────────────────────────────────
 
-def test_msrr_ridge_algebra():
-    """msrr_ridge must equal solve(M + λI, μ) exactly."""
+def _ridge_reference(F, lam_eff):
+    """solve(M + lam_eff·I, mu), L1-normalised."""
+    Fv = F.values.astype(float)
+    mu = Fv.mean(axis=0)
+    M = Fv.T @ Fv / len(Fv)
+    expected = np.linalg.solve(M + lam_eff * np.eye(M.shape[0]), mu)
+    return expected / np.abs(expected).sum(), M
+
+
+def test_msrr_ridge_algebra_absolute():
+    """lam_relative=False must equal solve(M + λI, μ) exactly."""
     signals, fwd_ret, names, _, _ = _make_positions(seed=2)
     F = build_managed_returns(signals, fwd_ret)
     lam = 0.05
 
-    Fv = F.values.astype(float)
-    T = len(Fv)
-    mu = Fv.mean(axis=0)
-    M = Fv.T @ Fv / T
-    K = M.shape[0]
-    expected = np.linalg.solve(M + lam * np.eye(K), mu)
-    expected /= np.abs(expected).sum()
+    expected, _ = _ridge_reference(F, lam)
+    bw = msrr_ridge(F, lam, lam_relative=False)
+    np.testing.assert_allclose(bw.weights.values, expected, atol=1e-8)
+
+
+def test_msrr_ridge_algebra_relative():
+    """Default lam_relative=True must apply λ_eff = λ · mean(diag(M))."""
+    signals, fwd_ret, names, _, _ = _make_positions(seed=2)
+    F = build_managed_returns(signals, fwd_ret)
+    lam = 0.05
+
+    _, M = _ridge_reference(F, 0.0)
+    lam_eff = lam * float(np.mean(np.diag(M)))
+    expected, _ = _ridge_reference(F, lam_eff)
 
     bw = msrr_ridge(F, lam)
     np.testing.assert_allclose(bw.weights.values, expected, atol=1e-8)
+    assert np.isclose(bw.diagnostics["lambda_eff"], lam_eff)
+
+
+def test_msrr_ridge_relative_is_scale_invariant():
+    """
+    Relative λ makes the fit invariant to the vol scale of F, which is what
+    lets every sleeve normalise signals to SIGNAL_VOL_TARGET without moving
+    blend weights.  Absolute λ does not have this property.
+    """
+    signals, fwd_ret, names, _, _ = _make_positions(seed=2)
+    F = build_managed_returns(signals, fwd_ret)
+    lam = 0.05
+
+    base = msrr_ridge(F, lam).weights.values
+    for c in (0.1, 10.0, 100.0):
+        np.testing.assert_allclose(
+            msrr_ridge(F * c, lam).weights.values, base, atol=1e-8
+        )
+
+    # absolute λ is scale-dependent, so it must differ under rescaling
+    abs_base = msrr_ridge(F, lam, lam_relative=False).weights.values
+    abs_scaled = msrr_ridge(F * 0.1, lam, lam_relative=False).weights.values
+    assert not np.allclose(abs_scaled, abs_base, atol=1e-6)
 
 
 def test_msrr_ols_direction_matches_mv():

@@ -5,8 +5,8 @@ Mirrors mom_carry_blend_run.py: vol-normalise the 3 pre-computed signal PnL
 parquets on IS σ, then apply every static and rolling blend method.
 
 Signals (from commodities/signals/):
-    tsmom_252    — 252-day time-series momentum
-    xs_carry_enh — enhanced cross-sectional carry (tenor-norm + seasonal + sector)
+    momentum       — 252-day time-series momentum
+    carry          — enhanced cross-sectional carry (tenor-norm + seasonal + sector)
     curvature    — NS butterfly (curve curvature)
 """
 

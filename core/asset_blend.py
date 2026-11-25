@@ -53,6 +53,7 @@ import numpy as np
 import pandas as pd
 
 from equities.blend import (
+    SIGNAL_VOL_TARGET,
     BlendWeights,
     equal_weight,
     inv_vol_blend,
@@ -91,6 +92,7 @@ def load_asset_returns(
     fx_r:       Optional[pd.Series] = None,
     comm_r:     Optional[pd.Series] = None,
     verbose:    bool = True,
+    is_end:     str = IS_END,
 ) -> pd.DataFrame:
     """
     Build the T × 4 monthly composite-return matrix for the four asset classes.
@@ -113,10 +115,13 @@ def load_asset_returns(
     Only months where all four series have data are returned (inner join).
     """
     if equities_r is None:
-        from equities.blend import load_eq_returns
+        from equities.blend import build_eq_composite_return
         if verbose:
-            print("  loading equities composite return …")
-        equities_r = load_eq_returns()
+            print("  building equities composite return …")
+        # Rebuilt from committed parquets rather than read from
+        # eq_prod_returns.parquet, so the sleeve reflects the current
+        # vol-matched blend definition.
+        equities_r = build_eq_composite_return(is_end=is_end)
 
     if rates_r is None:
         from rates.blend import run_blend
@@ -341,7 +346,7 @@ def try_asset_blend(
 
     # ── 2. Vol-normalise to unit annual vol using IS σ only ────────────────────
 
-    sigma     = F_is_raw.std() * np.sqrt(12)
+    sigma     = F_is_raw.std() * np.sqrt(12) / SIGNAL_VOL_TARGET
     sigma     = sigma.replace(0.0, np.nan)
     F_is      = F_is_raw.div(sigma)
     F_oos     = F_oos_raw.div(sigma)
@@ -618,9 +623,9 @@ def _build_position_turnover_series() -> pd.DataFrame:
     # portfolio (mirrors tc_sweep_fx._to / run_fx_prod._blended_pos).
     _fx_monthly_pos = {
         "momentum":  pd.read_parquet(_FX_SDIR / "signal_a_f9_h1.parquet"),
-        "mr_ns_loo": (pd.read_parquet(_FX_SDIR / "mr_ns_loo_positions.parquet")
+        "mean_reversion": (pd.read_parquet(_FX_SDIR / "mr_ns_loo_positions.parquet")
                       .resample("BME").last()),
-        "carry_xs":  pd.read_parquet(_FX_SDIR / "view_xs_carry_m.parquet"),
+        "carry":  pd.read_parquet(_FX_SDIR / "view_xs_carry_m.parquet"),
     }
     _fx_common_pairs = sorted(
         set.intersection(*[set(p.columns) for p in _fx_monthly_pos.values()])
@@ -708,7 +713,7 @@ def compare_blend_methods(
     F_is_raw  = F_all.loc[F_all.index <= is_end]
     F_oos_raw = F_all.loc[F_all.index >  is_end]
 
-    sigma  = F_is_raw.std() * np.sqrt(12)
+    sigma  = F_is_raw.std() * np.sqrt(12) / SIGNAL_VOL_TARGET
     sigma  = sigma.replace(0.0, np.nan)
     F_is   = F_is_raw.div(sigma)
     F_oos  = F_oos_raw.div(sigma)

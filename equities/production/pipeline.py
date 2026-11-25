@@ -34,7 +34,18 @@ import pandas as pd
 IS_END    = "2020-12-31"
 OOS_START = "2021-01-01"
 
-PRODUCTION_SIGNALS: list[str] = ["tsmom", "threshold_mean_reversion", "earnings_revision"]
+# Canonical production signal names, shared with the other three asset classes.
+# The research registry below keeps its own descriptive names: "momentum",
+# "mean_reversion" and "carry" exist there as different variants, so production
+# maps onto canonical names explicitly rather than renaming registry entries.
+# Families follow _SIGNAL_FAMILIES (earnings_revision is a carry-family signal).
+PRODUCTION_SIGNAL_MAP: dict[str, str] = {
+    "momentum":       "tsmom",
+    "mean_reversion": "threshold_mean_reversion",
+    "carry":          "earnings_revision",
+}
+
+PRODUCTION_SIGNALS: list[str] = list(PRODUCTION_SIGNAL_MAP)
 
 RESEARCH_SIGNALS: list[str] = [
     # production baseline (all 4, including momentum)
@@ -371,7 +382,7 @@ def run_eq_research_signals(
     ret_is  = returns.loc[returns.index <= is_end]
     ret_oos = returns.loc[returns.index >= oos_start]
 
-    production_set = set(PRODUCTION_SIGNALS) | {"momentum"}
+    production_set = set(PRODUCTION_SIGNAL_MAP.values()) | {"momentum"}
     result: dict[str, dict] = {}
 
     for name, pos_df in positions.items():
@@ -464,6 +475,28 @@ def load_eq_returns_panel(signals_dir: str | None = None) -> pd.DataFrame:
     return pd.read_parquet(path).dropna(how="all")
 
 
+def _canonicalise_positions(positions: dict) -> dict:
+    """
+    Rename research-signal keys to the canonical production names.
+
+    build_vf_positions and the pickle cache are keyed by research-signal name
+    (tsmom, threshold_mean_reversion, earnings_revision).  Everything
+    downstream, including the committed parquets and every report, uses the
+    canonical momentum / mean_reversion / carry names shared with the other
+    asset classes.  Keys not in the production map are passed through so the
+    research harness keeps working.
+    """
+    out = {canon: positions[research]
+           for canon, research in PRODUCTION_SIGNAL_MAP.items()
+           if research in positions}
+    # Pass through unrelated research signals, but never let a research signal
+    # that happens to share a canonical name (equities has its own "momentum",
+    # "mean_reversion" and "carry" variants) shadow the production mapping.
+    reserved = set(PRODUCTION_SIGNAL_MAP) | set(PRODUCTION_SIGNAL_MAP.values())
+    out.update({k: v for k, v in positions.items() if k not in reserved})
+    return out
+
+
 def _load_or_build_positions(rebuild: bool = False, verbose: bool = True) -> dict:
     if not rebuild:
         paths = {k: os.path.join(_SIGNALS_DIR, f"{k}_positions.parquet")
@@ -477,7 +510,7 @@ def _load_or_build_positions(rebuild: bool = False, verbose: bool = True) -> dic
         if verbose:
             print("Loading cached VF positions …")
         with open(_VF_POSITIONS_CACHE, "rb") as fh:
-            return pickle.load(fh)
+            return _canonicalise_positions(pickle.load(fh))
 
     if verbose:
         print("Building VF positions — this takes ~5 min …")
@@ -497,7 +530,7 @@ def _load_or_build_positions(rebuild: bool = False, verbose: bool = True) -> dic
         pickle.dump(positions, fh)
     if verbose:
         print(f"Cached to {_VF_POSITIONS_CACHE}\n")
-    return positions
+    return _canonicalise_positions(positions)
 
 
 # ── try_eq_blend ──────────────────────────────────────────────────────────────
@@ -531,6 +564,7 @@ def try_eq_blend(
         enet_blend, c_enet_blend, e_enet_blend,
         inv_msfe_blend, pcr_blend, pls_blend,
         RollingMSRR, DMABlend,
+        SIGNAL_VOL_TARGET, signal_vol, normalise_to_target, to_position_weights,
     )
     from core.backtest import run_backtest
 
@@ -550,9 +584,9 @@ def try_eq_blend(
     pos_oos = {k: v.loc[v.index >= oos_start] for k, v in positions.items()}
     F_is_raw = build_managed_returns(pos_is,  ret_is)
     F_oos_raw = build_managed_returns(pos_oos, ret_oos)
-    sigma  = F_is_raw.std().replace(0.0, np.nan)
-    F_is   = F_is_raw.div(sigma)
-    F_oos  = F_oos_raw.div(sigma)
+    sigma  = signal_vol(F_is_raw)
+    F_is   = normalise_to_target(F_is_raw,  sigma)
+    F_oos  = normalise_to_target(F_oos_raw, sigma)
     F_full = pd.concat([F_is, F_oos]).sort_index()
 
     names       = list(F_is.columns)
@@ -561,7 +595,7 @@ def try_eq_blend(
     # ── backtest helpers ──────────────────────────────────────────────────────
 
     def _static_sig_fn(bw):
-        combined = combine_signals(positions, bw)
+        combined = combine_signals(positions, to_position_weights(bw, sigma))
         return _make_signal_fn(combined)
 
     def _rolling_sig_fn(weights_df):
@@ -571,6 +605,8 @@ def try_eq_blend(
             if avail.empty:
                 return pd.Series(dtype=float)
             w = weights_df.loc[avail[-1]].dropna()
+            # weights_df is in normalised-return space; convert to position space
+            w = (w * (SIGNAL_VOL_TARGET / sigma.reindex(w.index))).dropna()
             total = w.abs().sum()
             if total < 1e-12:
                 return pd.Series(dtype=float)
@@ -660,7 +696,8 @@ def run_eq_blend(
     pd.DataFrame : date × ticker blended position weights.
     """
     from equities.production.data import fetch_prices
-    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+    from equities.blend import (build_managed_returns, msrr_ridge, combine_signals,
+                                SIGNAL_VOL_TARGET, signal_vol, normalise_to_target, to_position_weights)
 
     positions = _load_or_build_positions(rebuild, verbose)
     positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
@@ -668,17 +705,20 @@ def run_eq_blend(
     returns = load_eq_returns_panel()
     ret_is  = returns.loc[returns.index <= is_end]
 
-    pos_is = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
-    F_is   = build_managed_returns(pos_is, ret_is)
+    pos_is   = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
+    F_is_raw = build_managed_returns(pos_is, ret_is)
 
-    bw = msrr_ridge(F_is, lam=lam)
+    # Fit on columns at a common realised vol, then map back to position space,
+    # so bw.weights are risk weights rather than position weights.
+    sigma = signal_vol(F_is_raw)
+    bw    = msrr_ridge(normalise_to_target(F_is_raw, sigma), lam=lam)
 
     if verbose:
-        print(f"msrr_ridge blend weights (lam={lam}):")
+        print(f"msrr_ridge risk weights (lam={lam}):")
         for sig, w in bw.weights.items():
             print(f"  {sig:<30} {w:+.4f}")
 
-    return combine_signals(positions, bw)
+    return combine_signals(positions, to_position_weights(bw, sigma))
 
 
 def run_eq_prod(
@@ -710,7 +750,8 @@ def run_eq_prod(
     pd.Series : daily portfolio returns, full history (IS + OOS), name="eq_prod".
     """
     from equities.production.data import fetch_prices
-    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+    from equities.blend import (build_managed_returns, msrr_ridge, combine_signals,
+                                SIGNAL_VOL_TARGET, signal_vol, normalise_to_target, to_position_weights)
     from core.backtest import run_backtest
 
     positions = _load_or_build_positions(rebuild, verbose)
@@ -726,8 +767,9 @@ def run_eq_prod(
     pos_is = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
     F_is   = build_managed_returns(pos_is, ret_is)
 
-    bw       = msrr_ridge(F_is, lam=lam)
-    combined = combine_signals(positions, bw)
+    _sigma   = signal_vol(F_is)
+    bw       = msrr_ridge(normalise_to_target(F_is, _sigma), lam=lam)
+    combined = combine_signals(positions, to_position_weights(bw, _sigma))
     sig_fn   = _make_signal_fn(combined)
 
     bt_is  = run_backtest(ret_is,  sig_fn, rebalance_dates=vf_rebal_dates,
@@ -764,7 +806,8 @@ def tc_sweep_eq(
     or (df, returns_df) when _collect_returns=True.
     """
     from equities.production.data import fetch_prices
-    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+    from equities.blend import (build_managed_returns, msrr_ridge, combine_signals,
+                                SIGNAL_VOL_TARGET, signal_vol, normalise_to_target, to_position_weights)
     from core.backtest import run_backtest
 
     positions = _load_or_build_positions(rebuild, verbose=False)
@@ -779,8 +822,9 @@ def tc_sweep_eq(
 
     pos_is = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
     F_is   = build_managed_returns(pos_is, ret_is)
-    bw     = msrr_ridge(F_is, lam=lam)
-    combined = combine_signals(positions, bw)
+    _sigma = signal_vol(F_is)
+    bw     = msrr_ridge(normalise_to_target(F_is, _sigma), lam=lam)
+    combined = combine_signals(positions, to_position_weights(bw, _sigma))
     sig_fn   = _make_signal_fn(combined)
 
     records = []
@@ -1019,6 +1063,7 @@ def compare_blend_methods(
     from equities.blend import (
         build_managed_returns, combine_signals,
         msrr_ridge, RollingMSRR,
+        SIGNAL_VOL_TARGET, signal_vol, normalise_to_target, to_position_weights,
     )
     from core.backtest import run_backtest
 
@@ -1037,15 +1082,15 @@ def compare_blend_methods(
     pos_oos = {k: v.loc[v.index >= oos_start] for k, v in positions.items()}
     F_is_raw  = build_managed_returns(pos_is,  ret_is)
     F_oos_raw = build_managed_returns(pos_oos, ret_oos)
-    sigma  = F_is_raw.std().replace(0.0, np.nan)
-    F_is   = F_is_raw.div(sigma)
-    F_oos  = F_oos_raw.div(sigma)
+    sigma  = signal_vol(F_is_raw)
+    F_is   = normalise_to_target(F_is_raw,  sigma)
+    F_oos  = normalise_to_target(F_oos_raw, sigma)
     F_full = pd.concat([F_is, F_oos]).sort_index()
 
     all_tickers = sorted({t for pos in positions.values() for t in pos.columns})
 
     def _static_sig_fn(bw):
-        combined = combine_signals(positions, bw)
+        combined = combine_signals(positions, to_position_weights(bw, sigma))
         return _make_signal_fn(combined)
 
     def _rolling_sig_fn(weights_df):
@@ -1054,6 +1099,8 @@ def compare_blend_methods(
             if avail.empty:
                 return pd.Series(dtype=float)
             w = weights_df.loc[avail[-1]].dropna()
+            # weights_df is in normalised-return space; convert to position space
+            w = (w * (SIGNAL_VOL_TARGET / sigma.reindex(w.index))).dropna()
             total = w.abs().sum()
             if total < 1e-12:
                 return pd.Series(dtype=float)
@@ -1158,7 +1205,8 @@ def export_signals(
     import json
     import subprocess
 
-    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
+    from equities.blend import (build_managed_returns, msrr_ridge, combine_signals,
+                                SIGNAL_VOL_TARGET, signal_vol, normalise_to_target, to_position_weights)
     from core.backtest import run_backtest
 
     out = signals_dir or _SIGNALS_DIR
@@ -1174,7 +1222,11 @@ def export_signals(
     ret_oos = returns.loc[returns.index >= oos_start]
 
     F_is     = build_managed_returns({k: v.loc[v.index <= is_end] for k, v in positions.items()}, ret_is)
-    combined = combine_signals(positions, msrr_ridge(F_is, lam=lam))
+    _sigma   = signal_vol(F_is)
+    combined = combine_signals(
+        positions,
+        to_position_weights(msrr_ridge(normalise_to_target(F_is, _sigma), lam=lam), _sigma),
+    )
     sig_fn   = _make_signal_fn(combined)
     bt_is  = run_backtest(ret_is,  sig_fn, rebalance_dates=vf_rebal_dates, transaction_cost_bps=0.0)
     bt_oos = run_backtest(ret_oos, sig_fn, rebalance_dates=vf_rebal_dates, transaction_cost_bps=0.0)

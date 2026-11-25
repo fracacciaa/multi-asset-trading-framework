@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 # ── Re-export every blend algorithm from the equities layer ──────────────────
+from equities.blend import SIGNAL_VOL_TARGET
 from equities.blend import (                                        # noqa: F401
     BlendWeights,
     equal_weight,
@@ -319,7 +320,7 @@ def vol_normalise(
     signal (momentum operates on a ~1000× larger PnL scale than MR).
     Returns (F_train_normalised, F_apply_normalised).
     """
-    sigma = F_train.std() * np.sqrt(252)
+    sigma = F_train.std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
     return F_train.div(sigma), F_apply.div(sigma)
 
@@ -606,7 +607,7 @@ def tc_sweep_rates(
     F_free_oos = F_free.loc[F_free.index >= oos_start]
     F_free_is_n, F_free_oos_n = vol_normalise(F_free_is, F_free_oos)
     # Save IS sigma for consistent normalisation across all TC scenarios
-    sigma_free = F_free_is.std() * np.sqrt(252)
+    sigma_free = F_free_is.std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma_free = sigma_free.replace(0.0, np.nan)
     F_free_full = pd.concat([F_free_is_n, F_free_oos_n]).sort_index()
     w_raw_free  = RollingMSRR(penalty="ridge", lookback=lookback, min_obs=min_obs)._roll(F_free_full)
@@ -764,7 +765,7 @@ def _try_market_blend(
         raise ValueError(f"No IS data at or before {is_end} in {pnl_file}.")
 
     # Vol-normalise on IS realized σ × √252
-    sigma = F_is_raw.std() * np.sqrt(252)
+    sigma = F_is_raw.std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
     F_is   = F_is_raw.div(sigma)
     F_oos  = F_oos_raw.div(sigma)
@@ -789,7 +790,8 @@ def _try_market_blend(
 
     def _to_m(w_df: pd.DataFrame, F: pd.DataFrame) -> float:
         # Drift-corrected: returns at the vol target pull weights off target each day.
-        return _drift_to(w_df, F * vol_target, freq=252, l1_norm=True)
+        # F is already at SIGNAL_VOL_TARGET annual vol; no further rescaling.
+        return _drift_to(w_df, F, freq=252, l1_norm=True)
 
     def _static_w_df(bw, F: pd.DataFrame) -> pd.DataFrame:
         w = bw.weights.reindex(names).fillna(0.0)
@@ -1111,7 +1113,7 @@ def run_rates_prod(
 
     # IS sigma for blended-position TO
     _F_raw_to = load_managed_returns(signals_dir=sig_dir)
-    sigma_blend = _F_raw_to.loc[_F_raw_to.index <= IS_END].std() * np.sqrt(252)
+    sigma_blend = _F_raw_to.loc[_F_raw_to.index <= IS_END].std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma_blend = sigma_blend.replace(0.0, np.nan)
 
     def _blend_to(w_df: pd.DataFrame, start, end) -> float:
@@ -1246,7 +1248,7 @@ def compare_blend_methods(
         if path.exists():
             sig_pos[name] = pd.read_parquet(path)
 
-    sigma_cmp = F_is_raw.std() * np.sqrt(252)
+    sigma_cmp = F_is_raw.std() * np.sqrt(252) / SIGNAL_VOL_TARGET
     sigma_cmp = sigma_cmp.replace(0.0, np.nan)
 
     def _blend_to(w_df: pd.DataFrame, start, end) -> float:

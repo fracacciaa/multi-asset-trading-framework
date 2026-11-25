@@ -158,7 +158,60 @@ def sharpe_heuristic(F: pd.DataFrame, power: int = 1) -> BlendWeights:
     )
 
 
-def msrr_ridge(F: pd.DataFrame, lam: float = 0.0) -> BlendWeights:
+# Common vol scale for every signal panel handed to a blend estimator.
+# Signals are normalised to this annualised vol (not to 1.0) so that managed
+# returns, sleeve composites and cross-asset sleeves are all in the same
+# money units and inverse-vol weights are comparable across asset classes.
+SIGNAL_VOL_TARGET: float = 0.10
+
+
+def signal_vol(F_raw: pd.DataFrame, freq: int = 252) -> pd.Series:
+    """Annualised realised vol of each signal's managed-return column."""
+    return (F_raw.std() * np.sqrt(freq)).replace(0.0, np.nan)
+
+
+def normalise_to_target(
+    F_raw: pd.DataFrame,
+    sigma: Optional[pd.Series] = None,
+    target: float = SIGNAL_VOL_TARGET,
+    freq: int = 252,
+) -> pd.DataFrame:
+    """
+    Rescale each signal column to `target` annualised vol.
+
+    Equities views are vol-targeted ex ante by ViewFormationXS, but realised
+    vol differs across signals, so the blend estimator must be fed columns at
+    a common realised vol or it will reward low-realised-vol signals.
+    """
+    if sigma is None:
+        sigma = signal_vol(F_raw, freq)
+    return F_raw.div(sigma) * target
+
+
+def to_position_weights(
+    bw: "BlendWeights",
+    sigma: pd.Series,
+    target: float = SIGNAL_VOL_TARGET,
+) -> "BlendWeights":
+    """
+    Convert blend weights fitted on target-vol-normalised managed returns into
+    weights applicable to the raw VF position panels.
+
+    A weight b_k earned on a column at `target` vol must be applied to raw
+    positions as b_k × target / σ_k, since the raw sleeve realises σ_k rather
+    than `target`.  This mirrors the `w_k / σ_k` position scaling already used
+    in the rates and FX blends, and makes b_k a genuine risk weight.
+    """
+    s = sigma.reindex(bw.weights.index)
+    w = (bw.weights * (target / s)).dropna()
+    return BlendWeights(w, f"{bw.method}_volmatched", dict(bw.diagnostics))
+
+
+def msrr_ridge(
+    F: pd.DataFrame,
+    lam: float = 0.0,
+    lam_relative: bool = True,
+) -> BlendWeights:
     """
     Ridge MSRR: b = (M + λI)⁻¹ μ,  M = F'F/T,  μ = mean(F).
 
@@ -169,6 +222,12 @@ def msrr_ridge(F: pd.DataFrame, lam: float = 0.0) -> BlendWeights:
 
     λ interpretation: regularisation is on the scale of mean(diag(M)).
     A reasonable starting grid: [0, 0.01, 0.1, 1.0] × mean(diag(M)).
+
+    lam_relative=True (default) implements that interpretation literally:
+    the penalty applied is lam × mean(diag(M)).  This makes the fit invariant
+    to the vol scale of F and to its sampling frequency, so the same lam means
+    the same shrinkage in every sleeve.  With lam_relative=False the penalty is
+    the raw lam, which is scale- and frequency-dependent (legacy behaviour).
     """
     T = len(F)
     Fv = F.values.astype(float)
@@ -176,7 +235,8 @@ def msrr_ridge(F: pd.DataFrame, lam: float = 0.0) -> BlendWeights:
     M = Fv.T @ Fv / T
     K = M.shape[0]
 
-    A = M + lam * np.eye(K)
+    lam_eff = lam * float(np.mean(np.diag(M))) if lam_relative else lam
+    A = M + lam_eff * np.eye(K)
     b, _, rank, sv = np.linalg.lstsq(A, mu, rcond=None)
     cond = float(sv[0] / sv[-1]) if sv[-1] > 1e-15 else np.inf
 
@@ -184,7 +244,7 @@ def msrr_ridge(F: pd.DataFrame, lam: float = 0.0) -> BlendWeights:
     return BlendWeights(
         w,
         "msrr_ols" if lam == 0.0 else "msrr_ridge",
-        {"lambda": lam, "cond": cond, "rank": int(rank)},
+        {"lambda": lam, "lambda_eff": lam_eff, "cond": cond, "rank": int(rank)},
     )
 
 
@@ -207,7 +267,8 @@ class RollingMSRR:
 
     penalty:
         "ols"   — b_t = M_t^{-1} μ_t  (no regularisation, via lstsq)
-        "ridge" — b_t = (M_t + λI)^{-1} μ_t
+        "ridge" — b_t = (M_t + λI)^{-1} μ_t, λ = lam × mean(diag(M_t))
+                  when lam_relative (default), else λ = lam
         "lasso" — LASSO (enet l1_ratio=1) refitted on the rolling window
 
     The first `min_obs` time steps return no weights (NaN rows) while the
@@ -222,11 +283,13 @@ class RollingMSRR:
         alpha: float = 0.01,
         lookback: int = 36,
         min_obs: int = 24,
+        lam_relative: bool = True,
     ):
         if penalty not in ("ols", "ridge", "lasso"):
             raise ValueError(f"penalty must be 'ols', 'ridge', or 'lasso', got {penalty!r}")
         self.penalty  = penalty
         self.lam      = lam
+        self.lam_relative = lam_relative
         self.alpha    = alpha
         self.lookback = lookback
         self.min_obs  = min_obs
@@ -251,7 +314,9 @@ class RollingMSRR:
                 mu = Fv.mean(axis=0)
                 M  = Fv.T @ Fv / len(Fv)
                 lam = 0.0 if self.penalty == "ols" else self.lam
-                A   = M + lam * np.eye(K)
+                lam_eff = (lam * float(np.mean(np.diag(M)))
+                           if self.lam_relative else lam)
+                A   = M + lam_eff * np.eye(K)
                 try:
                     b = np.linalg.lstsq(A, mu, rcond=None)[0]
                 except np.linalg.LinAlgError:
@@ -1632,7 +1697,11 @@ import os as _os
 
 _EQ_SIGNALS_DIR = _os.path.join(_os.path.dirname(__file__), "signals")
 
-PRODUCTION_SIGNALS: list[str] = ["tsmom", "threshold_mean_reversion", "earnings_revision"]
+# Canonical production signal names, identical across all four asset classes.
+# Positions are committed as "<name>_positions.parquet"; the research-signal
+# variant each one is built from is recorded in
+# equities.production.pipeline.PRODUCTION_SIGNAL_MAP.
+PRODUCTION_SIGNALS: list[str] = ["momentum", "mean_reversion", "carry"]
 
 
 def load_eq_returns(signals_dir: str | None = None) -> pd.Series:
@@ -1667,6 +1736,44 @@ def load_rebal_dates(signals_dir: str | None = None) -> list:
     return list(pd.read_parquet(path).index)
 
 
+def build_eq_composite_return(
+    is_end: str = "2020-12-31",
+    lam: float = 0.01,
+    tc_bps: float = 0.0,
+    signals_dir: str | None = None,
+) -> pd.Series:
+    """
+    Daily equities composite return, rebuilt from committed parquets.
+
+    Same blend as run_eq_blend (vol-matched Ridge MSRR fitted on IS) run through
+    the position-level backtest, so the cross-asset layer can consume a sleeve
+    composite that reflects the current blend definition rather than whatever
+    was in eq_prod_returns.parquet when it was last exported.  Parquet-only: no
+    production imports, no raw data.
+    """
+    from core.backtest import run_backtest
+
+    positions  = load_signal_positions(signals_dir=signals_dir)
+    vf_rebal   = set(load_rebal_dates(signals_dir=signals_dir))
+    returns    = load_eq_returns_panel(signals_dir=signals_dir)
+
+    pos_is   = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
+    F_is_raw = build_managed_returns(pos_is, returns.loc[returns.index <= is_end])
+    sigma    = signal_vol(F_is_raw)
+    bw       = msrr_ridge(normalise_to_target(F_is_raw, sigma), lam=lam)
+    combined = combine_signals(positions, to_position_weights(bw, sigma))
+
+    def _sig_fn(date):
+        avail = combined.index[combined.index <= date]
+        if avail.empty:
+            return pd.Series(dtype=float)
+        return combined.loc[avail[-1]]
+
+    bt = run_backtest(returns, _sig_fn, rebalance_dates=vf_rebal,
+                      transaction_cost_bps=tc_bps)
+    return bt["daily_return"].rename("eq_prod")
+
+
 def tc_sweep_eq(
     tc_bps_list: list = (0.25, 1.0, 2.0),
     is_end: str = "2020-12-31",
@@ -1691,9 +1798,10 @@ def tc_sweep_eq(
     ret_oos = returns.loc[returns.index >= oos_start]
 
     pos_is   = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
-    F_is     = build_managed_returns(pos_is, ret_is)
-    bw       = msrr_ridge(F_is, lam=lam)
-    combined = combine_signals(positions, bw)
+    F_is_raw = build_managed_returns(pos_is, ret_is)
+    sigma    = signal_vol(F_is_raw)
+    bw       = msrr_ridge(normalise_to_target(F_is_raw, sigma), lam=lam)
+    combined = combine_signals(positions, to_position_weights(bw, sigma))
 
     def _sig_fn(date):
         avail = combined.index[combined.index <= date]

@@ -14,7 +14,7 @@ Signals (production, from fx/signals/):
     carry_E_only    signal_d_E_only_weights_daily.parquet  Dupuy MV E-only (daily)
     carry_bnp_base  signal_e_carry_daily.parquet        BNP base XS weights (daily)
     carry_bnp_e3    signal_e_carry_daily.parquet        BNP E3 crash-risk adjusted (daily)
-    mr_ns_loo       mr_ns_loo_positions_daily.parquet   NS LOO XS positions (daily)
+    mean_reversion  mr_ns_loo_positions_daily.parquet   NS LOO XS positions (daily)
     mr_fly          mr_fly_positions.parquet             NS fly XS positions (daily)
 
 Managed return convention: F_k[t] = (pos_k[t-1] × rx_d[t]).sum(pairs)
@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 # ── Re-export every blend algorithm from the equities layer ──────────────────
+from equities.blend import SIGNAL_VOL_TARGET
 from equities.blend import (                                        # noqa: F401
     BlendWeights,
     equal_weight,
@@ -74,7 +75,7 @@ SIGNAL_FILES: dict[str, str] = {
     "carry_E_only":   "signal_d_E_only_weights_daily.parquet",
     "carry_bnp_base": "signal_e_carry_daily.parquet",
     "carry_bnp_e3":   "signal_e_carry_daily.parquet",
-    "mr_ns_loo":      "mr_ns_loo_positions_daily.parquet",
+    "mean_reversion":      "mr_ns_loo_positions_daily.parquet",
     "mr_fly":         "mr_fly_positions.parquet",
 }
 
@@ -93,8 +94,8 @@ _RX_FILE = "rx_d.parquet"
 # ── Cross-pair blend (within each monthly signal) ────────────────────────────
 CROSS_PAIR_BLEND: dict[str, str] = {
     "momentum":  "inv_vol",
-    "mr_ns_loo": "inv_vol",
-    "carry_xs":  "inv_vol",
+    "mean_reversion": "inv_vol",
+    "carry":  "inv_vol",
 }
 _CROSS_PAIR_MIN_PAIR_MONTHS = 36    # min IS months a pair needs to be included
 
@@ -188,7 +189,7 @@ def load_managed_returns(
     if pairs is None:
         # Build default 19-pair intersection: rx_d ∩ all signal files.
         # MR files have 19 pairs (no USDTRY); that is the binding constraint.
-        mr_ns = _load_raw(SIGNAL_FILES["mr_ns_loo"])
+        mr_ns = _load_raw(SIGNAL_FILES["mean_reversion"])
         pairs = sorted(set(rx_d.columns) & set(mr_ns.columns))
 
     rx = rx_d[pairs]
@@ -255,13 +256,13 @@ def load_monthly_managed_returns(
 
     Signals:
         momentum   Momentum XS f=9m h=1       (monthly weights, shift(1) → rx_m)
-        mr_ns_loo  MR NS-LOO monthly VF-TS    (daily positions  → rx_d → monthly sum)
-        carry_xs   Carry XS monthly            (monthly weights, shift(1) → rx_m)
+        mean_reversion  MR NS-LOO monthly VF-TS    (daily positions  → rx_d → monthly sum)
+        carry      Carry XS monthly            (monthly weights, shift(1) → rx_m)
 
     Within each signal, per-pair PnL series are aggregated using inv_vol weights
     (IS σ × √12, frozen at cross_pair_is_end).
 
-    carry_dupuy is excluded: it has 0.82 IS / 0.79 OOS correlation with carry_xs.
+    carry_dupuy is excluded: it has 0.82 IS / 0.79 OOS correlation with carry.
 
     Returns
     -------
@@ -284,15 +285,15 @@ def load_monthly_managed_returns(
 
     pos_mr     = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
     pnl_mr_d   = pos_mr * rx_d.reindex(columns=pos_mr.columns)
-    pnl_mr     = _blend(pnl_mr_d.resample("BME").sum(), "mr_ns_loo")
+    pnl_mr     = _blend(pnl_mr_d.resample("BME").sum(), "mean_reversion")
 
     w_cxs   = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
-    pnl_cxs = _blend(w_cxs.shift(1) * rx_m.reindex(columns=w_cxs.columns), "carry_xs")
+    pnl_cxs = _blend(w_cxs.shift(1) * rx_m.reindex(columns=w_cxs.columns), "carry")
 
     F = pd.DataFrame({
         "momentum":  pnl_mom,
-        "mr_ns_loo": pnl_mr,
-        "carry_xs":  pnl_cxs,
+        "mean_reversion": pnl_mr,
+        "carry":  pnl_cxs,
     }).dropna()
     F.index.name = "date"
     return F
@@ -361,7 +362,7 @@ def run_fx_blend(
     F_is_raw  = F.loc[F.index <= is_end]
     F_oos_raw = F.loc[F.index >  is_end]
 
-    sigma = F_is_raw.std() * np.sqrt(12)
+    sigma = F_is_raw.std() * np.sqrt(12) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
     F_is  = F_is_raw.div(sigma)
     F_oos = F_oos_raw.div(sigma)
@@ -418,9 +419,9 @@ def run_fx_prod(
     # ── monthly positions for position-level turnover ─────────────────────────
     monthly_pos = {
         "momentum":  pd.read_parquet(sdir / "signal_a_f9_h1.parquet"),
-        "mr_ns_loo": (pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+        "mean_reversion": (pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
                       .resample("BME").last()),
-        "carry_xs":  pd.read_parquet(sdir / "view_xs_carry_m.parquet"),
+        "carry":  pd.read_parquet(sdir / "view_xs_carry_m.parquet"),
     }
     common_pairs = sorted(set.intersection(*[set(p.columns) for p in monthly_pos.values()]))
 
@@ -546,7 +547,7 @@ def tc_sweep_fx(
 
     TC is deducted AFTER blend weighting (cost scales with |w|, no rebate from
     negative weights), per signal:
-      momentum / carry_xs  : Σ_pair |Δpos_pair| × (h_pair_bp / 10_000)
+      momentum / carry  : Σ_pair |Δpos_pair| × (h_pair_bp / 10_000)
       mr_ns_loo            : Σ_pair daily |Δpos_pair| × (h_pair_bp / 10_000), summed to month
                              (mr_ns_loo rebalances daily, so TC accumulates intra-month)
 
@@ -589,8 +590,8 @@ def tc_sweep_fx(
     # Frozen cross-pair weights per signal (same as load_monthly_managed_returns)
     pair_pnl = {
         "momentum":  pos_mom.shift(1) * rx_m.reindex(columns=pos_mom.columns),
-        "mr_ns_loo": (pos_mr * rx_d.reindex(columns=pos_mr.columns)).resample("BME").sum(),
-        "carry_xs":  pos_cxs.shift(1) * rx_m.reindex(columns=pos_cxs.columns),
+        "mean_reversion": (pos_mr * rx_d.reindex(columns=pos_mr.columns)).resample("BME").sum(),
+        "carry":  pos_cxs.shift(1) * rx_m.reindex(columns=pos_cxs.columns),
     }
     pair_w: dict[str, pd.Series] = {}
     for sig, df in pair_pnl.items():
@@ -602,17 +603,17 @@ def tc_sweep_fx(
         return df.mul(pair_w[sig].reindex(df.columns).fillna(0.0), axis=1)
 
     # ── Precompute weighted per-pair |Δpos| (factor out of scenario loop) ─────
-    # momentum / carry_xs: monthly rebalance → one TC event per month per pair
+    # momentum / carry: monthly rebalance → one TC event per month per pair
     dpos_mom = _wcols(pos_mom.diff().abs(), "momentum")
-    dpos_cxs = _wcols(pos_cxs.diff().abs(), "carry_xs")
+    dpos_cxs = _wcols(pos_cxs.diff().abs(), "carry")
     # mr_ns_loo: daily rebalance → accumulate daily TC within each month, per pair
-    dpos_mr_m = _wcols(pos_mr.diff().abs().resample("BME").sum(), "mr_ns_loo")
+    dpos_mr_m = _wcols(pos_mr.diff().abs().resample("BME").sum(), "mean_reversion")
 
     # Monthly pair-weighted positions for blended-pair TO computation
     monthly_pos = {
         "momentum":  _wcols(pos_mom, "momentum"),
-        "mr_ns_loo": _wcols(pos_mr.resample("BME").last(), "mr_ns_loo"),
-        "carry_xs":  _wcols(pos_cxs, "carry_xs"),
+        "mean_reversion": _wcols(pos_mr.resample("BME").last(), "mean_reversion"),
+        "carry":  _wcols(pos_cxs, "carry"),
     }
     common_pairs = sorted(
         set.intersection(*[set(p.columns) for p in monthly_pos.values()])
@@ -664,7 +665,7 @@ def tc_sweep_fx(
     F_free_is  = F_gross.loc[F_gross.index <= is_end]
     F_free_oos = F_gross.loc[F_gross.index >= oos_start]
 
-    sigma_free = F_free_is.std() * np.sqrt(12)
+    sigma_free = F_free_is.std() * np.sqrt(12) / SIGNAL_VOL_TARGET
     sigma_free = sigma_free.replace(0.0, np.nan)
     F_free_is_n  = F_free_is.div(sigma_free)
     F_free_oos_n = F_free_oos.div(sigma_free)
@@ -687,8 +688,8 @@ def tc_sweep_fx(
         # Per-signal cost series; net = gross − cost (used only to FIT weights)
         C_tc = pd.DataFrame({
             "momentum":  _tc_series(dpos_mom).reindex(F_gross.index).fillna(0.0),
-            "mr_ns_loo": _tc_series(dpos_mr_m).reindex(F_gross.index).fillna(0.0),
-            "carry_xs":  _tc_series(dpos_cxs).reindex(F_gross.index).fillna(0.0),
+            "mean_reversion": _tc_series(dpos_mr_m).reindex(F_gross.index).fillna(0.0),
+            "carry":  _tc_series(dpos_cxs).reindex(F_gross.index).fillna(0.0),
         })
         F_tc = (F_gross - C_tc).dropna().sort_index()
         F_tc_is  = F_tc.loc[F_tc.index <= is_end]
@@ -841,7 +842,7 @@ def compare_blend_methods(
     F_is_raw  = F.loc[F.index <= IS_END]
     F_oos_raw = F.loc[F.index >  IS_END]
 
-    sigma = F_is_raw.std() * np.sqrt(12)
+    sigma = F_is_raw.std() * np.sqrt(12) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
     F_is  = F_is_raw.div(sigma)
     F_oos = F_oos_raw.div(sigma)
@@ -850,9 +851,9 @@ def compare_blend_methods(
     # Monthly signal position parquets for TO computation
     monthly_pos = {
         "momentum":  pd.read_parquet(sdir / "signal_a_f9_h1.parquet"),
-        "mr_ns_loo": (pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+        "mean_reversion": (pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
                       .resample("BME").last()),
-        "carry_xs":  pd.read_parquet(sdir / "view_xs_carry_m.parquet"),
+        "carry":  pd.read_parquet(sdir / "view_xs_carry_m.parquet"),
     }
     common_pairs = sorted(set.intersection(*[set(p.columns) for p in monthly_pos.values()]))
 
@@ -977,11 +978,11 @@ def load_pair_managed_returns(
 
     For each currency pair p the managed return at month t is:
         F[t, p] = Σ_{d in month t}  pos[d-1, p] × rx_d[d, p]   (MR — daily positions)
-        F[t, p] = pos[t-1, p] × rx_m[t, p]                      (momentum / carry_xs)
+        F[t, p] = pos[t-1, p] × rx_m[t, p]                      (momentum / carry)
 
     Parameters
     ----------
-    signal      One of "momentum", "mr_ns_loo", "carry_xs".
+    signal      One of "momentum", "mean_reversion", "carry".
     signals_dir Directory containing the parquet files.  Default: fx/signals/.
 
     Returns
@@ -999,13 +1000,13 @@ def load_pair_managed_returns(
         pairs = sorted(set(pos.columns) & set(rx_m.columns))
         F = (pos[pairs].shift(1) * rx_m.reindex(columns=pairs)).rename_axis("date")
 
-    elif signal == "mr_ns_loo":
+    elif signal == "mean_reversion":
         pos = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
         pairs = sorted(set(pos.columns) & set(rx_d.columns))
         daily = (pos[pairs] * rx_d.reindex(columns=pairs)).rename_axis("date")
         F = daily.resample("BME").sum()
 
-    elif signal == "carry_xs":
+    elif signal == "carry":
         pos = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
         pairs = sorted(set(pos.columns) & set(rx_m.columns))
         F = (pos[pairs].shift(1) * rx_m.reindex(columns=pairs)).rename_axis("date")
@@ -1037,7 +1038,7 @@ def _try_fx_pair_blend(
 
     Parameters
     ----------
-    signal          "momentum", "mr_ns_loo", or "carry_xs".
+    signal          "momentum", "mean_reversion", or "carry".
     signal_label    Display label for the header.
     signals_dir     Directory containing the parquet files.  Default: fx/signals/.
     is_end          Last IS date.  Default: IS_END ("2020-12-31").
@@ -1068,7 +1069,7 @@ def _try_fx_pair_blend(
     if F_is_raw.empty:
         raise ValueError(f"No IS data at or before {is_end} for signal '{signal}'.")
 
-    sigma = F_is_raw.std() * np.sqrt(12)
+    sigma = F_is_raw.std() * np.sqrt(12) / SIGNAL_VOL_TARGET
     sigma = sigma.replace(0.0, np.nan)
     F_is   = F_is_raw.div(sigma)
     F_oos  = F_oos_raw.div(sigma)
@@ -1093,7 +1094,8 @@ def _try_fx_pair_blend(
 
     def _to_m(w_df: pd.DataFrame, F: pd.DataFrame) -> float:
         # Drift-corrected: returns at the vol target pull weights off target each month.
-        return _drift_to(w_df, F * vol_target, freq=12, l1_norm=True)
+        # F is already at SIGNAL_VOL_TARGET annual vol; no further rescaling.
+        return _drift_to(w_df, F, freq=12, l1_norm=True)
 
     def _static_w_df(bw, F: pd.DataFrame) -> pd.DataFrame:
         w = bw.weights.reindex(pairs).fillna(0.0)
@@ -1268,7 +1270,7 @@ def try_mr_pair_blend(
     dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
     """
     return _try_fx_pair_blend(
-        signal="mr_ns_loo", signal_label="MEAN REVERSION",
+        signal="mean_reversion", signal_label="MEAN REVERSION",
         signals_dir=signals_dir, is_end=is_end,
         lookback=lookback, min_obs=min_obs, vol_target=vol_target,
     )
@@ -1292,7 +1294,7 @@ def try_carry_pair_blend(
     dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
     """
     return _try_fx_pair_blend(
-        signal="carry_xs", signal_label="CARRY",
+        signal="carry", signal_label="CARRY",
         signals_dir=signals_dir, is_end=is_end,
         lookback=lookback, min_obs=min_obs, vol_target=vol_target,
     )

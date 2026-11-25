@@ -5,6 +5,17 @@ Each asset class has a self-contained production pipeline that serialises PnL to
 
 IS/OOS split: **2020-12-31** (all asset classes).
 
+Two conventions are shared by every sleeve:
+
+- **Signal names.**  Each asset class runs exactly three production signals, named
+  `momentum`, `mean_reversion` and `carry`.
+- **Signal scale.**  Every signal panel handed to a blend estimator is normalised to
+  `SIGNAL_VOL_TARGET` (10%) annualised realised vol, so managed returns, sleeve
+  composites and cross-asset sleeves are all in the same money units and inverse-vol
+  weights are comparable across asset classes.  Ridge λ is applied relative to
+  `mean(diag(M))`, which makes the fit invariant to that scale and to the sampling
+  frequency, so the same λ means the same shrinkage everywhere.
+
 ---
 
 ## Repository Layout
@@ -163,7 +174,8 @@ Transaction costs are deducted per signal from their respective position parquet
 python -m fx.production.run
 ```
 
-Signals: momentum (XS f=9m h=1), TSMOM (Moskowitz-Ooi-Pedersen vol-scaled + equal-weight), carry (Dupuy leverage + E3 de-risk), MR (NS leave-one-out view-formation TS + fly).  View formations (xs_weights, ts_weights, ts_vol_weights) in `formations.py`.  Monthly and daily outputs in `fx/signals/`.
+Production signals (canonical names): `momentum` (XS f=9m h=1), `mean_reversion` (NS leave-one-out view-formation TS), `carry` (XS forward-discount rank).
+Also built, outside the production blend: TSMOM (Moskowitz-Ooi-Pedersen vol-scaled), Dupuy E-only leverage carry, BNP crash-conditioned carry (base / E3), NS fly.  View formations (xs_weights, ts_weights, ts_vol_weights) in `formations.py`.  Monthly and daily outputs in `fx/signals/`.
 
 ### Equities
 
@@ -172,7 +184,11 @@ from equities.production.pipeline import run_eq_prod
 run_eq_prod()
 ```
 
-Signals: TSMOM, threshold mean reversion, earnings revision.  Outputs in `equities/signals/`.
+Production signals (canonical names): `momentum`, `mean_reversion`, `carry`.
+These map onto research-signal variants via `PRODUCTION_SIGNAL_MAP`
+(`momentum`→tsmom, `mean_reversion`→threshold_mean_reversion, `carry`→earnings_revision);
+the research registry keeps its own `momentum` / `mean_reversion` / `carry` variants
+unchanged.  Outputs in `equities/signals/`.
 
 ### Commodities
 
@@ -181,7 +197,8 @@ from commodities.production.backtest import run_comparison
 run_comparison()
 ```
 
-Signals: TSMOM-252, XS carry enhanced, curvature.  Outputs in `commodities/signals/`.
+Production signals (canonical names): `momentum` (TSMOM-252), `carry` (XS carry enhanced),
+`mean_reversion` (NS butterfly curvature).  Outputs in `commodities/signals/`.
 
 ---
 

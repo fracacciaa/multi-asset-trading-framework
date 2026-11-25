@@ -115,6 +115,7 @@ def _eq_rows(is_end: str, oos_start: str) -> list[tuple[str, dict]]:
     from equities.blend import (
         load_signal_positions, load_rebal_dates, load_eq_returns_panel,
         PRODUCTION_SIGNALS, build_managed_returns, msrr_ridge, combine_signals,
+        signal_vol, normalise_to_target, to_position_weights,
     )
     from core.backtest import run_backtest
 
@@ -135,12 +136,14 @@ def _eq_rows(is_end: str, oos_start: str) -> list[tuple[str, dict]]:
 
     pos_is      = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
     F_is_raw    = build_managed_returns(pos_is, ret_is)
-    bw_all      = msrr_ridge(F_is_raw, lam=0.01)
+    sigma       = signal_vol(F_is_raw)
+    bw_all      = msrr_ridge(normalise_to_target(F_is_raw, sigma), lam=0.01)
 
     rows: list[tuple[str, dict]] = []
     for sig in PRODUCTION_SIGNALS:
-        bw_s   = msrr_ridge(F_is_raw[[sig]], lam=0.0)
-        comb_s = combine_signals({sig: positions[sig]}, bw_s)
+        bw_s   = msrr_ridge(normalise_to_target(F_is_raw[[sig]], sigma[[sig]]), lam=0.0)
+        comb_s = combine_signals({sig: positions[sig]},
+                                 to_position_weights(bw_s, sigma[[sig]]))
         fn_s   = _make_signal_fn(comb_s)
         r_s    = pd.concat([
             run_backtest(ret_is,  fn_s, rebalance_dates=vf_rebal,
@@ -150,7 +153,8 @@ def _eq_rows(is_end: str, oos_start: str) -> list[tuple[str, dict]]:
         ]).sort_index()
         rows.append((sig, _row(r_s, 252, is_end, oos_start)))
 
-    fn_all = _make_signal_fn(combine_signals(positions, bw_all))
+    fn_all = _make_signal_fn(combine_signals(positions,
+                                             to_position_weights(bw_all, sigma)))
     r_all  = pd.concat([
         run_backtest(ret_is,  fn_all, rebalance_dates=vf_rebal,
                      transaction_cost_bps=0.0)["daily_return"],
