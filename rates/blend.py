@@ -330,9 +330,9 @@ def run_blend(
     min_obs: int = 63,
 ) -> dict:
     """
-    Canonical rates blend pipeline (rolling OLS MSRR).
+    Canonical rates blend pipeline (rolling ridge).
 
-    Loads managed returns, vol-normalises using IS σ, runs rolling OLS on the
+    Loads managed returns, vol-normalises using IS σ, runs rolling ridge on the
     full timeline (IS + OOS) so the OOS window always has access to the IS tail.
 
     Returns
@@ -388,7 +388,7 @@ def run_rates_blend(
 
     Step 2 — Blend (rates/blend.run_blend):
         Loads the three PnL parquets, vol-normalises to unit annual vol using
-        IS σ, runs rolling OLS MSRR on the full timeline.
+        IS σ, runs rolling ridge on the full timeline.
 
     Parameters
     ----------
@@ -1046,7 +1046,7 @@ def run_rates_prod(
     """
     Production rates pipeline: blend signals, report metrics, return returns.
 
-    Runs the rolling OLS MSRR blend on all three production signals (momentum,
+    Runs the rolling ridge blend on all three production signals (momentum,
     carry, mean_reversion), prints an IS / OOS summary table (Sharpe, MDD,
     position-level turnover), and returns the full combined daily return series.
 
