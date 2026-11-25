@@ -44,7 +44,7 @@ from rates.production.ois_data import fetch_ois_curves
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-_BOND_PATH = "/Users/francescocaccia/Downloads/RATESSSSS.xlsx"
+_BOND_PATH = "RATESSSSS.xlsx"
 
 BOND_MARKETS: list[str] = ["US", "Germany", "UK", "Japan", "France", "Canada", "Australia"]
 
@@ -178,7 +178,8 @@ def bond_carry_panel(
         horizons = HORIZONS
 
     # Bond yields — sort columns ascending by tenor
-    all_bonds = load_bloomberg_excel(_BOND_PATH)
+    from core.paths import raw as _resolve
+    all_bonds = load_bloomberg_excel(str(_resolve(_BOND_PATH)))
     if market not in all_bonds:
         raise ValueError(f"Bond market {market!r} not found. Available: {list(all_bonds)}")
     bond_df = all_bonds[market].sort_index(axis=1)

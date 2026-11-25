@@ -42,7 +42,7 @@ import pandas as pd
 
 # ── File path ─────────────────────────────────────────────────────────────────
 
-_FX_PATH = "/Users/francescocaccia/Downloads/FXXXXXXXXX.xlsx"
+_FX_PATH = "FXXXXXXXXX.xlsx"
 
 # ── Universe ──────────────────────────────────────────────────────────────────
 
@@ -130,7 +130,8 @@ def _read_block(raw: pd.DataFrame, block: int) -> pd.Series:
 @lru_cache(maxsize=None)
 def _load_pair(pair: str, path: str = _FX_PATH) -> dict[tuple[str, str], pd.Series]:
     """Load all 31 blocks for a pair. Cached per (pair, path)."""
-    raw = pd.read_excel(path, sheet_name=pair, header=None)
+    from core.paths import raw as _resolve
+    raw = pd.read_excel(str(_resolve(path)), sheet_name=pair, header=None)
     out: dict[tuple[str, str], pd.Series] = {}
     for key, block in _BLOCK_INDEX.items():
         s = _read_block(raw, block)

@@ -77,6 +77,7 @@ _VF_POSITIONS_CACHE     = os.path.join(os.path.dirname(__file__), "cache", "vf_p
 _SIGNALS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "signals")
 _EQ_RETURNS_PARQUET   = os.path.join(_SIGNALS_DIR, "eq_prod_returns.parquet")
 _COMBINED_POS_PARQUET = os.path.join(_SIGNALS_DIR, "combined_positions.parquet")
+_REBAL_PARQUET        = os.path.join(_SIGNALS_DIR, "rebal_dates.parquet")
 
 _XS_ABLATIONS: dict[str, dict] = {
     "baseline":   {},
@@ -96,6 +97,9 @@ _TS_ABLATIONS: dict[str, dict] = {
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _load_or_build_vf_data(prices, fundamentals, returns, rebuild=False, verbose=True):
+    if not rebuild and os.path.exists(_REBAL_PARQUET):
+        idx = pd.read_parquet(_REBAL_PARQUET).index
+        return {"rebal_dates": list(idx)}
     os.makedirs(os.path.dirname(_VF_DATA_CACHE), exist_ok=True)
     if not rebuild and os.path.exists(_VF_DATA_CACHE):
         if verbose:
@@ -238,7 +242,7 @@ def run_eq_signals(
 
     prices       = fetch_prices(tickers=None)
     fundamentals = fetch_fundamentals(tickers=None)
-    returns      = prices.pct_change(fill_method=None).dropna(how="all")
+    returns      = load_eq_returns_panel()
 
     vf_data   = _load_or_build_vf_data(prices, fundamentals, returns, rebuild, verbose)
     positions = apply_vf_params(vf_data)
@@ -290,7 +294,7 @@ def run_vf_ablation(
 
     prices       = fetch_prices(tickers=None)
     fundamentals = fetch_fundamentals(tickers=None)
-    returns      = prices.pct_change(fill_method=None).dropna(how="all")
+    returns      = load_eq_returns_panel()
 
     vf_data = _load_or_build_vf_data(prices, fundamentals, returns, rebuild, verbose)
 
@@ -358,7 +362,7 @@ def run_eq_research_signals(
 
     prices       = fetch_prices(tickers=None)
     fundamentals = fetch_fundamentals(tickers=None)
-    returns      = prices.pct_change(fill_method=None).dropna(how="all")
+    returns      = load_eq_returns_panel()
 
     vf_data  = _load_or_build_research_vf_data(prices, fundamentals, rebuild, verbose)
     positions = apply_vf_params(vf_data)
@@ -454,7 +458,20 @@ def load_combined_positions(signals_dir: str | None = None) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+def load_eq_returns_panel(signals_dir: str | None = None) -> pd.DataFrame:
+    """Date × ticker daily return panel written by export_signals()."""
+    path = os.path.join(signals_dir or _SIGNALS_DIR, "returns.parquet")
+    return pd.read_parquet(path).dropna(how="all")
+
+
 def _load_or_build_positions(rebuild: bool = False, verbose: bool = True) -> dict:
+    if not rebuild:
+        paths = {k: os.path.join(_SIGNALS_DIR, f"{k}_positions.parquet")
+                 for k in PRODUCTION_SIGNALS}
+        if all(os.path.exists(p) for p in paths.values()):
+            if verbose:
+                print("Loading positions from signals/ parquets ...")
+            return {k: pd.read_parquet(p) for k, p in paths.items()}
     os.makedirs(os.path.dirname(_VF_POSITIONS_CACHE), exist_ok=True)
     if not rebuild and os.path.exists(_VF_POSITIONS_CACHE):
         if verbose:
@@ -524,9 +541,7 @@ def try_eq_blend(
     vf_data = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
     vf_rebal_dates = set(vf_data["rebal_dates"])
 
-    prices  = fetch_prices(tickers=None)
-    returns = prices.pct_change(fill_method=None).dropna(how="all")
-
+    returns = load_eq_returns_panel()
     ret_is  = returns.loc[returns.index <= is_end]
     ret_oos = returns.loc[returns.index >= oos_start]
 
@@ -650,8 +665,7 @@ def run_eq_blend(
     positions = _load_or_build_positions(rebuild, verbose)
     positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
 
-    prices  = fetch_prices(tickers=None)
-    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    returns = load_eq_returns_panel()
     ret_is  = returns.loc[returns.index <= is_end]
 
     pos_is = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
@@ -705,8 +719,7 @@ def run_eq_prod(
     vf_data        = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
     vf_rebal_dates = set(vf_data["rebal_dates"])
 
-    prices  = fetch_prices(tickers=None)
-    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    returns = load_eq_returns_panel()
     ret_is  = returns.loc[returns.index <= is_end]
     ret_oos = returns.loc[returns.index >= oos_start]
 
@@ -760,8 +773,7 @@ def tc_sweep_eq(
     vf_data        = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
     vf_rebal_dates = set(vf_data["rebal_dates"])
 
-    prices  = fetch_prices(tickers=None)
-    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    returns = load_eq_returns_panel()
     ret_is  = returns.loc[returns.index <= is_end]
     ret_oos = returns.loc[returns.index >= oos_start]
 
@@ -1016,8 +1028,7 @@ def compare_blend_methods(
     vf_data        = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
     vf_rebal_dates = set(vf_data["rebal_dates"])
 
-    prices  = fetch_prices(tickers=None)
-    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    returns = load_eq_returns_panel()
     ret_is  = returns.loc[returns.index <= is_end]
     ret_oos = returns.loc[returns.index >= oos_start]
 
@@ -1143,7 +1154,10 @@ def export_signals(
     eq_prod_returns, combined_positions and one {signal}_positions per production
     signal.  Same construction as run_eq_prod (tc_bps = 0).
     """
-    from equities.production.data import fetch_prices
+    import datetime
+    import json
+    import subprocess
+
     from equities.blend import build_managed_returns, msrr_ridge, combine_signals
     from core.backtest import run_backtest
 
@@ -1155,8 +1169,7 @@ def export_signals(
     vf_data        = _load_or_build_vf_data(None, None, None, rebuild=False, verbose=False)
     vf_rebal_dates = set(vf_data["rebal_dates"])
 
-    prices  = fetch_prices(tickers=None)
-    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    returns = load_eq_returns_panel()
     ret_is  = returns.loc[returns.index <= is_end]
     ret_oos = returns.loc[returns.index >= oos_start]
 
@@ -1171,7 +1184,33 @@ def export_signals(
     combined.to_parquet(os.path.join(out, "combined_positions.parquet"))
     for k, v in positions.items():
         v.to_parquet(os.path.join(out, f"{k}_positions.parquet"))
-    print(f"Wrote eq_prod_returns, combined_positions and {len(positions)} signal position files to {out}")
+    pd.DataFrame(index=pd.DatetimeIndex(sorted(vf_rebal_dates), name="date")) \
+      .to_parquet(os.path.join(out, "rebal_dates.parquet"))
+
+    _sha_r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                            capture_output=True, text=True)
+    manifest = {
+        "universe":  sorted(returns.columns.tolist()),
+        "start":     str(returns.index[0].date()) if not returns.empty else None,
+        "end":       str(returns.index[-1].date()) if not returns.empty else None,
+        "is_end":    is_end,
+        "oos_start": oos_start,
+        "params":    {"lam": lam, "signals": PRODUCTION_SIGNALS},
+        "files": {
+            "returns":              "date × ticker; daily price-change return panel",
+            "eq_prod_returns":      "date × 1; combined production blend daily return (TC-free)",
+            "combined_positions":   "date × ticker; combined signal position (msrr_ridge blend)",
+            "rebal_dates":          "empty DataFrame, index = VF rebalance dates",
+            **{f"{k}_positions": f"date × ticker; {k} ViewFormation positions" for k in PRODUCTION_SIGNALS},
+        },
+        "git_sha":   _sha_r.stdout.strip() if _sha_r.returncode == 0 else "unknown",
+        "built_at":  datetime.datetime.utcnow().isoformat() + "Z",
+    }
+    with open(os.path.join(out, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2, default=str)
+
+    print(f"Wrote eq_prod_returns, combined_positions, {len(positions)} signal position files, "
+          f"rebal_dates, and manifest.json to {out}")
 
 
 if __name__ == "__main__":

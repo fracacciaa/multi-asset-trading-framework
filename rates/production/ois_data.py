@@ -39,7 +39,7 @@ import pandas as pd
 from functools import lru_cache
 from typing import Optional
 
-_OIS_PATH = "/Users/francescocaccia/Downloads/SWAPPPPP RATES.xlsx"
+_OIS_PATH = "SWAPPPPP RATES.xlsx"
 
 # Market display name → sheet name
 OIS_SHEETS: dict[str, str] = {
@@ -81,7 +81,8 @@ def _parse_ois_sheet(path: str, sheet: str) -> pd.DataFrame:
 
     Handles deduplication: 12M and 1Y both map to 1.0Y and are averaged.
     """
-    raw = pd.read_excel(path, sheet_name=sheet, header=None)
+    from core.paths import raw as _resolve
+    raw = pd.read_excel(str(_resolve(path)), sheet_name=sheet, header=None)
 
     # Row 3: tenor labels at cols 0, 3, 6, ...
     tenor_row = raw.iloc[3, :]

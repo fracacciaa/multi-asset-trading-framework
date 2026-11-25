@@ -99,7 +99,7 @@ def fetch_prices(
     tickers: Optional[list],
     start: Optional[str] = None,
     end: Optional[str] = None,
-    path: str = "/Users/francescocaccia/Downloads/EQH saved.xlsx",
+    path: str = "EQH saved.xlsx",
 ) -> pd.DataFrame:
     """
     Return adjusted close prices (date × ticker), optionally filtered.
@@ -113,7 +113,8 @@ def fetch_prices(
         ret = pd.read_parquet(_RETURNS_PARQUET)
         prices = (1.0 + ret.fillna(0.0)).cumprod()
         return _slice(prices, tickers, start, end)
-    data = _cached_load(path)
+    from core.paths import raw as _resolve
+    data = _cached_load(str(_resolve(path)))
     return _slice(data["prices"], tickers, start, end)
 
 
@@ -121,16 +122,18 @@ def fetch_fundamentals(
     tickers: Optional[list],
     start: Optional[str] = None,
     end: Optional[str] = None,
-    path: str = "/Users/francescocaccia/Downloads/EQH saved.xlsx",
+    path: str = "EQH saved.xlsx",
 ) -> dict:
     """Return fundamental DataFrames (market_cap, fcf, shares_out, eps_fwd), optionally filtered."""
-    data = _cached_load(path)
+    from core.paths import raw as _resolve
+    data = _cached_load(str(_resolve(path)))
     return {f: _slice(data[f], tickers, start, end) for f in _FIELDS if f != "prices"}
 
 
-def fetch_universe(path: str = "/Users/francescocaccia/Downloads/EQH saved.xlsx") -> list[str]:
+def fetch_universe(path: str = "EQH saved.xlsx") -> list[str]:
     """Return all ticker symbols available in the data file."""
-    return list(_cached_load(path)["prices"].columns)
+    from core.paths import raw as _resolve
+    return list(_cached_load(str(_resolve(path)))["prices"].columns)
 
 
 def _slice(

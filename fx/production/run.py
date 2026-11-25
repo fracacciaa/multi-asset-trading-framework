@@ -26,7 +26,9 @@ Plus manifest.json.
 
 from __future__ import annotations
 
+import datetime
 import json
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -62,6 +64,8 @@ def run(
     end=None,
     output_dir: Path | None = None,
     path: str | None = None,
+    is_end: str = "2020-12-31",
+    oos_start: str = "2021-01-01",
     verbose: bool = True,
 ) -> dict:
     """
@@ -222,7 +226,10 @@ def run(
     _save("view_ts_carry_daily.parquet",  ts_weights(fd_d))
 
     # ── Manifest ───────────────────────────────────────────────────────────────
+    _sha_r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                            capture_output=True, text=True)
     manifest = {
+        "universe":    sorted(pairs),
         "fcu_base":           sorted(FCU_BASE),
         "no_fwd_pairs":       sorted(NO_FWD_PAIRS),
         "excluded":           panels["excluded"],
@@ -257,6 +264,25 @@ def run(
             "fly_pnl_type":      "rx_d",
             "oos_sr_fly":        0.366,
         },
+        "start":     str(start) if start else None,
+        "end":       str(end) if end else None,
+        "is_end":    is_end,
+        "oos_start": oos_start,
+        "params":    {"lam_grid": str(LAM_GRID)},
+        "files": {
+            "returns":                        "date × (surface-col, pair) MultiIndex cols; monthly",
+            "rx_d":                           "date × pair; daily FX excess returns",
+            "signal_a_f9_h1":                 "date × pair; XS momentum f=9m h=1 (monthly rebalance)",
+            "signal_d_E_only_weights_daily":  "date × pair; rolling MV carry, E-only (daily)",
+            "signal_e_carry_daily":           "date × (base_weights/e3_weights, pair); crash-risk carry (daily)",
+            "mr_ns_loo_signal":               "date × pair; NS LOO VF TS z-score (monthly rebalance)",
+            "mr_ns_loo_positions":            "date × pair; NS LOO VF TS positions (monthly)",
+            "mr_ns_loo_positions_daily":      "date × pair; NS LOO XS positions (daily, n=4)",
+            "mr_fly_signal":                  "date × pair; NS fly z-score",
+            "mr_fly_positions":               "date × pair; NS fly XS positions (daily, n=4)",
+        },
+        "git_sha":   _sha_r.stdout.strip() if _sha_r.returncode == 0 else "unknown",
+        "built_at":  datetime.datetime.utcnow().isoformat() + "Z",
     }
     with open(out_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2, default=str)
@@ -276,6 +302,9 @@ def run(
         "mr_fly_pos":    fly_pos if not fly_raw.empty else pd.DataFrame(),
         "manifest":      manifest,
     }
+
+
+export_signals = run
 
 
 if __name__ == "__main__":

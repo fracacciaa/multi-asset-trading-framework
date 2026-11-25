@@ -27,18 +27,16 @@ import numpy as np
 from functools import lru_cache
 from typing import Optional
 
-_BASE = "/Users/francescocaccia/Downloads/"
+_PATH_PRICE  = "GEN_PRICE (1).xlsx"
+_PATH_OI     = "GEN_OI.xlsx"
+_PATH_OI_AGG = "GEN_OI_AGG.xlsx"
+_PATH_TICKER = "GEN_TICKER (1).xlsx"
+_PATH_FAR    = "ULTIMO TOMMI BBG (2).xlsx"
 
-_PATH_PRICE  = _BASE + "GEN_PRICE (1).xlsx"
-_PATH_OI     = _BASE + "GEN_OI.xlsx"
-_PATH_OI_AGG = _BASE + "GEN_OI_AGG.xlsx"
-_PATH_TICKER = _BASE + "GEN_TICKER (1).xlsx"
-_PATH_FAR    = _BASE + "ULTIMO TOMMI BBG (2).xlsx"
-
-_PATH_POWER_PRICE  = _BASE + "POWER_PRICE.xlsx"
-_PATH_POWER_OI     = _BASE + "POWER_OI.xlsx"
-_PATH_POWER_OI_AGG = _BASE + "POWER_OI_AGG.xlsx"
-_PATH_POWER_TICKER = _BASE + "POWER_TICKERS.xlsx"
+_PATH_POWER_PRICE  = "POWER_PRICE.xlsx"
+_PATH_POWER_OI     = "POWER_OI.xlsx"
+_PATH_POWER_OI_AGG = "POWER_OI_AGG.xlsx"
+_PATH_POWER_TICKER = "POWER_TICKERS.xlsx"
 
 _POWER_LIQUID = ["DET", "ITP", "FAC", "PHB"]
 
@@ -124,7 +122,8 @@ def _cached_parse(
     n_contracts: int,
     numeric: bool,
 ) -> dict[str, pd.DataFrame]:
-    raw = pd.read_excel(path, sheet_name=sheet_name, header=0)
+    from core.paths import raw as _resolve
+    raw = pd.read_excel(str(_resolve(path)), sheet_name=sheet_name, header=0)
     return _parse_bloomberg_wide(raw, n_contracts=n_contracts, numeric=numeric)
 
 

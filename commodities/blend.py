@@ -221,8 +221,9 @@ def build_signal_parquets(
     if panels is None:
         panels = _signal_panels(params)
 
-    print("Computing managed returns …")
-    for blend_key, (_, F_i) in panels.items():
+    print("Computing managed returns and instrument positions …")
+    w_eff_all: dict[str, pd.DataFrame] = {}
+    for blend_key, (w, F_i) in panels.items():
         F_k = _aggregate_instruments(F_i, CROSS_INSTRUMENT_BLEND[blend_key], is_end)
         F_k = F_k.replace(0.0, np.nan).dropna()
         F_k.index.name = "date"
@@ -231,6 +232,34 @@ def build_signal_parquets(
         F_k.to_frame().to_parquet(path)
         sr = F_k.mean() / F_k.std() * np.sqrt(252)
         print(f"  {blend_key:15s}  SR={sr:+.3f}  rows={len(F_k)}  → {path.name}")
+
+        v = _instrument_multipliers(F_i, CROSS_INSTRUMENT_BLEND[blend_key], is_end)
+        w_eff = w.mul(v.reindex(w.columns).fillna(0.0), axis=1)
+        w_eff.index.name = "date"
+        w_eff.to_parquet(out_dir / f"{blend_key}_positions.parquet")
+        w_eff_all[blend_key] = w_eff
+        print(f"  {blend_key:15s}  positions → {blend_key}_positions.parquet")
+
+    # Combined instrument-level position (blend-weighted)
+    res = run_comm_blend(signals_dir=out_dir, is_end=is_end)
+    w_is, w_oos = res["weights_is"], res["weights_oos"]
+    alpha_full = pd.concat([w_is, w_oos]).sort_index()
+    F_raw   = load_managed_returns(signals_dir=out_dir)
+    sigma_k = F_raw.loc[F_raw.index <= is_end].std() * np.sqrt(252)
+    names   = list(w_is.columns)
+    all_idx  = w_eff_all[names[0]].index
+    all_cols = w_eff_all[names[0]].columns
+    a_df    = alpha_full.reindex(all_idx).ffill().fillna(0.0)
+    a_norm  = a_df.div(sigma_k.reindex(a_df.columns), axis=1).fillna(0.0)
+    W_blend = pd.DataFrame(0.0, index=all_idx, columns=all_cols)
+    for k in names:
+        if k in w_eff_all:
+            W_blend += (w_eff_all[k]
+                        .reindex(index=all_idx, columns=all_cols).fillna(0.0)
+                        .mul(a_norm[k], axis=0))
+    W_blend.index.name = "date"
+    W_blend.to_parquet(out_dir / "combined_positions.parquet")
+    print(f"  combined         positions → combined_positions.parquet")
 
     print("Done.")
 
@@ -433,7 +462,6 @@ def run_commodities_blend(
 
 def run_comm_prod(
     is_end: str = IS_END,
-    params: dict | None = None,
     min_obs: int = 252,
     rebuild_signals: bool = False,
     vol_target: float = 0.10,
@@ -456,14 +484,7 @@ def run_comm_prod(
     -------
     pd.Series — daily return series named "commodities", IS then OOS.
     """
-    from commodities.production.backtest import (
-        PARAMS as _PARAMS, specific_contract_returns, _build_signals,
-        vol_scale, rebalance,
-    )
-    from commodities.production.data import fetch_prices, fetch_term_structure, fetch_tickers
-
     TD = 252
-    p  = params or {**_PARAMS, **BLEND_PARAMS}
 
     # ── 1. Blend ──────────────────────────────────────────────────────────────
     res   = run_commodities_blend(is_end=is_end, min_obs=min_obs,
@@ -472,51 +493,18 @@ def run_comm_prod(
     r_oos = res["r_oos"]
     w_is  = res["weights_is"]   # T_is × 3  (L1-normalised blend weights)
     w_oos = res["weights_oos"]  # T_oos × 3
+    names = list(w_is.columns)
 
-    # ── 2. Instrument-level weights for turnover ──────────────────────────────
-    prices   = fetch_prices()
-    ts_data  = fetch_term_structure()
-    tk       = fetch_tickers()
-    returns  = specific_contract_returns(ts_data, tk).reindex(columns=prices.columns)
-    raw_sigs = _build_signals(prices, ts_data, tk, p)
-
-    _name_map = {
-        "tsmom_252":         "tsmom_252",
-        "xs_carry_enh_f1f2": "xs_carry_enh",
-        "curvature":         "curvature",
-    }
-    w_k: dict[str, pd.DataFrame] = {}
-    for raw_key, blend_key in _name_map.items():
-        if raw_key not in raw_sigs:
-            continue
-        sig = raw_sigs[raw_key].reindex(index=returns.index, columns=returns.columns)
-        w   = vol_scale(sig, returns, target_vol=p["asset_vol"], com=p["vol_com"])
-        w   = rebalance(w, rule=p["rebal"])
-        F_i = (w.shift(p["lag"]) * returns).dropna(how="all", axis=1)
-        v   = _instrument_multipliers(F_i, CROSS_INSTRUMENT_BLEND[blend_key], is_end)
-        w_k[blend_key] = w.mul(v.reindex(w.columns).fillna(0.0), axis=1)
-
-    # ── 3. Blended instrument weights ─────────────────────────────────────────
-    names    = list(w_is.columns)
-    all_idx  = w_k[names[0]].index
-    all_cols = w_k[names[0]].columns
+    # ── 2. Load instrument-level combined positions from committed parquet ─────
+    _combined_path = _SIGNALS_DIR / "combined_positions.parquet"
+    if not _combined_path.exists():
+        raise FileNotFoundError(
+            f"{_combined_path} not found. "
+            "Run commodities.blend.build_signal_parquets() to generate it."
+        )
+    W_blend  = pd.read_parquet(_combined_path)
+    all_idx  = W_blend.index
     ts_cut   = pd.Timestamp(is_end)
-
-    # Returns are Σ_k a_k · F_k / σ_k, so instrument weights carry a_k / σ_k.
-    F_raw    = load_managed_returns()
-    sigma_k  = F_raw.loc[F_raw.index <= ts_cut].std() * np.sqrt(TD)
-    alpha_full = pd.concat([w_is, w_oos]).sort_index()
-    a_df       = (alpha_full
-                  .reindex(all_idx).ffill().fillna(0.0))
-    a_norm     = a_df.div(sigma_k.reindex(a_df.columns), axis=1).fillna(0.0)
-
-    W_blend = pd.DataFrame(0.0, index=all_idx, columns=all_cols)
-    for k in names:
-        if k in w_k:
-            W_blend += (w_k[k]
-                        .reindex(index=all_idx, columns=all_cols)
-                        .fillna(0.0)
-                        .mul(a_norm[k], axis=0))
 
     def _inst_to(w: pd.DataFrame, freq: int) -> float:
         gross = w.abs().sum(axis=1).replace(0.0, np.nan)
@@ -562,6 +550,66 @@ def run_comm_prod(
     r_full = pd.concat([r_is, r_oos]).sort_index()
     r_full.name = "commodities"
     return r_full
+
+
+def export_signals(
+    output_dir: "str | Path | None" = None,
+    params: "dict | None" = None,
+    is_end: str = IS_END,
+    oos_start: str = OOS_START,
+) -> None:
+    """
+    Build commodities signal parquets and write manifest.json to commodities/signals/.
+
+    Thin wrapper around build_signal_parquets() that also records provenance.
+    Call once with Bloomberg data present; downstream layers read parquets only.
+    """
+    import datetime
+    import json
+    import subprocess
+
+    out_dir = Path(output_dir) if output_dir else _SIGNALS_DIR
+    build_signal_parquets(output_dir=out_dir, params=params, is_end=is_end)
+
+    # Derive universe and date range from the written managed-return parquets
+    F = load_managed_returns(signals_dir=out_dir)
+    start_str = str(F.index[0].date()) if not F.empty else None
+    end_str   = str(F.index[-1].date()) if not F.empty else None
+
+    _sha_r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                            capture_output=True, text=True)
+
+    # Read one per-signal positions file to get instrument universe
+    pos_path = out_dir / f"{list(SIGNAL_FILES)[0]}_positions.parquet"
+    universe: list = []
+    if pos_path.exists():
+        import pandas as _pd
+        universe = sorted(_pd.read_parquet(pos_path).columns.tolist())
+
+    manifest = {
+        "universe":  universe,
+        "start":     start_str,
+        "end":       end_str,
+        "is_end":    is_end,
+        "oos_start": oos_start,
+        "params":    params or BLEND_PARAMS,
+        "files": {
+            k: v for k, v in {
+                "tsmom_252_pnl":        "date × 1; aggregated managed return (daily)",
+                "xs_carry_enh_pnl":     "date × 1; aggregated managed return (daily)",
+                "curvature_pnl":        "date × 1; aggregated managed return (daily)",
+                "tsmom_252_positions":        "date × instrument; vol-scaled eff. weight panel",
+                "xs_carry_enh_positions":     "date × instrument; vol-scaled eff. weight panel",
+                "curvature_positions":        "date × instrument; vol-scaled eff. weight panel",
+                "combined_positions":   "date × instrument; blend-weighted combined position",
+            }.items()
+        },
+        "git_sha":   _sha_r.stdout.strip() if _sha_r.returncode == 0 else "unknown",
+        "built_at":  datetime.datetime.utcnow().isoformat() + "Z",
+    }
+    with open(out_dir / "manifest.json", "w") as fh:
+        json.dump(manifest, fh, indent=2, default=str)
+    print(f"  Wrote manifest.json")
 
 
 from equities.blend import RollingMSRR as _RollingMSRR   # noqa: E402

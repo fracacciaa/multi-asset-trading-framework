@@ -73,8 +73,8 @@ ASSET_CLASSES = ["equities", "rates", "fx", "commodities"]
 # Equities uses numeric one-way TC bps (no named scenarios in tc_sweep_eq).
 TC_SCENARIOS_ASSETS: dict[str, dict] = {
     "scenario 1": {"rates": "best",  "fx": "best",  "commodities": "best",  "equities": 0.25},
-    "scenario 2": {"rates": "base",  "fx": "base",  "commodities": "base",  "equities": 0.50},
-    "scenario 3": {"rates": "worst", "fx": "worst", "commodities": "worst", "equities": 1.00},
+    "scenario 2": {"rates": "base",  "fx": "base",  "commodities": "base",  "equities": 1.00},
+    "scenario 3": {"rates": "worst", "fx": "worst", "commodities": "worst", "equities": 2.00},
 }
 
 
@@ -113,7 +113,7 @@ def load_asset_returns(
     Only months where all four series have data are returned (inner join).
     """
     if equities_r is None:
-        from equities.production.pipeline import load_eq_returns
+        from equities.blend import load_eq_returns
         if verbose:
             print("  loading equities composite return …")
         equities_r = load_eq_returns()
@@ -532,7 +532,7 @@ def _build_position_turnover_series() -> pd.DataFrame:
         return (delta / gross) * 12  # already monthly, × 12 annualises
 
     # ── Equities ──────────────────────────────────────────────────────────────
-    from equities.production.pipeline import load_combined_positions as _load_eq_pos
+    from equities.blend import load_combined_positions as _load_eq_pos
     _comb_eq = _load_eq_pos()
     to_eq = _daily_ann_to(_comb_eq).resample("BME").last().rename("equities")
 
@@ -606,65 +606,14 @@ def _build_position_turnover_series() -> pd.DataFrame:
     ).rename("fx")
 
     # ── Commodities ───────────────────────────────────────────────────────────
-    from commodities.production.backtest import (
-        PARAMS as _CP,
-        specific_contract_returns as _spec_rets,
-        _build_signals as _cbuild,
-        vol_scale as _cvs,
-        rebalance as _creb,
-        book_scale as _cbook,
-    )
-    from commodities.production.data import (
-        fetch_prices as _fetch_comm,
-        fetch_term_structure as _fetch_ts,
-        fetch_tickers as _fetch_tk,
-    )
-    from commodities.blend import run_comm_blend as _run_comm_blend
-
-    with contextlib.redirect_stdout(_io.StringIO()):
-        _comm_res = _run_comm_blend()
-
-    _px_c   = _fetch_comm()
-    _ts_c   = _fetch_ts()
-    _tk_c   = _fetch_tk()
-    _ret_c  = _spec_rets(_ts_c, _tk_c).reindex(columns=_px_c.columns)
-    _rsigs  = _cbuild(_px_c, _ts_c, _tk_c, _CP)
-
-    _cname_map = {
-        "tsmom_252":         "tsmom_252",
-        "xs_carry_enh_f1f2": "xs_carry_enh",
-        "curvature":         "curvature",
-    }
-    _w_k_c: dict[str, pd.DataFrame] = {}
-    for _rk, _bk in _cname_map.items():
-        if _rk not in _rsigs:
-            continue
-        _sig_c = _rsigs[_rk].reindex(index=_ret_c.index, columns=_ret_c.columns)
-        _w_c   = _cvs(_sig_c, _ret_c, target_vol=_CP["asset_vol"], com=_CP["vol_com"])
-        _w_c   = _creb(_w_c, rule=_CP["rebal"])
-        _w_c   = _cbook(_w_c, _ret_c, target_vol=_CP["book_vol"],
-                        cov_hl=_CP["cov_hl"], k_max=_CP["k_max"])
-        _w_k_c[_bk] = _w_c
-
-    _w_is_c   = _comm_res["weights_is"]
-    _w_oos_c  = _comm_res["weights_oos"]
-    _alpha_c  = pd.concat([_w_is_c, _w_oos_c]).sort_index()
-    _all_idx  = _w_k_c[list(_w_k_c)[0]].index
-    _all_cols = _w_k_c[list(_w_k_c)[0]].columns
-
-    _a_df   = _alpha_c.reindex(_all_idx).ffill().fillna(0.0)
-    _norms  = _a_df.abs().sum(axis=1).replace(0.0, np.nan)
-    _a_norm = _a_df.div(_norms, axis=0).fillna(0.0)
-
-    _W_comm = pd.DataFrame(0.0, index=_all_idx, columns=_all_cols)
-    for _ck in _a_norm.columns:
-        if _ck in _w_k_c:
-            _W_comm += (
-                _w_k_c[_ck]
-                .reindex(index=_all_idx, columns=_all_cols).fillna(0.0)
-                .mul(_a_norm[_ck], axis=0)
-            )
-
+    from pathlib import Path as _CommPath
+    _comm_pos_path = _CommPath(__file__).parent.parent / "commodities" / "signals" / "combined_positions.parquet"
+    if not _comm_pos_path.exists():
+        raise FileNotFoundError(
+            f"{_comm_pos_path} not found. "
+            "Run commodities.blend.build_signal_parquets() to generate it."
+        )
+    _W_comm = pd.read_parquet(_comm_pos_path)
     to_comm = _daily_ann_to(_W_comm).resample("BME").last().rename("commodities")
 
     to_df = pd.DataFrame({
@@ -1065,15 +1014,16 @@ def run_assets_tc(
     from rates.blend       import tc_sweep_rates
     from fx.blend          import tc_sweep_fx
     from commodities.blend import tc_sweep_comm
-    from equities.production.pipeline import tc_sweep_eq
+    from equities.blend import tc_sweep_eq
 
     # ── 1. Run per-asset TC sweeps, suppress their print output ──────────────
     print("Running per-asset TC sweeps …")
     with contextlib.redirect_stdout(_io.StringIO()):
+        eq_tc_bps = sorted({s["equities"] for s in scenarios.values()})
         _, rates_ret = tc_sweep_rates(_collect_returns=True)
         _, fx_ret    = tc_sweep_fx(_collect_returns=True)
         _, comm_ret  = tc_sweep_comm(_collect_returns=True)
-        _, eq_ret    = tc_sweep_eq(_collect_returns=True)
+        _, eq_ret    = tc_sweep_eq(tc_bps_list=eq_tc_bps, _collect_returns=True)
 
     # ── 1b. Instrument-level position turnover (computed once, reused) ────────
     print("Computing instrument-level turnover …")

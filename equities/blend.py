@@ -1624,3 +1624,142 @@ class STMOM:
             X_flat = self._model(torch.tensor(U.reshape(T * N, input_dim))).numpy()
         X = X_flat.reshape(T, N)
         return pd.DataFrame(X, index=all_dates, columns=self._tickers)
+
+
+# ── Parquet loaders (no production imports) ───────────────────────────────────
+
+import os as _os
+
+_EQ_SIGNALS_DIR = _os.path.join(_os.path.dirname(__file__), "signals")
+
+PRODUCTION_SIGNALS: list[str] = ["tsmom", "threshold_mean_reversion", "earnings_revision"]
+
+
+def load_eq_returns(signals_dir: str | None = None) -> pd.Series:
+    path = _os.path.join(signals_dir or _EQ_SIGNALS_DIR, "eq_prod_returns.parquet")
+    s = pd.read_parquet(path).iloc[:, 0]
+    s.name = "eq_prod"
+    return s
+
+
+def load_eq_returns_panel(signals_dir: str | None = None) -> pd.DataFrame:
+    """Date × ticker daily return panel written by export_signals()."""
+    path = _os.path.join(signals_dir or _EQ_SIGNALS_DIR, "returns.parquet")
+    return pd.read_parquet(path).dropna(how="all")
+
+
+def load_combined_positions(signals_dir: str | None = None) -> pd.DataFrame:
+    path = _os.path.join(signals_dir or _EQ_SIGNALS_DIR, "combined_positions.parquet")
+    return pd.read_parquet(path)
+
+
+def load_signal_positions(
+    signals: list[str] | None = None,
+    signals_dir: str | None = None,
+) -> dict[str, pd.DataFrame]:
+    sigs = signals or PRODUCTION_SIGNALS
+    sdir = signals_dir or _EQ_SIGNALS_DIR
+    return {k: pd.read_parquet(_os.path.join(sdir, f"{k}_positions.parquet")) for k in sigs}
+
+
+def load_rebal_dates(signals_dir: str | None = None) -> list:
+    path = _os.path.join(signals_dir or _EQ_SIGNALS_DIR, "rebal_dates.parquet")
+    return list(pd.read_parquet(path).index)
+
+
+def tc_sweep_eq(
+    tc_bps_list: list = (0.25, 1.0, 2.0),
+    is_end: str = "2020-12-31",
+    oos_start: str = "2021-01-01",
+    lam: float = 0.01,
+    _collect_returns: bool = False,
+) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
+    """
+    TC sensitivity sweep for the equity msrr_ridge blend, parquet-only.
+
+    Identical logic to equities.production.pipeline.tc_sweep_eq but reads from
+    committed parquets via the blend-layer loaders — no production imports.
+    """
+    from core.backtest import run_backtest
+    from core.performance import sharpe_ratio, max_drawdown
+
+    positions      = load_signal_positions()
+    vf_rebal_dates = set(load_rebal_dates())
+    returns        = load_eq_returns_panel()
+
+    ret_is  = returns.loc[returns.index <= is_end]
+    ret_oos = returns.loc[returns.index >= oos_start]
+
+    pos_is   = {k: v.loc[v.index <= is_end] for k, v in positions.items()}
+    F_is     = build_managed_returns(pos_is, ret_is)
+    bw       = msrr_ridge(F_is, lam=lam)
+    combined = combine_signals(positions, bw)
+
+    def _sig_fn(date):
+        avail = combined.index[combined.index <= date]
+        if avail.empty:
+            return pd.Series(dtype=float)
+        return combined.loc[avail[-1]]
+
+    def _stats(bt):
+        return {
+            "sharpe":       sharpe_ratio(bt["daily_return"]),
+            "max_drawdown": max_drawdown(bt["nav"]),
+            "ann_turnover": float(bt["turnover"].mean() * 252),
+        }
+
+    records = []
+    _returns_dict: dict = {}
+
+    for tc in tc_bps_list:
+        bt_is  = run_backtest(ret_is,  _sig_fn, rebalance_dates=vf_rebal_dates,
+                              transaction_cost_bps=tc)
+        bt_oos = run_backtest(ret_oos, _sig_fn, rebalance_dates=vf_rebal_dates,
+                              transaction_cost_bps=tc)
+
+        if _collect_returns:
+            _returns_dict[("Static Ridge [prod]", tc)] = pd.concat(
+                [bt_is["daily_return"], bt_oos["daily_return"]]
+            ).sort_index()
+
+        for period, bt in [("IS", bt_is), ("OOS", bt_oos)]:
+            s = _stats(bt)
+            records.append({
+                "TC_bps":  tc,
+                "Period":  period,
+                "Sharpe":  s["sharpe"],
+                "MDD_pct": s["max_drawdown"] * 100,
+                "TO":      s["ann_turnover"],
+            })
+
+    df = pd.DataFrame(records)
+
+    W = 68
+    print("\n" + "=" * W)
+    print("  EQUITIES TC SWEEP — msrr_ridge blend")
+    print(f"  IS ≤ {is_end}   |   OOS ≥ {oos_start}   |   λ={lam}")
+    print("  TC is one-way per side (bps)")
+    print("=" * W)
+    print(f"  {'TC (bps)':<10}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'TO':>8}")
+    print("  " + "─" * (W - 2))
+
+    prev_tc = None
+    for _, row in df.iterrows():
+        if prev_tc is not None and row["TC_bps"] != prev_tc:
+            print("  " + "─" * (W - 2))
+        prev_tc = row["TC_bps"]
+        sr  = f"{row['Sharpe']:+.2f}"  if np.isfinite(row["Sharpe"])  else "   n/a"
+        mdd = f"{row['MDD_pct']:.1f}%" if np.isfinite(row["MDD_pct"]) else "    n/a"
+        to  = f"{row['TO']:.1f}x"      if np.isfinite(row["TO"])      else "   n/a"
+        print(f"  {row['TC_bps']:<10.2f}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>8}")
+
+    print("=" * W)
+    print("  MDD = NAV peak-to-trough (%). TO = ann. one-way position turnover.")
+
+    if _collect_returns:
+        returns_df = pd.DataFrame(_returns_dict)
+        returns_df.columns = pd.MultiIndex.from_tuples(
+            returns_df.columns, names=["Method", "TC_bps"]
+        )
+        return df, returns_df
+    return df

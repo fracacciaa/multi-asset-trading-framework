@@ -112,20 +112,24 @@ def _comm_rows(is_end: str, oos_start: str) -> list[tuple[str, dict]]:
 
 
 def _eq_rows(is_end: str, oos_start: str) -> list[tuple[str, dict]]:
-    from equities.production.pipeline import (
-        _load_or_build_positions, _load_or_build_vf_data,
-        PRODUCTION_SIGNALS, _make_signal_fn,
+    from equities.blend import (
+        load_signal_positions, load_rebal_dates, load_eq_returns_panel,
+        PRODUCTION_SIGNALS, build_managed_returns, msrr_ridge, combine_signals,
     )
-    from equities.production.data import fetch_prices
-    from equities.blend import build_managed_returns, msrr_ridge, combine_signals
     from core.backtest import run_backtest
 
-    positions = _load_or_build_positions(rebuild=False, verbose=False)
+    def _make_signal_fn(pos_df):
+        def signal_fn(date):
+            avail = pos_df.index[pos_df.index <= date]
+            if avail.empty:
+                return pd.Series(dtype=float)
+            return pos_df.loc[avail[-1]]
+        return signal_fn
+
+    positions = load_signal_positions()
     positions = {k: v for k, v in positions.items() if k in PRODUCTION_SIGNALS}
-    vf_rebal  = set(_load_or_build_vf_data(None, None, None,
-                                            rebuild=False, verbose=False)["rebal_dates"])
-    prices  = fetch_prices(tickers=None)
-    returns = prices.pct_change(fill_method=None).dropna(how="all")
+    vf_rebal  = set(load_rebal_dates())
+    returns   = load_eq_returns_panel()
     ret_is  = returns.loc[returns.index <= is_end]
     ret_oos = returns.loc[returns.index >= oos_start]
 

@@ -23,7 +23,9 @@ Sharpe recipe (any *_pnl file):
 
 from __future__ import annotations
 
+import datetime
 import json
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -56,6 +58,8 @@ def run(
     start: str | None = None,
     end: str | None = None,
     output_dir: Path | None = None,
+    is_end: str = "2020-12-31",
+    oos_start: str = "2021-01-01",
     verbose: bool = True,
 ) -> dict:
     """
@@ -240,13 +244,25 @@ def run(
     _save("mean_reversion_dv01_pos.parquet", mr_dv01_pos)
 
     # ── Manifest ───────────────────────────────────────────────────────────────
+    _sha_r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                            capture_output=True, text=True)
     manifest = {
+        "universe":    sorted(markets),
         "markets":     sorted(markets),
         "carry_markets": sorted(carry_mkts),
         "mom_markets": sorted(mom_panels.keys()),
         "mr_markets":  sorted(mr_pnl_dict.keys()),
         "start":       str(start) if start else None,
         "end":         str(end) if end else None,
+        "is_end":      is_end,
+        "oos_start":   oos_start,
+        "params":      {
+            "lam_train_end": _LAM_TRAIN_END,
+            "mr_target_vol": _MR_TARGET_VOL,
+            "mr_burn_in":    _MR_BURN_IN,
+        },
+        "git_sha":     _sha_r.stdout.strip() if _sha_r.returncode == 0 else "unknown",
+        "built_at":    datetime.datetime.utcnow().isoformat() + "Z",
         "ns_model":    "ns_calibrated",
         "carry_tenors": CARRY_TENORS,
         "mr_lam_train_end": _LAM_TRAIN_END,
@@ -295,6 +311,9 @@ def run(
         "all_panels":              all_panels,
         "manifest":                manifest,
     }
+
+
+export_signals = run
 
 
 if __name__ == "__main__":

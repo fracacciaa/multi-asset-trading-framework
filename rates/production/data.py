@@ -8,7 +8,7 @@ import pandas as pd
 from functools import lru_cache
 from typing import Optional
 
-_PATH = "/Users/francescocaccia/Downloads/RATESSSSS.xlsx"
+_PATH = "RATESSSSS.xlsx"
 _SHEET = "Sheet2"
 
 # Bloomberg prefix → display name
@@ -44,7 +44,8 @@ def load_bloomberg_excel(path: str) -> dict[str, pd.DataFrame]:
     Returns dict keyed by display name (e.g. 'US', 'Germany') containing
     date × tenor (float years) DataFrames of continuously compounded yields (%).
     """
-    raw = pd.read_excel(path, sheet_name=_SHEET, header=0)
+    from core.paths import raw as _resolve
+    raw = pd.read_excel(str(_resolve(path)), sheet_name=_SHEET, header=0)
     cols = list(raw.columns)
 
     # Collect (market_display, tenor) → list of Series
