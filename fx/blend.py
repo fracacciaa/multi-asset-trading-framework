@@ -127,12 +127,19 @@ def _pair_blend_inv_vol(
     """
     Inverse-vol cross-pair blend: w_i ∝ 1/σ_i (IS σ × √12), frozen and applied
     to the full period.  Falls back to plain sum on insufficient data.
+
+    Weights are re-normalised at each date to the subset of pairs with data,
+    so the blend extends back to the first date any eligible pair has a return
+    rather than being truncated to the latest-starting pair.
     """
     pnl = pnl_df.sort_index()
     w = _pair_inv_vol_weights(pnl, is_end, min_pair_months)
     if w is None:
-        return pnl.sum(axis=1)
-    return (pnl[w.index] * w).sum(axis=1, min_count=len(w))
+        return pnl.sum(axis=1, min_count=1)
+    avail        = pnl[w.index].notna()
+    w_avail_sum  = avail.multiply(w).sum(axis=1)
+    weighted_sum = (pnl[w.index] * w).sum(axis=1, min_count=1)
+    return (weighted_sum / w_avail_sum.replace(0.0, np.nan)).rename("blend")
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
@@ -441,10 +448,10 @@ def run_fx_prod(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        r_scaled = r * vol_target
-        cum = (1 + r_scaled).cumprod()
+        ann_vol = r.std() * np.sqrt(12)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min())
 
     def _turnover(pos: pd.DataFrame) -> float:
@@ -621,9 +628,10 @@ def tc_sweep_fx(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(12)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _to(w_df: pd.DataFrame, sigma: pd.Series, t0, t1) -> float:
@@ -868,9 +876,10 @@ def compare_blend_methods(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(12)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _turnover(pos: pd.DataFrame) -> float:
@@ -1076,9 +1085,10 @@ def _try_fx_pair_blend(
 
     def _mdd_m(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(12)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _to_m(w_df: pd.DataFrame, F: pd.DataFrame) -> float:

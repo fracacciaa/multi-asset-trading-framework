@@ -50,7 +50,8 @@ def mdd(r_norm: pd.Series, cfg: ReportCfg) -> float:
     r = r_norm.dropna()
     if len(r) < 2 or r.std() < 1e-12:
         return float("nan")
-    cum = (1 + r * cfg.vol_target).cumprod()
+    ann_vol = r.std() * np.sqrt(cfg.ann)
+    cum = (1 + r * (cfg.vol_target / ann_vol)).cumprod()
     return float((cum / cum.cummax() - 1).min() * 100)
 
 

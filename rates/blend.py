@@ -538,9 +538,10 @@ def tc_sweep_rates(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if len(r) < 2:
+        if len(r) < 2 or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(252)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _sig_to_local(pos_df: pd.DataFrame, t0, t1) -> float:
@@ -777,9 +778,10 @@ def _try_market_blend(
 
     def _mdd_m(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(252)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _to_m(w_df: pd.DataFrame, F: pd.DataFrame) -> float:
@@ -1082,10 +1084,10 @@ def run_rates_prod(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if len(r) < 2:
+        if len(r) < 2 or r.std() < 1e-12:
             return float("nan")
-        r_scaled = r * vol_target
-        cum = (1 + r_scaled).cumprod()
+        ann_vol = r.std() * np.sqrt(252)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _sig_to(pos_df: pd.DataFrame, start, end) -> float:
@@ -1223,9 +1225,10 @@ def compare_blend_methods(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if len(r) < 2:
+        if len(r) < 2 or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(252)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _normalise_w(w_raw: pd.DataFrame) -> pd.DataFrame:

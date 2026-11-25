@@ -69,18 +69,62 @@ from equities.blend import (                                        # noqa: F401
 IS_END    = "2020-12-31"
 OOS_START = "2021-01-01"
 
-TC_SCENARIOS_COMM: dict[str, float] = {
+_TC_ANNUAL_DRAG_COMM: dict[str, float] = {
     "best":   2.0,   # bps/yr — est. 1 bp spread × ~2x annual instrument TO
     "base":  12.0,   # bps/yr — est. 3 bp spread × ~4x annual instrument TO
     "worst": 56.0,   # bps/yr — est. 7 bp spread × ~8x annual instrument TO
 }
 
-# Half-spread scenarios for tc_sweep_comm_actual (position-based TC model).
-# TC per signal is computed as spread × Σ_i |Δw_eff_i,t| from committed parquets.
-TC_SPREAD_SCENARIOS: dict[str, float] = {
-    "tight":  1.0,   # bps half-spread (liquid periods / small size)
-    "base":   3.0,   # bps half-spread (normal markets)
-    "wide":   7.0,   # bps half-spread (stressed markets / large size)
+# Per-instrument half-spread scenarios for tc_sweep_comm_actual.
+# TC per signal is computed as Σ_i (spread_i × |Δw_eff_k[i,t]|) from committed parquets.
+# Structure mirrors TC_SCENARIOS (rates) and TC_SCENARIOS_FX (FX).
+_TC_DEFAULT_COMM: float = 5.0   # fallback half-spread (bps) for unlisted instruments
+
+TC_SCENARIOS_COMM: dict[str, dict[str, float]] = {
+    "best": {
+        # Energy
+        "CL":  0.5,   # WTI Crude — most liquid commodity futures
+        "XB":  1.0,   # RBOB Gasoline
+        "HO":  1.0,   # Heating Oil
+        # Metals
+        "GC":  0.25,  # Gold — deepest metals market
+        "HG":  0.5,   # Copper
+        "SI":  1.0,   # Silver
+        # Grains
+        "C":   0.5,   # Corn
+        "S":   0.5,   # Soybeans
+        "W":   1.0,   # CBOT Wheat
+        "SM":  1.0,   # Soybean Meal
+        "BO":  1.0,   # Soybean Oil
+        "O":   3.0,   # Oats — thin CBOT market
+        "RR":  5.0,   # Rough Rice — very thin
+        # Softs
+        "KC":  2.0,   # Coffee
+        "CC":  2.0,   # Cocoa
+        "CT":  1.5,   # Cotton
+        "JO":  3.0,   # OJ Futures — thin ICE market
+        "LB":  6.0,   # Lumber — structurally illiquid
+        # Livestock
+        "LC":  1.5,   # Live Cattle
+        "LHD": 1.5,   # Lean Hogs
+        "FC":  2.5,   # Feeder Cattle — less liquid than LC
+    },
+    "base": {
+        "CL":  1.5,  "XB":  3.0,  "HO":  3.0,
+        "GC":  1.0,  "HG":  2.0,  "SI":  3.5,
+        "C":   2.0,  "S":   2.0,  "W":   3.5,  "SM":  3.5,  "BO":  3.5,
+        "O":   8.0,  "RR": 12.0,
+        "KC":  5.0,  "CC":  6.0,  "CT":  4.0,  "JO":  8.0,  "LB": 15.0,
+        "LC":  4.0,  "LHD": 4.0,  "FC":  7.0,
+    },
+    "worst": {
+        "CL":  4.0,  "XB":  8.0,  "HO":  8.0,
+        "GC":  3.0,  "HG":  5.0,  "SI": 10.0,
+        "C":   5.0,  "S":   5.0,  "W":  10.0,  "SM": 10.0,  "BO": 10.0,
+        "O":  20.0,  "RR": 28.0,
+        "KC": 15.0,  "CC": 18.0,  "CT": 12.0,  "JO": 20.0,  "LB": 35.0,
+        "LC": 10.0,  "LHD": 10.0, "FC": 18.0,
+    },
 }
 
 _SIGNALS_DIR = Path(__file__).parent / "signals"
@@ -529,10 +573,10 @@ def run_comm_prod(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        r_scaled = r * vol_target
-        cum = (1 + r_scaled).cumprod()
+        ann_vol = r.std() * np.sqrt(TD)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min())
 
     # ── 5. Print ──────────────────────────────────────────────────────────────
@@ -638,14 +682,14 @@ def tc_sweep_comm(
     TC approximation: instrument-level position parquets are not available here
     (only pre-computed signal PnL parquets), so TC is modelled as a fixed annual
     drag applied equally to all signals.  Scenarios express estimated cost as
-    spread × annual instrument-level TO (see TC_SCENARIOS_COMM for defaults).
+    spread × annual instrument-level TO (see _TC_ANNUAL_DRAG_COMM for defaults).
 
     Fixed weights (Static Ridge): IS-fitted static Ridge weights held constant
     across all scenarios; only the TC cost changes.  Shows pure TC impact.
 
     Parameters
     ----------
-    scenarios       dict mapping name → annual TC drag in bps.  Default: TC_SCENARIOS_COMM.
+    scenarios       dict mapping name → annual TC drag in bps.  Default: _TC_ANNUAL_DRAG_COMM.
     signals_dir     Path to signal parquets.  Default: commodities/signals/.
     is_end          Last IS date (inclusive).  Default: IS_END.
     oos_start       First OOS date (inclusive).  Default: OOS_START.
@@ -659,7 +703,7 @@ def tc_sweep_comm(
     or (df, returns_df) when _collect_returns=True.
     """
     if scenarios is None:
-        scenarios = TC_SCENARIOS_COMM
+        scenarios = _TC_ANNUAL_DRAG_COMM
 
     F = load_managed_returns(signals_dir=signals_dir)
 
@@ -694,9 +738,10 @@ def tc_sweep_comm(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(252)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _blend_to(w_df: pd.DataFrame, F_n: pd.DataFrame) -> float:
@@ -802,7 +847,7 @@ def run_comm_tc(
 
 
 def tc_sweep_comm_actual(
-    spreads: Optional[dict] = None,
+    scenarios: Optional[dict] = None,
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     oos_start: str = OOS_START,
@@ -810,17 +855,17 @@ def tc_sweep_comm_actual(
     lam: float = 0.01,
 ) -> pd.DataFrame:
     """
-    TC sensitivity sweep using actual per-signal instrument-level turnover.
+    TC sensitivity sweep using actual per-signal, per-instrument turnover.
 
     Unlike tc_sweep_comm(), which applies a uniform annual-drag estimate, this
     function loads the committed per-signal position parquets and computes TC as
 
-        TC_k[t] = spread × Σ_i |w_eff_k[i,t] - w_eff_k[i,t-1]|
+        TC_k[t] = Σ_i ( spread_i × |w_eff_k[i,t] - w_eff_k[i,t-1]| )
 
-    for each signal k and each day t.  The TC is deducted from each signal's raw
-    managed return before vol-normalisation and blend-fitting:
+    for each signal k and each day t, using per-instrument half-spreads.
+    The TC is deducted from each signal's raw managed return:
 
-        F_k_net[t] = F_k[t] - spread × Σ_i |Δw_eff_k[i,t]|
+        F_k_net[t] = F_k[t] - Σ_i ( spread_i × |Δw_eff_k[i,t]| )
 
     Vol-normalisation uses TC-gross IS σ (same denominator across scenarios, so
     blend weights are comparable across spread levels).  Ridge MSRR blend weights
@@ -828,7 +873,9 @@ def tc_sweep_comm_actual(
 
     Parameters
     ----------
-    spreads       dict mapping name → half-spread in bps.  Default: TC_SPREAD_SCENARIOS.
+    scenarios     dict mapping name → {instrument: half_spread_bps}.
+                  Default: TC_SCENARIOS_COMM.  Instruments not in the dict
+                  use _TC_DEFAULT_COMM (5 bps).
     signals_dir   Path to signal and position parquets.    Default: commodities/signals/.
     is_end        Last IS date (inclusive).                Default: IS_END.
     oos_start     First OOS date (inclusive).              Default: OOS_START.
@@ -837,18 +884,19 @@ def tc_sweep_comm_actual(
 
     Returns
     -------
-    pd.DataFrame with columns [Scenario, Spread_bps, Period, Sharpe, MDD_pct, Blend_TO,
-                                TC_tsmom_bps, TC_carry_bps, TC_curv_bps, Blend_w_tsmom,
-                                Blend_w_carry, Blend_w_curv]
+    pd.DataFrame with columns [Scenario, Period, Sharpe, MDD_pct, Blend_TO,
+                                Blended_TC_bps, TC_tsmom_bps, TC_carry_bps,
+                                TC_curv_bps, Blend_w_tsmom, Blend_w_carry,
+                                Blend_w_curv]
     """
-    if spreads is None:
-        spreads = TC_SPREAD_SCENARIOS
+    if scenarios is None:
+        scenarios = TC_SCENARIOS_COMM
 
     sig_dir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
     F = load_managed_returns(signals_dir=sig_dir)
 
-    # Per-signal daily delta: Σ_i |Δw_eff_k[i,t]|  (in position units, spread-free)
-    delta: dict[str, pd.Series] = {}
+    # Per-signal per-instrument absolute daily position changes: T × I
+    dw: dict[str, pd.DataFrame] = {}
     for k in F.columns:
         pos_path = sig_dir / f"{k}_positions.parquet"
         if not pos_path.exists():
@@ -856,45 +904,29 @@ def tc_sweep_comm_actual(
                 f"{pos_path} not found.  Run build_signal_parquets() first."
             )
         w_eff = pd.read_parquet(pos_path)
-        delta[k] = (
-            w_eff.diff().abs().sum(axis=1)
-            .reindex(F.index).fillna(0.0)
-        )
-    Delta = pd.DataFrame(delta)   # T × K, same index as F
+        dw[k] = w_eff.diff().abs().reindex(F.index).fillna(0.0)   # T × I
 
     F_is_raw  = F.loc[F.index <= is_end]
     F_oos_raw = F.loc[F.index >= oos_start]
-    D_is      = Delta.loc[F.index <= is_end]
-    D_oos     = Delta.loc[F.index >= oos_start]
 
     # TC-gross IS σ — fixed denominator across all scenarios (no look-ahead)
     sigma = F_is_raw.std() * np.sqrt(252)
     sigma = sigma.replace(0.0, np.nan)
 
-    # Annualised TC per signal (IS) at each spread, for the table
-    ann_tc_is: dict[str, dict[str, float]] = {}
-    for scenario_name, spread_bps in spreads.items():
-        spread = spread_bps / 10_000.0
-        ann_tc_is[scenario_name] = {
-            k: float(D_is[k].mean() * spread * 252 * 10_000)
-            for k in F.columns
-        }
-
-    # Print per-signal TC breakdown header
+    # Print header
     names = list(F.columns)
     _abbrev = {"tsmom_252": "tsmom", "xs_carry_enh": "carry", "curvature": "curv"}
     abbrevs = [_abbrev.get(n, n[:6]) for n in names]
 
     W = 90
     print("=" * W)
-    print("  COMMODITIES TC SWEEP — Actual position-based TC (spread × Σ|Δw_eff|)")
+    print("  STAGE 4 — TC-AWARE SCENARIOS — Actual TC: Σ_i(spread_i × |Δw_eff_k[i,t]|)")
     print(f"  IS ≤ {is_end}   |   OOS ≥ {oos_start}   |   λ={lam}")
     print(f"  Signals: {names}")
     print("=" * W)
 
-    # Per-signal TC bps/yr at each spread (IS)
-    print(f"\n  Per-signal annual TC (IS, bps/yr) by spread scenario:")
-    hdr = f"  {'Scenario':<10}  {'Spread':>8}"
+    print(f"\n  Per-signal annual TC (IS, bps/yr) by scenario:")
+    hdr = f"  {'Scenario':<10}"
     for ab in abbrevs:
         hdr += f"  {ab+' TC':>12}"
     hdr += f"  {'Blended TC':>12}"
@@ -909,19 +941,35 @@ def tc_sweep_comm_actual(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(252)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     records = []
 
-    for scenario_name, spread_bps in spreads.items():
-        spread = spread_bps / 10_000.0
+    for scenario_name, spread_map in scenarios.items():
+
+        # Build per-instrument spread vectors for each signal's position columns
+        tc_is:  dict[str, pd.Series] = {}
+        tc_oos: dict[str, pd.Series] = {}
+        ann_tc: dict[str, float]     = {}
+        for k in names:
+            sv = pd.Series(
+                {col: spread_map.get(col, _TC_DEFAULT_COMM) / 10_000.0
+                 for col in dw[k].columns}
+            )
+            tc_is[k]  = dw[k].loc[dw[k].index <= is_end].multiply(sv).sum(axis=1)
+            tc_oos[k] = dw[k].loc[dw[k].index >= oos_start].multiply(sv).sum(axis=1)
+            ann_tc[k] = float(tc_is[k].mean() * 252 * 10_000)
 
         # TC-net managed returns
-        F_is_net  = F_is_raw  - D_is  * spread
-        F_oos_net = F_oos_raw - D_oos * spread
+        F_is_net  = F_is_raw.copy()
+        F_oos_net = F_oos_raw.copy()
+        for k in names:
+            F_is_net[k]  = F_is_raw[k]  - tc_is[k]
+            F_oos_net[k] = F_oos_raw[k] - tc_oos[k]
 
         # Vol-normalise using TC-gross IS σ (fixed across scenarios)
         F_is_n  = F_is_net.div(sigma)
@@ -943,28 +991,25 @@ def tc_sweep_comm_actual(
         r_is  = (F_is_n  * w_is).sum(axis=1)
         r_oos = (F_oos_n * w_oos).sum(axis=1)
 
-        tc_k      = ann_tc_is[scenario_name]
-        blended_tc = sum(abs(float(w_static[k])) * tc_k[k] for k in names)
+        blended_tc = sum(abs(float(w_static[k])) * ann_tc[k] for k in names)
 
         # Print per-signal TC row
-        line = f"  {scenario_name:<10}  {spread_bps:>7.1f}bp"
+        line = f"  {scenario_name:<10}"
         for k in names:
-            line += f"  {tc_k[k]:>11.1f}b"
+            line += f"  {ann_tc[k]:>11.1f}b"
         line += f"  {blended_tc:>11.1f}b"
         print(line)
 
-        # Blend weights
         blend_w = {f"Blend_w_{_abbrev.get(k, k[:6])}": float(w_static[k]) for k in names}
-        tc_cols  = {f"TC_{_abbrev.get(k, k[:6])}_bps": tc_k[k] for k in names}
+        tc_cols  = {f"TC_{_abbrev.get(k, k[:6])}_bps": ann_tc[k] for k in names}
 
         for period, r, w_df, F_n in [("IS", r_is, w_is, F_is_n), ("OOS", r_oos, w_oos, F_oos_n)]:
             rec = {
-                "Scenario":    scenario_name,
-                "Spread_bps":  spread_bps,
-                "Period":      period,
-                "Sharpe":      _sharpe(r),
-                "MDD_pct":     _mdd(r),
-                "Blend_TO":    _drift_to(w_df, F_n * vol_target, freq=252, l1_norm=True),
+                "Scenario":       scenario_name,
+                "Period":         period,
+                "Sharpe":         _sharpe(r),
+                "MDD_pct":        _mdd(r),
+                "Blend_TO":       _drift_to(w_df, F_n * vol_target, freq=252, l1_norm=True),
                 "Blended_TC_bps": blended_tc,
             }
             rec.update(tc_cols)
@@ -973,7 +1018,7 @@ def tc_sweep_comm_actual(
 
     # Print metrics table
     print("\n" + "=" * W)
-    print(f"  {'Scenario':<10}  {'Spread':>8}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'Blend TO':>9}")
+    print(f"  {'Scenario':<10}  {'Period':<6}  {'Sharpe':>8}  {'MDD':>8}  {'Blend TO':>9}  {'Blended TC':>11}")
     print("  " + "─" * (W - 2))
     prev = None
     for r in records:
@@ -983,14 +1028,15 @@ def tc_sweep_comm_actual(
         sr  = f"{r['Sharpe']:+.2f}"   if not np.isnan(r["Sharpe"])  else "   n/a"
         mdd = f"{r['MDD_pct']:.1f}%"  if not np.isnan(r["MDD_pct"]) else "    n/a"
         to_ = f"{r['Blend_TO']:.2f}x" if not np.isnan(r["Blend_TO"]) else "   n/a"
+        tc_ = f"{r['Blended_TC_bps']:.1f}b"
         print(
-            f"  {r['Scenario']:<10}  {r['Spread_bps']:>7.1f}bp  {r['Period']:<6}"
-            f"  {sr:>8}  {mdd:>8}  {to_:>9}"
+            f"  {r['Scenario']:<10}  {r['Period']:<6}"
+            f"  {sr:>8}  {mdd:>8}  {to_:>9}  {tc_:>11}"
         )
     print("=" * W)
 
     # Print blend weights per scenario
-    print(f"\n  Blend weights (IS-fitted Ridge, λ={lam}) per spread scenario:")
+    print(f"\n  Blend weights (IS-fitted Ridge, λ={lam}) per scenario:")
     print(f"  {'Scenario':<10}" + "".join(f"  {ab:>14}" for ab in abbrevs))
     print("  " + "─" * (10 + 16 * len(names)))
     seen = set()
@@ -1051,9 +1097,10 @@ def compare_blend_methods(
 
     def _mdd(r: pd.Series) -> float:
         r = r.dropna()
-        if r.empty:
+        if r.empty or r.std() < 1e-12:
             return float("nan")
-        cum = (1 + r * vol_target).cumprod()
+        ann_vol = r.std() * np.sqrt(252)
+        cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
 
     def _blend_weight_to(w_df: pd.DataFrame, F_n: pd.DataFrame) -> float:

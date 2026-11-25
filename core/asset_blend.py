@@ -193,9 +193,10 @@ def _sharpe(r: pd.Series, freq: int = 12) -> float:
 
 def _mdd(r: pd.Series, vol_target: float = 0.10, freq: int = 12) -> float:
     r = r.dropna()
-    if r.empty:
+    if r.empty or r.std() < 1e-12:
         return float("nan")
-    cum = (1 + r * vol_target).cumprod()
+    ann_vol = r.std() * np.sqrt(freq)
+    cum = (1 + r * (vol_target / ann_vol)).cumprod()
     return float((cum / cum.cummax() - 1).min())
 
 
@@ -389,7 +390,6 @@ def try_asset_blend(
 
     result: dict = {}
 
-    # Every method is rescaled to vol_target IS vol so "MDD at vol target" is comparable.
     for mname, bw in static_blends_raw.items():
         r_is  = _apply_static(F_is_raw, bw)
         r_oos = _apply_static(F_oos_raw, bw)
@@ -399,8 +399,8 @@ def try_asset_blend(
         total  = w_norm.abs().sum()
         w_norm = w_norm / total if total > 1e-12 else w_norm
         result[mname] = {
-            "is":         _metrics(r_is,  None, False, 1.0),
-            "oos":        _metrics(r_oos, None, False, 1.0),
+            "is":         _metrics(r_is,  None, False, vol_target),
+            "oos":        _metrics(r_oos, None, False, vol_target),
             "type":       "static",
             "weights_is": w_norm,
         }
@@ -414,8 +414,8 @@ def try_asset_blend(
         total  = w_norm.abs().sum()
         w_norm = w_norm / total if total > 1e-12 else w_norm
         result[mname] = {
-            "is":         _metrics(r_is,  None, False, 1.0),
-            "oos":        _metrics(r_oos, None, False, 1.0),
+            "is":         _metrics(r_is,  None, False, vol_target),
+            "oos":        _metrics(r_oos, None, False, vol_target),
             "type":       "static",
             "weights_is": w_norm,
         }
@@ -428,8 +428,8 @@ def try_asset_blend(
         w_is_slice  = w_df.reindex(F_is.index).dropna()
         w_oos_slice = w_df.reindex(F_oos.index).dropna()
         result[mname] = {
-            "is":         _metrics(r_is,  w_is_slice,  True, 1.0, F=F_is),
-            "oos":        _metrics(r_oos, w_oos_slice, True, 1.0, F=F_oos),
+            "is":         _metrics(r_is,  w_is_slice,  True, vol_target, F=F_is),
+            "oos":        _metrics(r_oos, w_oos_slice, True, vol_target, F=F_oos),
             "type":       "dynamic",
             "weights_is": w_is_slice.mean() if not w_is_slice.empty else pd.Series(dtype=float),
         }
@@ -978,7 +978,7 @@ def compare_blend_methods(
                 "Method": method_name,
                 "Period": period,
                 "Sharpe": _sharpe(r),
-                "MDD":    _mdd(r, 1.0) * 100,
+                "MDD":    _mdd(r, vol_target) * 100,
                 "TO":     to,
             })
 
@@ -1135,7 +1135,7 @@ def run_assets_tc(
                 "Scenario": scenario_name,
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
-                "MDD_pct":  _mdd(r, 1.0) * 100,
+                "MDD_pct":  _mdd(r, vol_target) * 100,
                 "TO":       _portfolio_to(w, to_df, r.index),
             })
 
@@ -1266,7 +1266,7 @@ def run_asset_tc(
             "Scenario": "gross",
             "Period":   period,
             "Sharpe":   _sharpe(r),
-            "MDD_pct":  _mdd(r, 1.0) * 100,
+            "MDD_pct":  _mdd(r, vol_target) * 100,
             "TO":       gross_to,
         })
 

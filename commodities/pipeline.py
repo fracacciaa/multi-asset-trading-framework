@@ -8,19 +8,17 @@ for IS (≤ blend.IS_END) and OOS (≥ blend.OOS_START) at four levels:
   1. markets     per signal × per instrument
   2. signals     inverse-vol cross-instrument blend of each signal
   3. composites  static-Ridge (IS-fit) blends of every subset (≥2) of the signals
-  4. TC-aware    tc_sweep_comm scenarios (best / base / worst), fixed weights
+  4. TC-aware    tc_sweep_comm_actual: Σ_i(spread_i × |Δw_i|) per instrument
+                 using TC_SCENARIOS_COMM (best / base / worst per-instrument spreads)
 
 Conventions: see core/pipeline_report.py.  Turnover is instrument-level on the
 weekly-rebalanced vol-scaled weights, scaled by the inv-vol instrument
-multipliers (and Ridge weights for composites).  The TC table is different in
-kind: tc_sweep_comm applies a uniform annual cost drag per scenario and reports
-blend-level (signal-weight) turnover, not instrument-level.
+multipliers (and Ridge weights for composites).  Stage 4 reports blend-level
+turnover and blended TC in bps/yr from actual position parquets.
 """
 
 from __future__ import annotations
 
-import contextlib
-import io
 import itertools
 from pathlib import Path
 from typing import Optional
@@ -54,12 +52,13 @@ def run_commodities_pipeline(
     params           Pipeline parameters (default blend.BLEND_PARAMS).
     lam              Ridge penalty for the static-Ridge composites.
     vol_target       Annual vol used for MDD scaling.
-    scenarios        TC scenarios (default blend.TC_SCENARIOS_COMM: best/base/worst).
+    scenarios        Per-instrument spread scenarios passed to tc_sweep_comm_actual
+                     (default blend.TC_SCENARIOS_COMM: best/base/worst).
 
     Returns
     -------
     dict with DataFrames "markets" (MultiIndex signal × instrument), "signals",
-    "composites", "tc" (tc_sweep_comm metrics), "tc_returns".
+    "composites", "tc" (tc_sweep_comm_actual metrics), "tc_returns" (empty).
     """
     sdir = Path(signals_dir) if signals_dir else _b._SIGNALS_DIR
     cfg = R.ReportCfg(ann=252, is_end=_b.IS_END, oos_start=_b.OOS_START,
@@ -145,20 +144,17 @@ def run_commodities_pipeline(
         R.print_row(label, row, 38)
     print("=" * R.WIDTH)
 
-    # ── stage 4: TC-aware scenarios ───────────────────────────────────────────
-    with contextlib.redirect_stdout(io.StringIO()):
-        tc = _b.run_comm_tc(
-            scenarios=scenarios, signals_dir=sdir, vol_target=vol_target, lam=lam,
-        )
-    R.print_tc(tc["metrics"],
-               "STAGE 4 — TC-AWARE SCENARIOS (all 3 signals, uniform annual cost drag)", cfg)
+    # ── stage 4: TC-aware scenarios (per-instrument spreads) ─────────────────
+    tc_df = _b.tc_sweep_comm_actual(
+        scenarios=scenarios, signals_dir=sdir, vol_target=vol_target, lam=lam,
+    )
 
     return {
         "markets":    R.to_frame(market_rows, ["signal", "instrument"]),
         "signals":    R.to_frame(signal_rows, ["signal"]),
         "composites": R.to_frame(composite_rows, ["composite"]),
-        "tc":         tc["metrics"],
-        "tc_returns": tc["returns"],
+        "tc":         tc_df,
+        "tc_returns": pd.DataFrame(),
     }
 
 
