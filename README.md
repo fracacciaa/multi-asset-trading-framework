@@ -225,8 +225,10 @@ pandas
 numpy
 scipy
 scikit-learn
+torch
+pyarrow
 ```
 
 ```bash
-pip install pandas numpy scipy scikit-learn
+pip install pandas numpy scipy scikit-learn torch pyarrow
 ```
