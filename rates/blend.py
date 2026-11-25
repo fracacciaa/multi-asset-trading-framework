@@ -158,12 +158,19 @@ def _mkt_blend_inv_vol(
     Inverse-vol cross-market blend: w_i ∝ 1/σ_i (IS σ), frozen and applied to
     the full period.  More liquid markets tend to have lower vol and therefore
     receive higher weight.  Falls back to equal-weight sum on insufficient data.
+
+    Weights are re-normalised at each date to the subset of markets with data,
+    so the blend extends back to the first date any eligible market has a return
+    rather than being truncated to the latest-starting market.
     """
     pnl = pnl_df.sort_index()
     w = _inv_vol_weights(pnl, is_end, min_mkt_days)
     if w is None:
-        return pnl.sum(axis=1)
-    return (pnl[w.index] * w).sum(axis=1, min_count=len(w))
+        return pnl.sum(axis=1, min_count=1)
+    avail        = pnl[w.index].notna()
+    w_avail_sum  = avail.multiply(w).sum(axis=1)
+    weighted_sum = (pnl[w.index] * w).sum(axis=1, min_count=1)
+    return (weighted_sum / w_avail_sum.replace(0.0, np.nan)).rename("blend")
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
