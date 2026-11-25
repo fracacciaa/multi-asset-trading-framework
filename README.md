@@ -3,7 +3,7 @@
 A research-grade signal framework for systematic trading across **Equities, Rates, FX and Commodities**.  
 Each asset class has a self-contained production pipeline that serialises PnL to parquet; a cross-asset blend layer combines the four sleeves into a single portfolio.
 
-IS/OOS split: **2020-12-31** (all asset classes; rates blend uses 2018-12-31).
+IS/OOS split: **2020-12-31** (all asset classes).
 
 ---
 
@@ -13,8 +13,11 @@ IS/OOS split: **2020-12-31** (all asset classes; rates blend uses 2018-12-31).
 .
 ├── core/
 │   ├── asset_blend.py      # Cross-asset inv-vol blend (monthly, 10% vol target)
+│   ├── backtest.py         # Walk-forward engine: rebalance schedule + TC
+│   ├── export_all.py       # Regenerate all signal parquets from Bloomberg data
 │   ├── main.py             # Full pipeline: all four sleeves → cross-asset blend
 │   ├── optimization.py     # Covariance estimation + mean-variance / risk-parity
+│   ├── paths.py            # Resolves MATF_DATA_DIR for raw Bloomberg exports
 │   ├── performance.py      # Sharpe, MDD, Calmar, VaR, CVaR, hit rate …
 │   ├── pipeline_report.py  # IS/OOS tearsheet formatter
 │   └── signal_metrics.py   # Per-signal Sharpe / turnover helpers
@@ -26,9 +29,24 @@ IS/OOS split: **2020-12-31** (all asset classes; rates blend uses 2018-12-31).
 │   │   │   ├── bootstrap.py            # OIS curve bootstrapping
 │   │   │   ├── ns_fit.py               # DV01-weighted NS regression + z-scores
 │   │   │   ├── signal.py               # build_dv01_positions (net-DV01 neutral)
+│   │   │   ├── spread_signal.py        # DV01-neutral two-tenor spread from NS residuals
 │   │   │   └── pnl.py                  # Full swap repricing backtest
 │   │   ├── momentum/                   # Daily TSMOM signal
-│   │   ├── carry/                      # Within-curve OIS carry
+│   │   │   ├── signal_a.py
+│   │   │   ├── returns.py
+│   │   │   └── pnl_repriced.py
+│   │   ├── carry/                      # Within-curve OIS carry (full sub-package)
+│   │   │   ├── carry_ois_par.py        # Par-curve carry + repriced PnL
+│   │   │   ├── carry_ois.py            # OIS carry measures
+│   │   │   ├── carry_bonds.py          # Gov bond carry (E08/E09 approximation)
+│   │   │   ├── measures.py             # Carry/roll-down primitives
+│   │   │   ├── signal.py               # DV01-neutral carry position sizing
+│   │   │   ├── returns.py              # Carry return decomposition
+│   │   │   ├── pnl_repriced.py         # Full swap repricing
+│   │   │   ├── cross_country.py        # Cross-market carry
+│   │   │   ├── config.py               # Market configs
+│   │   │   └── data.py                 # Data loaders
+│   │   ├── ns_core.py                  # Nelson-Siegel primitives shared across sub-packages
 │   │   └── data.py / ois_data.py       # Curve data loaders
 │   ├── signals/                        # ← parquet outputs (read by blend)
 │   │   ├── mean_reversion_pnl.parquet      date × market, bp
@@ -52,8 +70,10 @@ IS/OOS split: **2020-12-31** (all asset classes; rates blend uses 2018-12-31).
 │   ├── production/
 │   │   ├── run.py          # ← entry point: generates all FX parquets
 │   │   ├── signal_a.py     # Momentum (XS, f=9m h=1)
+│   │   ├── signal_c.py     # TSMOM (Moskowitz-Ooi-Pedersen vol-scaled + equal-weight)
 │   │   ├── signal_d.py     # Carry (Dupuy E-only leverage)
 │   │   ├── signal_e.py     # Carry (XS + E3 aggregate de-risk)
+│   │   ├── formations.py   # View formations: xs_weights, ts_weights, ts_vol_weights
 │   │   ├── ns_rv.py        # MR: NS LOO view-formation TS signal
 │   │   ├── ns_fwd.py       # NS forward curve fitting
 │   │   └── data.py / bloomberg.py
@@ -65,16 +85,20 @@ IS/OOS split: **2020-12-31** (all asset classes; rates blend uses 2018-12-31).
 │   │   ├── backtest.py     # ← entry point: signal comparison harness
 │   │   ├── signals.py      # TSMOM-252, XS carry enhanced, curvature
 │   │   └── data.py
+│   ├── pipeline.py         # IS/OOS pipeline with per-level reporting + TC sweep
+│   ├── comm_blend_run.py   # Static and rolling blend sweep
 │   ├── signals/            # ← parquet outputs
-│   └── blend.py
+│   └── blend.py            # tc_sweep_comm_actual: position-based TC model
 │
 └── tests/
     ├── rates/
     │   ├── ns_classic/     # 53 tests: bootstrap, swap PV, NS fit, leakage, net-DV01
-    │   └── carry/          # signal, returns, orthogonality, no-lookahead
-    ├── equities/           # blend tests
-    ├── fx/                 # blend tests
-    └── test_position_turnover.py   # cross-asset turnover sanity
+    │   └── carry/          # 49 tests: measures, signal, returns, orthogonality, no-lookahead
+    ├── equities/           # 46 blend tests
+    ├── fx/                 # 24 blend tests
+    ├── test_layer_boundary.py      # 7 tests: enforce production import boundary
+    ├── test_ns_core.py             # 9 tests: Nelson-Siegel primitives
+    └── test_position_turnover.py   # 12 tests: cross-asset turnover sanity
 ```
 
 ---
@@ -97,7 +121,9 @@ Outputs (all in `rates/signals/`):
 | `mean_reversion_dv01_pos.parquet` | date × (market, tenor) | Held DV01 positions — TC proxy |
 | `mean_reversion_zscores.parquet` | date × (market, tenor) | NS residual z-scores |
 | `momentum_a_daily_pnl.parquet` | date × market | Daily TSMOM PnL, full repricing (bp) |
+| `momentum_a_daily.parquet` | date × (market, tenor) | TSMOM daily positions (DV01) |
 | `carry_ois_par_pnl.parquet` | date × market | Within-curve OIS carry PnL, full repricing (bp) |
+| `carry_ois_par.parquet` | date × (market, tenor) | Carry positions (DV01) |
 | `ns_factors.parquet` | date × (market, factor) | NS level / slope / curvature |
 | `ret_d.parquet` | date × (market, tenor) | Daily constant-maturity returns (bp) |
 | `rx_m.parquet` | date × (market, tenor) | Monthly Sihvonen log excess returns (bp) |
@@ -137,7 +163,7 @@ Transaction costs are deducted per signal from their respective position parquet
 python -m fx.production.run
 ```
 
-Signals: momentum (XS f=9m h=1), carry (Dupuy leverage + E3 de-risk), MR (NS leave-one-out view-formation TS + fly).  Monthly and daily outputs in `fx/signals/`.
+Signals: momentum (XS f=9m h=1), TSMOM (Moskowitz-Ooi-Pedersen vol-scaled + equal-weight), carry (Dupuy leverage + E3 de-risk), MR (NS leave-one-out view-formation TS + fly).  View formations (xs_weights, ts_weights, ts_vol_weights) in `formations.py`.  Monthly and daily outputs in `fx/signals/`.
 
 ### Equities
 
@@ -159,6 +185,19 @@ Signals: TSMOM-252, XS carry enhanced, curvature.  Outputs in `commodities/signa
 
 ---
 
+## Regenerating Signal Parquets from Raw Data
+
+All blend and cross-asset layers run purely from committed parquets — no raw data required.  To regenerate from Bloomberg exports:
+
+```bash
+export MATF_DATA_DIR=~/Downloads   # folder containing Bloomberg export files
+python -m core.export_all
+```
+
+This runs all four production pipelines in order and rewrites `*/signals/`.  `core/paths.py` resolves `MATF_DATA_DIR` (defaults to `~/Downloads`).
+
+---
+
 ## Full Cross-Asset Pipeline
 
 ```bash
@@ -175,7 +214,7 @@ Runs all four sleeves, then blends them with static inverse-vol weights (IS σ, 
 python -m pytest tests/
 ```
 
-214 tests.  The rates suite (`tests/rates/`) covers bootstrap round-trips, swap PV sign conventions, NS fit properties, leakage audits, placebo Sharpe distribution, and net-DV01 neutrality.
+221 tests.  The rates suite (`tests/rates/`) covers bootstrap round-trips, swap PV sign conventions, NS fit properties, leakage audits, placebo Sharpe distribution, net-DV01 neutrality, carry measures, and no-lookahead.  `test_layer_boundary.py` enforces that blend/core layers cannot import production modules at module level.
 
 ---
 
