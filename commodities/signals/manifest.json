@@ -1,0 +1,48 @@
+{
+  "universe": [
+    "BO",
+    "C",
+    "CC",
+    "CL",
+    "CT",
+    "FC",
+    "GC",
+    "HG",
+    "HO",
+    "JO",
+    "KC",
+    "LB",
+    "LC",
+    "LHD",
+    "O",
+    "RR",
+    "S",
+    "SI",
+    "SM",
+    "W",
+    "XB"
+  ],
+  "start": "1991-12-16",
+  "end": "2026-08-07",
+  "is_end": "2020-12-31",
+  "oos_start": "2021-01-01",
+  "params": {
+    "asset_vol": 0.1,
+    "vol_com": 60,
+    "rebal": "W-FRI",
+    "lag": 1,
+    "mode": "sign",
+    "clip": 2.0
+  },
+  "files": {
+    "tsmom_252_pnl": "date \u00d7 1; aggregated managed return (daily)",
+    "xs_carry_enh_pnl": "date \u00d7 1; aggregated managed return (daily)",
+    "curvature_pnl": "date \u00d7 1; aggregated managed return (daily)",
+    "tsmom_252_positions": "date \u00d7 instrument; vol-scaled eff. weight panel",
+    "xs_carry_enh_positions": "date \u00d7 instrument; vol-scaled eff. weight panel",
+    "curvature_positions": "date \u00d7 instrument; vol-scaled eff. weight panel",
+    "combined_positions": "date \u00d7 instrument; blend-weighted combined position"
+  },
+  "git_sha": "5636536",
+  "built_at": "2026-11-25T22:15:51.214157Z"
+}

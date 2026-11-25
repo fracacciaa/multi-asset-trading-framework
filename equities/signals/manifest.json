@@ -475,6 +475,6 @@
     "threshold_mean_reversion_positions": "date \u00d7 ticker; threshold_mean_reversion ViewFormation positions",
     "earnings_revision_positions": "date \u00d7 ticker; earnings_revision ViewFormation positions"
   },
-  "git_sha": "bb77db8",
-  "built_at": "2026-11-25T01:15:53.082047Z"
+  "git_sha": "5636536",
+  "built_at": "2026-11-25T22:15:06.622693Z"
 }
