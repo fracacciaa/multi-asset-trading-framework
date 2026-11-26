@@ -862,13 +862,31 @@ def compare_blend_methods(
     F_oos = F_oos_raw.div(sigma)
     names = list(F_is.columns)
 
-    # Monthly signal position parquets for TO computation
-    monthly_pos = {
-        "momentum":  pd.read_parquet(sdir / "signal_a_f9_h1.parquet"),
-        "mean_reversion": (pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
-                      .resample("BME").last()),
-        "carry":  pd.read_parquet(sdir / "view_xs_carry_m.parquet"),
+    # Monthly signal positions with inv-vol pair weights applied (matching tc_sweep_fx / run_fx_prod)
+    rx_m_to  = pd.read_parquet(sdir / "returns.parquet")["rx_m"]
+    rx_d_to  = pd.read_parquet(sdir / _RX_FILE)
+    pos_mom_raw = pd.read_parquet(sdir / "signal_a_f9_h1.parquet")
+    pos_mr_raw  = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+    pos_cxs_raw = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
+    _pair_pnl_to = {
+        "momentum":       pos_mom_raw.shift(1) * rx_m_to.reindex(columns=pos_mom_raw.columns),
+        "mean_reversion": (pos_mr_raw * rx_d_to.reindex(columns=pos_mr_raw.columns)).resample("BME").sum(),
+        "carry":          pos_cxs_raw.shift(1) * rx_m_to.reindex(columns=pos_cxs_raw.columns),
     }
+    _base_pos_to = {
+        "momentum":       pos_mom_raw,
+        "mean_reversion": pos_mr_raw.resample("BME").last(),
+        "carry":          pos_cxs_raw,
+    }
+    monthly_pos: dict[str, pd.DataFrame] = {}
+    for _sig, _pnl in _pair_pnl_to.items():
+        _pw = (_pair_inv_vol_weights(_pnl, IS_END)
+               if CROSS_PAIR_BLEND.get(_sig, "inv_vol") == "inv_vol" else None)
+        if _pw is None:
+            _pw = pd.Series(1.0, index=_pnl.columns)
+        monthly_pos[_sig] = _base_pos_to[_sig].mul(
+            _pw.reindex(_base_pos_to[_sig].columns).fillna(0.0), axis=1
+        )
     common_pairs = sorted(set.intersection(*[set(p.columns) for p in monthly_pos.values()]))
 
     def _blended_pos(w_df: pd.DataFrame) -> pd.DataFrame:
