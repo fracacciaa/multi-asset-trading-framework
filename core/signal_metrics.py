@@ -202,7 +202,7 @@ def run_signal_metrics(
 
     ASSET_SPECS = [
         ("rates",       "RATES",       "rolling Ridge MSRR", "daily",   _rates_rows),
-        ("fx",          "FX",          "rolling Ridge MSRR", "monthly", _fx_rows),
+        ("fx",          "FX",          "static Ridge MSRR",  "monthly", _fx_rows),
         ("commodities", "COMMODITIES", "static Ridge MSRR",  "daily",   _comm_rows),
     ]
     if include_equities:
