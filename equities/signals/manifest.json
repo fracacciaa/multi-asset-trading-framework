@@ -461,9 +461,9 @@
   "params": {
     "lam": 0.01,
     "signals": [
-      "tsmom",
-      "threshold_mean_reversion",
-      "earnings_revision"
+      "momentum",
+      "mean_reversion",
+      "carry"
     ]
   },
   "files": {
@@ -471,10 +471,10 @@
     "eq_prod_returns": "date \u00d7 1; combined production blend daily return (TC-free)",
     "combined_positions": "date \u00d7 ticker; combined signal position (msrr_ridge blend)",
     "rebal_dates": "empty DataFrame, index = VF rebalance dates",
-    "tsmom_positions": "date \u00d7 ticker; tsmom ViewFormation positions",
-    "threshold_mean_reversion_positions": "date \u00d7 ticker; threshold_mean_reversion ViewFormation positions",
-    "earnings_revision_positions": "date \u00d7 ticker; earnings_revision ViewFormation positions"
+    "momentum_positions": "date \u00d7 ticker; momentum ViewFormation positions",
+    "mean_reversion_positions": "date \u00d7 ticker; mean_reversion ViewFormation positions",
+    "carry_positions": "date \u00d7 ticker; carry ViewFormation positions"
   },
-  "git_sha": "5636536",
-  "built_at": "2026-11-25T22:15:06.622693Z"
+  "git_sha": "fa12c03",
+  "built_at": "2026-11-26T15:33:37.847826Z"
 }
