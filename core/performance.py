@@ -26,6 +26,14 @@ def max_drawdown(nav: pd.Series) -> float:
     drawdown = nav / rolling_max - 1
     return drawdown.min()
 
+def mdd_vol_scaled(returns: pd.Series, vol_target: float = 0.10, freq: int = 252) -> float:
+    r = returns.dropna()
+    if len(r) < 2 or r.std() < 1e-12:
+        return float("nan")
+    ann_vol = r.std() * np.sqrt(freq)
+    cum = (1 + r * (vol_target / ann_vol)).cumprod()
+    return float((cum / cum.cummax() - 1).min())
+
 def calmar_ratio(nav: pd.Series, returns: pd.Series, periods_per_year: int = 252) -> float:
     mdd = max_drawdown(nav)
     if mdd == 0:

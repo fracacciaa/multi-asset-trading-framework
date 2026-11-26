@@ -1788,7 +1788,7 @@ def tc_sweep_eq(
     committed parquets via the blend-layer loaders — no production imports.
     """
     from core.backtest import run_backtest
-    from core.performance import sharpe_ratio, max_drawdown
+    from core.performance import sharpe_ratio, mdd_vol_scaled
 
     positions      = load_signal_positions()
     vf_rebal_dates = set(load_rebal_dates())
@@ -1812,7 +1812,7 @@ def tc_sweep_eq(
     def _stats(bt):
         return {
             "sharpe":       sharpe_ratio(bt["daily_return"]),
-            "max_drawdown": max_drawdown(bt["nav"]),
+            "max_drawdown": mdd_vol_scaled(bt["daily_return"]),
             "ann_turnover": float(bt["turnover"].mean() * 252),
         }
 
@@ -1862,7 +1862,7 @@ def tc_sweep_eq(
         print(f"  {row['TC_bps']:<10.2f}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>8}")
 
     print("=" * W)
-    print("  MDD = NAV peak-to-trough (%). TO = ann. one-way position turnover.")
+    print("  MDD at 10% vol target (%). TO = ann. one-way position turnover.")
 
     if _collect_returns:
         returns_df = pd.DataFrame(_returns_dict)

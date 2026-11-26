@@ -212,10 +212,10 @@ def _make_signal_fn(pos_df: pd.DataFrame):
 
 
 def _stats_from_bt(bt: pd.DataFrame) -> dict:
-    from core.performance import sharpe_ratio, max_drawdown
+    from core.performance import sharpe_ratio, mdd_vol_scaled
     return {
         "sharpe":       sharpe_ratio(bt["daily_return"]),
-        "max_drawdown": max_drawdown(bt["nav"]),
+        "max_drawdown": mdd_vol_scaled(bt["daily_return"]),
         "ann_turnover": float(bt["turnover"].mean() * 252),
     }
 
@@ -873,7 +873,7 @@ def tc_sweep_eq(
         print(f"  {row['TC_bps']:<10.2f}  {row['Period']:<6}  {sr:>8}  {mdd:>8}  {to:>8}")
 
     print("=" * W)
-    print("  MDD = NAV peak-to-trough (%). TO = ann. one-way position turnover.")
+    print("  MDD at 10% vol target (%). TO = ann. one-way position turnover.")
 
     if _collect_returns:
         returns_df = pd.DataFrame(_returns_dict)
@@ -966,7 +966,7 @@ def _print_blend_table(result: dict, is_end: str, oos_start: str) -> None:
         )
 
     print("=" * W)
-    print("  MDD = NAV peak-to-trough (%). TO = annualised one-way position turnover.")
+    print("  MDD at 10% vol target (%). TO = annualised one-way position turnover.")
 
 
 def _print_ablation_table(results: dict, is_end: str, oos_start: str) -> None:
@@ -1053,7 +1053,7 @@ def compare_blend_methods(
 
     All metrics come from a full position-level backtest (run_backtest), so
     Sharpe and TO reflect actual ticker-level positions, not managed returns.
-    MDD is raw NAV peak-to-trough (no additional vol-target scaling).
+    MDD is vol-scaled to a 10% annualised vol target.
 
     Returns
     -------
@@ -1163,7 +1163,7 @@ def compare_blend_methods(
     W = 72
     print("=" * W)
     print(f"  EQUITIES BLEND COMPARISON  (λ_ridge={ridge_lam})")
-    print(f"  note: MDD = raw NAV peak-to-trough; TO = ann. position-level one-way")
+    print(f"  note: MDD at 10% vol target (%); TO = ann. position-level one-way")
     print("=" * W)
     print(f"  {'Method':<24}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
     print("  " + "─" * (W - 2))
