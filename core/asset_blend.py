@@ -936,23 +936,23 @@ def run_assets_tc(
         r_comm  = comm_ret [("Fixed weights", asset_scens["commodities"])]
         r_eq    = eq_ret   [("Static Ridge [prod]", asset_scens["equities"])]
 
-        # Build monthly TC-adjusted F matrix (same structure as load_asset_returns)
-        F_tc_all = pd.DataFrame({
+        # Build monthly net-return matrix (same structure as load_asset_returns)
+        r_net = pd.DataFrame({
             "equities":    _to_monthly(r_eq,    "equities"),
             "rates":       _to_monthly(r_rates, "rates"),
             "fx":          _to_monthly(r_fx,    "fx"),
             "commodities": _to_monthly(r_comm,  "commodities"),
         }).sort_index().dropna(how="any")
 
-        F_tc_is_raw  = F_tc_all.loc[F_tc_all.index <= is_end]
-        F_tc_oos_raw = F_tc_all.loc[F_tc_all.index >= oos_start]
+        r_net_is  = r_net.loc[r_net.index <= is_end]
+        r_net_oos = r_net.loc[r_net.index >= oos_start]
 
-        if len(F_tc_is_raw) < 12 or F_tc_oos_raw.empty:
+        if len(r_net_is) < 12 or r_net_oos.empty:
             continue
 
         # Weights (TC-free IS σ) and scale are frozen; only the sleeve returns carry cost.
-        r_is_f  = _apply_tvw(F_tc_is_raw,  w_is.reindex(F_tc_is_raw.index))  * scale
-        r_oos_f = _apply_tvw(F_tc_oos_raw, w_oos.reindex(F_tc_oos_raw.index)) * scale
+        r_is_f  = _apply_tvw(r_net_is,  w_is.reindex(r_net_is.index))  * scale
+        r_oos_f = _apply_tvw(r_net_oos, w_oos.reindex(r_net_oos.index)) * scale
 
         for period, r, w in [
             ("IS",  r_is_f,  w_is),
@@ -966,7 +966,7 @@ def run_assets_tc(
                 "MDD_pct":  _mdd(r, vol_target) * 100,
                 "TO":       _total_traded_to(
                                 w, to_df,
-                                F_tc_is_raw if period == "IS" else F_tc_oos_raw),
+                                r_net_is if period == "IS" else r_net_oos),
             })
 
         _returns_dict[("Inverse vol", scenario_name)] = (

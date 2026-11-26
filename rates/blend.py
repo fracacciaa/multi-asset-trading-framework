@@ -628,27 +628,24 @@ def tc_sweep_rates(
                 cdf = pd.DataFrame(0.0, index=pnl_df.index, columns=pnl_df.columns)
             cost_blend[sig] = _apply_mkt_weights(cdf, sig)
         C_tc = pd.DataFrame(cost_blend).reindex(F_free.index).fillna(0.0)
-        F_tc = F_free - C_tc
-        F_tc_is  = F_tc.loc[F_tc.index <= is_end]
-        F_tc_oos = F_tc.loc[F_tc.index >= oos_start]
 
-        if len(F_tc_is) < min_obs or len(F_tc_oos) < 30:
+        if len(F_free_is) < min_obs or len(F_free_oos) < 30:
             continue
 
         # ── Method 1: Fixed weights — TC-free Ridge, only deduct cost ─────────
         # Normalise using the TC-free IS sigma so the fixed weights stay on the
         # same scale they were calibrated on.
         G_is_f, G_oos_f = F_free_is.div(sigma_free), F_free_oos.div(sigma_free)
-        C_is_f  = C_tc.loc[F_tc_is.index].div(sigma_free)
-        C_oos_f = C_tc.loc[F_tc_oos.index].div(sigma_free)
-        w_is_f  = w_fixed.reindex(F_tc_is.index)
-        w_oos_f = w_fixed.reindex(F_tc_oos.index)
+        C_is_f  = C_tc.loc[F_free_is.index].div(sigma_free)
+        C_oos_f = C_tc.loc[F_free_oos.index].div(sigma_free)
+        w_is_f  = w_fixed.reindex(F_free_is.index)
+        w_oos_f = w_fixed.reindex(F_free_oos.index)
         r_is_f  = _net_return(G_is_f, C_is_f, w_is_f)
         r_oos_f = _net_return(G_oos_f, C_oos_f, w_oos_f)
 
         for period, r, w, t0, t1 in [
-            ("IS",  r_is_f,  w_is_f,  F_tc_is.index[0],  F_tc_is.index[-1]),
-            ("OOS", r_oos_f, w_oos_f, F_tc_oos.index[0], F_tc_oos.index[-1]),
+            ("IS",  r_is_f,  w_is_f,  F_free_is.index[0],  F_free_is.index[-1]),
+            ("OOS", r_oos_f, w_oos_f, F_free_oos.index[0], F_free_oos.index[-1]),
         ]:
             records.append({
                 "Method":   "Fixed weights",

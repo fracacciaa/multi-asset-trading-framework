@@ -704,30 +704,29 @@ def tc_sweep_fx(
             )
             return (dpos_df * h_vec).sum(axis=1)
 
-        # Per-signal cost series; net = gross − cost (used only to FIT weights)
+        # Per-signal cost series
         C_tc = pd.DataFrame({
             "momentum":  _tc_series(dpos_mom).reindex(F_gross.index).fillna(0.0),
             "mean_reversion": _tc_series(dpos_mr_m).reindex(F_gross.index).fillna(0.0),
             "carry":  _tc_series(dpos_cxs).reindex(F_gross.index).fillna(0.0),
         })
-        F_tc = (F_gross - C_tc).dropna().sort_index()
-        F_tc_is  = F_tc.loc[F_tc.index <= is_end]
-        F_tc_oos = F_tc.loc[F_tc.index >= oos_start]
+        align_is  = F_gross.loc[F_gross.index <= is_end ].dropna(how="any").index
+        align_oos = F_gross.loc[F_gross.index >= oos_start].dropna(how="any").index
 
-        if F_tc_is.empty or len(F_tc_oos) < 12:
+        if align_is.empty or len(align_oos) < 12:
             continue
 
         # ── Method 1: Fixed weights — TC-free Ridge, only deduct cost ─────────
-        C_is_f  = C_tc.loc[F_tc_is.index].div(sigma_free)
-        C_oos_f = C_tc.loc[F_tc_oos.index].div(sigma_free)
-        r_is_f  = _net_return(F_free_is_n.loc[F_tc_is.index], C_is_f,
-                              w_is_fixed.reindex(F_tc_is.index))
-        r_oos_f = _net_return(F_free_oos_n.loc[F_tc_oos.index], C_oos_f,
-                              w_oos_fixed.reindex(F_tc_oos.index))
+        C_is_f  = C_tc.loc[align_is].div(sigma_free)
+        C_oos_f = C_tc.loc[align_oos].div(sigma_free)
+        r_is_f  = _net_return(F_free_is_n.loc[align_is], C_is_f,
+                              w_is_fixed.reindex(align_is))
+        r_oos_f = _net_return(F_free_oos_n.loc[align_oos], C_oos_f,
+                              w_oos_fixed.reindex(align_oos))
 
         for period, r, w, t0, t1 in [
-            ("IS",  r_is_f,  w_is_fixed,  F_tc_is.index[0],  F_tc_is.index[-1]),
-            ("OOS", r_oos_f, w_oos_fixed, F_tc_oos.index[0], F_tc_oos.index[-1]),
+            ("IS",  r_is_f,  w_is_fixed,  align_is[0],  align_is[-1]),
+            ("OOS", r_oos_f, w_oos_fixed, align_oos[0], align_oos[-1]),
         ]:
             records.append({
                 "Method":   "Fixed weights",
