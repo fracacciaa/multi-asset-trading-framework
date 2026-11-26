@@ -1088,13 +1088,17 @@ def compare_blend_methods(
 
     Daily frequency; Sharpe annualised with √252.
     MDD at vol_target wealth scaling.
-    TO = annualised one-way drift-corrected turnover of blend weights (static weights
-         still trade back to target after returns move them).  Blend-level only;
-         instrument-level trading is not included.
+    TO = annualised one-way instrument-level turnover of the combined book that the
+         method actually trades, Σ_k pos_k · w_k/σ_k, as a fraction of average gross.
+         This is the tradable number and is comparable to the rates, FX and equities
+         blend tables.  Weight_TO is the drift-corrected blend-weight turnover kept
+         for diagnostics (static weights still trade back to target as returns move
+         them); it excludes instrument-level trading and is an order of magnitude
+         smaller, so never quote it as the turnover of the strategy.
 
     Returns
     -------
-    pd.DataFrame with columns [Method, Period, Sharpe, MDD, TO].
+    pd.DataFrame with columns [Method, Period, Sharpe, MDD, TO, Weight_TO].
     """
     F = load_managed_returns(signals_dir=signals_dir)
     F_is_raw  = F.loc[F.index <= is_end]
@@ -1119,6 +1123,28 @@ def compare_blend_methods(
         ann_vol = r.std() * np.sqrt(252)
         cum = (1 + r * (vol_target / ann_vol)).cumprod()
         return float((cum / cum.cummax() - 1).min() * 100)
+
+    # Per-signal instrument positions — needed for the traded turnover number
+    sig_dir   = Path(signals_dir) if signals_dir else _SIGNALS_DIR
+    sigma_ann = F_is_raw.std() * np.sqrt(252)
+    pos       = {k: pd.read_parquet(sig_dir / f"{k}_positions.parquet") for k in F.columns}
+    first     = pos[list(F.columns)[0]]
+    pos_idx, pos_cols = first.index, first.columns
+
+    def _instrument_to(w_df: pd.DataFrame, t0, t1) -> float:
+        """Annual one-way turnover of the combined book Σ_k pos_k · w_k/σ_k over [t0, t1]."""
+        a = (w_df.reindex(pos_idx).ffill()
+                 .div(sigma_ann.reindex(w_df.columns), axis=1).fillna(0.0))
+        W_comb = pd.DataFrame(0.0, index=pos_idx, columns=pos_cols)
+        for k in w_df.columns:
+            W_comb += (pos[k].reindex(index=pos_idx, columns=pos_cols)
+                             .fillna(0.0).mul(a[k], axis=0))
+        W_comb = W_comb.loc[t0:t1].dropna(how="all")
+        gross = W_comb.abs().sum(axis=1).replace(0.0, np.nan).mean()
+        if not np.isfinite(gross) or gross < 1e-12 or len(W_comb) < 2:
+            return float("nan")
+        trade = W_comb.diff().dropna(how="all").abs().sum(axis=1)
+        return float(trade.mean() * 252 / gross)
 
     def _blend_weight_to(w_df: pd.DataFrame, F_n: pd.DataFrame) -> float:
         """Drift-corrected annual one-way turnover of L1-normalised blend weights."""
@@ -1166,12 +1192,15 @@ def compare_blend_methods(
             ("IS",  r_is_,  w_is_),
             ("OOS", r_oos_, w_oos_),
         ]:
+            w_valid = w.dropna()
             records.append({
-                "Method": method_name,
-                "Period": period,
-                "Sharpe": _sharpe(r),
-                "MDD":    _mdd(r),
-                "TO":     _blend_weight_to(w, F_is if period == "IS" else F_oos),
+                "Method":    method_name,
+                "Period":    period,
+                "Sharpe":    _sharpe(r),
+                "MDD":       _mdd(r),
+                "TO":        _instrument_to(w, w_valid.index[0], w_valid.index[-1])
+                             if len(w_valid) else float("nan"),
+                "Weight_TO": _blend_weight_to(w, F_is if period == "IS" else F_oos),
             })
 
     df = pd.DataFrame(records)
@@ -1180,15 +1209,17 @@ def compare_blend_methods(
     W = 72
     print("=" * W)
     print(f"  COMMODITIES BLEND COMPARISON  (vol target={vol_target*100:.0f}%, λ_ridge={ridge_lam})")
-    print(f"  note: TO = drift-corrected blend-weight turnover (ann.); excludes instrument-level trading")
+    print(f"  note: TO = ann. one-way instrument turnover of the traded book;"
+          f" w-TO = blend-weight turnover only")
     print("=" * W)
-    print(f"  {'Method':<20}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}")
+    print(f"  {'Method':<20}  {'Period':<6}  {'Sharpe':>7}  {'MDD':>8}  {'TO':>7}  {'w-TO':>6}")
     print("  " + "─" * (W - 2))
     for _, row in df.iterrows():
         sr  = f"{row['Sharpe']:+.2f}" if not np.isnan(row["Sharpe"]) else "   n/a"
         mdd = f"{row['MDD']:.1f}%"    if not np.isnan(row["MDD"])    else "    n/a"
         to  = f"{row['TO']:.2f}x"     if not np.isnan(row["TO"])     else "   n/a"
-        print(f"  {row['Method']:<20}  {row['Period']:<6}  {sr:>7}  {mdd:>8}  {to:>7}")
+        wto = f"{row['Weight_TO']:.2f}x" if not np.isnan(row["Weight_TO"]) else "   n/a"
+        print(f"  {row['Method']:<20}  {row['Period']:<6}  {sr:>7}  {mdd:>8}  {to:>7}  {wto:>6}")
         if row["Period"] == "OOS":
             print("  " + "─" * (W - 2))
     print("=" * W)

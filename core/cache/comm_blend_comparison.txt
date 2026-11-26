@@ -1,20 +1,20 @@
-Generated: 2026-11-25 22:09 UTC
+Generated: 2026-11-26 16:06 UTC
 IS <= 2020-12-31  |  OOS >= 2021-01-01  |  10% vol target
 
 ========================================================================
   COMMODITIES BLEND COMPARISON  (vol target=10%, λ_ridge=0.01)
-  note: TO = drift-corrected blend-weight turnover (ann.); excludes instrument-level trading
+  note: TO = ann. one-way instrument turnover of the traded book; w-TO = blend-weight turnover only
 ========================================================================
-  Method                Period   Sharpe       MDD       TO
+  Method                Period   Sharpe       MDD       TO    w-TO
   ──────────────────────────────────────────────────────────────────────
-  Rolling OLS           IS        +1.76    -20.3%   15.19x
-  Rolling OLS           OOS       +1.89     -8.2%   12.08x
+  Rolling OLS           IS        +1.76    -20.3%   45.64x  15.19x
+  Rolling OLS           OOS       +1.89     -8.2%   21.50x  12.08x
   ──────────────────────────────────────────────────────────────────────
-  Rolling Ridge         IS        +1.76    -20.4%   15.16x
-  Rolling Ridge         OOS       +1.89     -8.2%   12.08x
+  Rolling Ridge         IS        +1.76    -20.4%   45.63x  15.16x
+  Rolling Ridge         OOS       +1.89     -8.2%   21.50x  12.08x
   ──────────────────────────────────────────────────────────────────────
-  Static Ridge          IS        +1.91    -20.4%    0.81x
-  Static Ridge          OOS       +2.21     -8.3%    0.93x
+  Static Ridge          IS        +1.91    -20.4%   36.01x   0.81x
+  Static Ridge          OOS       +2.21     -8.3%   11.04x   0.93x
   ──────────────────────────────────────────────────────────────────────
 ========================================================================
 

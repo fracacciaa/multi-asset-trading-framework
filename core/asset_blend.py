@@ -269,6 +269,32 @@ def _drift_to(
     return float(np.mean(to_vals) * freq) if to_vals else float("nan")
 
 
+def _total_traded_to(
+    w_df: pd.DataFrame,
+    to_df: pd.DataFrame,
+    F: pd.DataFrame,
+    freq: int = 12,
+) -> float:
+    """
+    Annual one-way instrument-level turnover the portfolio actually trades.
+
+    Two components, both at instrument level and in the same units:
+      sleeve trading   each sleeve's own instrument turnover at the blend's exposure
+                       weights (_portfolio_to); the sleeves trade disjoint instruments
+                       (swaps, FX forwards, futures, single names) so these add.
+      reallocation     the trades needed to restore the target weights after returns
+                       move them, plus any movement in the weights themselves (_drift_to).
+
+    This is the number to quote as the turnover of the strategy.  _drift_to alone is
+    weight turnover and is roughly two orders of magnitude smaller.
+    """
+    sleeve = _portfolio_to(w_df, to_df, F.index)
+    if not np.isfinite(sleeve):
+        return float("nan")
+    realloc = _drift_to(w_df.reindex(F.index), F, freq)
+    return sleeve + (realloc if np.isfinite(realloc) else 0.0)
+
+
 def _metrics(
     r: pd.Series,
     w_df: Optional[pd.DataFrame],
@@ -308,7 +334,9 @@ def try_asset_blend(
     Fits every method strictly on IS data (no look-ahead). Dynamic methods
     (rolling_msrr, dma) are rolled forward on the full IS+OOS timeline.
     Reports annualised Sharpe, MDD at vol_target, and asset-class weight
-    turnover for each method in IS and OOS.
+    turnover for each method in IS and OOS.  Weight turnover is a research
+    diagnostic, not what the strategy trades: for the instrument-level traded
+    turnover use compare_blend_methods, which adds sleeve trading on top.
 
     Parameters
     ----------
@@ -700,7 +728,8 @@ def compare_blend_methods(
 
     Monthly frequency; Sharpe annualised with √12.
     MDD at exactly vol_target (r scaled to vol_target annual vol).
-    TO = annualised asset-class weight turnover (static methods = 0.0x).
+    TO = annualised one-way instrument-level turnover actually traded: sleeve
+         trading at the method's exposure weights plus reallocation.
 
     Returns
     -------
@@ -712,6 +741,10 @@ def compare_blend_methods(
 
     F_is_raw  = F_all.loc[F_all.index <= is_end]
     F_oos_raw = F_all.loc[F_all.index >  is_end]
+
+    import contextlib, io as _io
+    with contextlib.redirect_stdout(_io.StringIO()):
+        to_df = _build_position_turnover_series()
 
     sigma  = F_is_raw.std() * np.sqrt(12) / SIGNAL_VOL_TARGET
     sigma  = sigma.replace(0.0, np.nan)
@@ -768,7 +801,7 @@ def compare_blend_methods(
             ("OOS", F_o, w_full.reindex(F_o.index)),
         ]:
             r  = _apply_tvw(F, w) * k
-            to = _drift_to(w, F)
+            to = _total_traded_to(w, to_df, F)
             records.append({
                 "Method": method_name,
                 "Period": period,
@@ -931,7 +964,9 @@ def run_assets_tc(
                 "Period":   period,
                 "Sharpe":   _sharpe(r),
                 "MDD_pct":  _mdd(r, vol_target) * 100,
-                "TO":       _portfolio_to(w, to_df, r.index),
+                "TO":       _total_traded_to(
+                                w, to_df,
+                                F_tc_is_raw if period == "IS" else F_tc_oos_raw),
             })
 
         _returns_dict[("Inverse vol", scenario_name)] = (
@@ -988,6 +1023,8 @@ def run_assets_tc(
         "to_df":   to_df,
         "w_is":    w_is,
         "w_oos":   w_oos,
+        "F_is":    F_free_is_raw,
+        "F_oos":   F_free_oos_raw,
     }
 
 
@@ -1049,11 +1086,11 @@ def run_asset_tc(
 
     # ── 3. Build gross metrics row ────────────────────────────────────────────
     gross_rows = []
-    for period, r, w in [
-        ("IS",  r_gross_is,  w_is),
-        ("OOS", r_gross_oos, w_oos),
+    for period, r, w, F_p in [
+        ("IS",  r_gross_is,  w_is,  tc_res["F_is"]),
+        ("OOS", r_gross_oos, w_oos, tc_res["F_oos"]),
     ]:
-        gross_to = _portfolio_to(w, to_df, r.index)
+        gross_to = _total_traded_to(w, to_df, F_p)
         gross_rows.append({
             "Method":   "Inverse vol",
             "Scenario": "gross",
