@@ -416,11 +416,27 @@ def run_fx_prod(
     names   = list(result["F_is"].columns)
 
     # ── monthly positions for position-level turnover ─────────────────────────
+    # Pair inv-vol weights (IS-frozen, same as load_monthly_managed_returns) must
+    # be applied so the blended-pair position is consistent with managed returns / sigma.
+    _rx_m = pd.read_parquet(sdir / "returns.parquet")["rx_m"]
+    _rx_d = pd.read_parquet(sdir / _RX_FILE)
+    _pos_mom = pd.read_parquet(sdir / "signal_a_f9_h1.parquet")
+    _pos_mr  = pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
+    _pos_cxs = pd.read_parquet(sdir / "view_xs_carry_m.parquet")
+    _pair_pnl = {
+        "momentum":       _pos_mom.shift(1) * _rx_m.reindex(columns=_pos_mom.columns),
+        "mean_reversion": (_pos_mr * _rx_d.reindex(columns=_pos_mr.columns)).resample("BME").sum(),
+        "carry":          _pos_cxs.shift(1) * _rx_m.reindex(columns=_pos_cxs.columns),
+    }
+
+    def _pw(sig: str, pos_df: pd.DataFrame) -> pd.DataFrame:
+        w = _pair_inv_vol_weights(_pair_pnl[sig], is_end)
+        return pos_df.mul(w.reindex(pos_df.columns).fillna(0.0), axis=1) if w is not None else pos_df
+
     monthly_pos = {
-        "momentum":  pd.read_parquet(sdir / "signal_a_f9_h1.parquet"),
-        "mean_reversion": (pd.read_parquet(sdir / "mr_ns_loo_positions.parquet")
-                      .resample("BME").last()),
-        "carry":  pd.read_parquet(sdir / "view_xs_carry_m.parquet"),
+        "momentum":       _pw("momentum",      _pos_mom),
+        "mean_reversion": _pw("mean_reversion", _pos_mr.resample("BME").last()),
+        "carry":          _pw("carry",          _pos_cxs),
     }
     common_pairs = sorted(set.intersection(*[set(p.columns) for p in monthly_pos.values()]))
 
