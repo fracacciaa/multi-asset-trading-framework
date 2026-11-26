@@ -53,10 +53,8 @@ def run_fx_pipeline(
     pairs, start, end  Passed to the signal pipeline (fx/production/run.py).
     rebuild_signals    False reuses existing parquets in signals_dir.
     signals_dir        Parquet directory (default fx/signals/).
-    lookback, min_obs  Rolling Ridge MSRR settings for composites (months;
-                       defaults match run_fx_prod).
-    tc_min_obs         min_obs for the TC sweep (default: same as min_obs, so net and
-                       gross share the same IS sample).
+    lookback, min_obs  Rolling Ridge MSRR settings for stage 3 composites (months).
+    tc_min_obs         Unused; kept for backwards compatibility.
     vol_target         Annual vol used for MDD scaling.
     scenarios          TC scenarios (default blend.TC_SCENARIOS_FX: best/base/worst).
     verbose            Print signal-pipeline progress.
@@ -173,8 +171,7 @@ def run_fx_pipeline(
     # ── stage 4: TC-aware scenarios ───────────────────────────────────────────
     with contextlib.redirect_stdout(io.StringIO()):
         tc = _b.run_fx_tc(
-            scenarios=scenarios, signals_dir=sdir,
-            lookback=lookback, min_obs=tc_min_obs or min_obs, vol_target=vol_target,
+            scenarios=scenarios, signals_dir=sdir, vol_target=vol_target,
         )
     R.print_tc(tc["metrics"],
                "STAGE 4 — TC-AWARE SCENARIOS (all 3 signals, pair-specific forward spreads)", cfg)

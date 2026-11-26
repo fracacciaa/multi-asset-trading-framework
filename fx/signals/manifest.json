@@ -86,5 +86,18 @@
     "fly_n_pairs": 4,
     "fly_pnl_type": "rx_d",
     "oos_sr_fly": 0.366
-  }
+  },
+  "blend": {
+    "method": "msrr_ridge",
+    "lam": 0.01,
+    "fit": "static (IS-fit once, frozen weights)",
+    "signals": ["momentum", "mean_reversion", "carry"],
+    "cross_pair_blend": "inv_vol",
+    "universe": "19-pair (excludes USDTRY, absent from mr_fly_positions)",
+    "is_end": "2020-12-31",
+    "oos_start": "2021-01-01",
+    "blend_start": "1999-10-29"
+  },
+  "git_sha": "407fda5",
+  "built_at": "2026-11-26T16:57:10.097195Z"
 }

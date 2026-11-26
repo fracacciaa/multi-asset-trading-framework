@@ -331,28 +331,24 @@ def combined_return_rolling(
 def run_fx_blend(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
-    lookback: int = 36,
-    min_obs: int = 36,
 ) -> dict:
     """
-    Canonical FX blend pipeline: monthly managed returns → rolling Ridge MSRR.
+    Canonical FX blend pipeline: monthly managed returns → static Ridge MSRR.
 
     Loads the three production signal managed returns, vol-normalises to unit
-    annual vol using IS σ only (no look-ahead), fits a rolling Ridge MSRR on IS
-    data (lookback=36m), and predicts weights on OOS.
+    annual vol using IS σ only (no look-ahead), fits a static Ridge MSRR on IS
+    data once, and applies the frozen weights to both IS and OOS.
 
     Parameters
     ----------
     signals_dir   Directory containing the parquet files.  Default: fx/signals/.
     is_end        Last date of the in-sample period.  Default: "2020-12-31".
-    lookback      Rolling window length in months.  Default: 36.
-    min_obs       Minimum observations before weights are produced.  Default: 24.
 
     Returns
     -------
     dict with keys:
-        weights_history   DataFrame of time-varying IS blend weights  (T_is × 3)
-        weights_oos       DataFrame of time-varying OOS blend weights (T_oos × 3)
+        weights_history   DataFrame of constant IS blend weights  (T_is × 3)
+        weights_oos       DataFrame of constant OOS blend weights (T_oos × 3)
         F_is              vol-normalised IS managed returns  (T_is × 3, monthly)
         F_oos             vol-normalised OOS managed returns (T_oos × 3, monthly)
         r_is              combined IS return series  (monthly)
@@ -367,8 +363,16 @@ def run_fx_blend(
     F_is  = F_is_raw.div(sigma)
     F_oos = F_oos_raw.div(sigma)
 
-    model = RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
-    w_is, w_oos = roll_weights_full(model, F_is, F_oos)
+    bw  = msrr_ridge(F_is, lam=0.01)
+    w_s = bw.weights / bw.weights.abs().sum()
+    w_is  = pd.DataFrame(
+        np.tile(w_s.reindex(F_is.columns).values,  (len(F_is),  1)),
+        index=F_is.index,  columns=F_is.columns,
+    )
+    w_oos = pd.DataFrame(
+        np.tile(w_s.reindex(F_oos.columns).values, (len(F_oos), 1)),
+        index=F_oos.index, columns=F_oos.columns,
+    )
 
     return {
         "weights_history": w_is,
@@ -384,21 +388,17 @@ def run_fx_blend(
 def run_fx_prod(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
-    lookback: int = 36,
-    min_obs: int = 36,
     print_table: bool = True,
     vol_target: float = 0.10,
 ) -> pd.Series:
     """
-    FX production pipeline: blend 3 signals with rolling OLS MSRR, print
+    FX production pipeline: blend 3 signals with static Ridge MSRR, print
     IS / OOS Sharpe, MDD and turnover, and return the full combined return series.
 
     Parameters
     ----------
     signals_dir   Directory containing the parquet files.  Default: fx/signals/.
     is_end        Last date of the in-sample period.  Default: "2020-12-31".
-    lookback      Rolling window length in months.  Default: 36.
-    min_obs       Minimum observations before weights are produced.  Default: 24.
     print_table   Whether to print the summary table.  Default: True.
 
     Returns
@@ -407,8 +407,7 @@ def run_fx_prod(
     """
     sdir = Path(signals_dir) if signals_dir else _SIGNALS_DIR
 
-    result  = run_fx_blend(signals_dir=sdir, is_end=is_end,
-                           lookback=lookback, min_obs=min_obs)
+    result  = run_fx_blend(signals_dir=sdir, is_end=is_end)
     r_is    = result["r_is"]
     r_oos   = result["r_oos"]
     w_is    = result["weights_history"]
@@ -471,7 +470,7 @@ def run_fx_prod(
         oos_end   = result["F_oos"].index[-1].strftime("%Y-%m")
         print()
         print("=" * W)
-        print("  FX PRODUCTION  —  Rolling Ridge MSRR  (lookback={:d}m, 3 signals)".format(lookback))
+        print("  FX PRODUCTION  —  Static Ridge MSRR  (IS-fit, 3 signals)")
         print(f"  IS  : {is_start} → {is_end}   |   OOS : {OOS_START[:7]} → {oos_end}")
         print("=" * W)
         print(f"  {'':20}  {'Sharpe':>8}  {'MDD':>9}  {'Turnover':>10}")
@@ -533,15 +532,13 @@ def tc_sweep_fx(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     oos_start: str = OOS_START,
-    lookback: int = 36,
-    min_obs: int = 36,
     vol_target: float = 0.10,
     _collect_returns: bool = False,
 ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """
     TC sensitivity sweep for the FX blend with market-specific forward spreads.
 
-    Fixed weights: the rolling Ridge is fit ONCE on TC-free signals; only the TC
+    Fixed weights: static Ridge is fit ONCE on IS TC-free signals; only the TC
     deduction changes across scenarios (same logic as tc_sweep_rates).  Pure cost
     impact, Sharpe decreases monotonically with higher TC.
 
@@ -559,8 +556,6 @@ def tc_sweep_fx(
     signals_dir Directory containing the parquet files.  Default: fx/signals/.
     is_end      Last IS date.  Default: "2020-12-31".
     oos_start   First OOS date.  Default: "2021-01-01".
-    lookback    Rolling Ridge window in months.  Default: 36.
-    min_obs     Minimum observations before first weight estimate.  Default: 24.
     vol_target  For MDD computation (scales NAV to target annual vol).
 
     Returns
@@ -661,7 +656,7 @@ def tc_sweep_fx(
         return ((G_n.loc[idx] * w).sum(axis=1)
                 - (C_n.loc[idx] * w.abs()).sum(axis=1)).rename("combined")
 
-    # ── TC-free baseline: fit Rolling Ridge ONCE for fixed-weight method ──────
+    # ── TC-free baseline: fit Static Ridge ONCE on IS for fixed-weight method ──
     F_free_is  = F_gross.loc[F_gross.index <= is_end]
     F_free_oos = F_gross.loc[F_gross.index >= oos_start]
 
@@ -670,8 +665,16 @@ def tc_sweep_fx(
     F_free_is_n  = F_free_is.div(sigma_free)
     F_free_oos_n = F_free_oos.div(sigma_free)
 
-    model_free = RollingMSRR(penalty="ridge", lam=0.01, lookback=lookback, min_obs=min_obs)
-    w_is_fixed, w_oos_fixed = roll_weights_full(model_free, F_free_is_n, F_free_oos_n)
+    bw_free  = msrr_ridge(F_free_is_n, lam=0.01)
+    w_s_free = bw_free.weights / bw_free.weights.abs().sum()
+    w_is_fixed  = pd.DataFrame(
+        np.tile(w_s_free.reindex(F_free_is_n.columns).values,  (len(F_free_is_n),  1)),
+        index=F_free_is_n.index,  columns=F_free_is_n.columns,
+    )
+    w_oos_fixed = pd.DataFrame(
+        np.tile(w_s_free.reindex(F_free_oos_n.columns).values, (len(F_free_oos_n), 1)),
+        index=F_free_oos_n.index, columns=F_free_oos_n.columns,
+    )
 
     # ── Sweep ─────────────────────────────────────────────────────────────────
     records = []
@@ -695,7 +698,7 @@ def tc_sweep_fx(
         F_tc_is  = F_tc.loc[F_tc.index <= is_end]
         F_tc_oos = F_tc.loc[F_tc.index >= oos_start]
 
-        if len(F_tc_is) < min_obs or len(F_tc_oos) < 12:
+        if F_tc_is.empty or len(F_tc_oos) < 12:
             continue
 
         # ── Method 1: Fixed weights — TC-free Ridge, only deduct cost ─────────
@@ -728,7 +731,7 @@ def tc_sweep_fx(
 
     # ── Print results ─────────────────────────────────────────────────────────
     W = 80
-    label = "FIXED WEIGHTS — TC-free Ridge fit; only cost deducted"
+    label = "FIXED WEIGHTS — TC-free Static Ridge fit; only cost deducted"
     print("\n" + "=" * W)
     print(f"  FX  |  {label}")
     print(f"  IS ≤ {is_end}  |  OOS ≥ {oos_start}  |  vol target={vol_target*100:.0f}%  |  monthly")
@@ -778,8 +781,6 @@ def run_fx_tc(
     signals_dir: str | Path | None = None,
     is_end: str = IS_END,
     oos_start: str = OOS_START,
-    lookback: int = 36,
-    min_obs: int = 36,
     vol_target: float = 0.10,
 ) -> dict:
     """
@@ -804,8 +805,6 @@ def run_fx_tc(
         signals_dir=signals_dir,
         is_end=is_end,
         oos_start=oos_start,
-        lookback=lookback,
-        min_obs=min_obs,
         vol_target=vol_target,
         _collect_returns=True,
     )
