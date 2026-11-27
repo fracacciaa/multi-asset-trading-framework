@@ -1,4 +1,17 @@
 {
+  "universe": [
+    "Australia",
+    "Canada",
+    "China",
+    "EUR",
+    "India",
+    "Japan",
+    "New Zealand",
+    "Sweden",
+    "Switzerland",
+    "UK",
+    "US"
+  ],
   "markets": [
     "Australia",
     "Canada",
@@ -49,6 +62,15 @@
   ],
   "start": null,
   "end": null,
+  "is_end": "2020-12-31",
+  "oos_start": "2021-01-01",
+  "params": {
+    "lam_train_end": "2015-12-31",
+    "mr_target_vol": 100.0,
+    "mr_burn_in": 252
+  },
+  "git_sha": "ac8e660",
+  "built_at": "2026-11-27T18:58:35.481977Z",
   "ns_model": "ns_calibrated",
   "carry_tenors": [
     5.0,
@@ -67,6 +89,8 @@
     "mean_reversion_pnl": "date \u00d7 market; NS classic MR full repricing \u2014 use for Sharpe (daily, \u221a252)",
     "mean_reversion_zscores": "date \u00d7 (market,tenor) MultiIndex; NS classic z-scores \u2014 diagnostic, NOT for TC",
     "mean_reversion_dv01_pos": "date \u00d7 (market,tenor) MultiIndex; held DV01 positions (daily rebalancing) \u2014 use for TC estimation in rates/blend.py",
+    "mean_reversion_fly_pnl": "date \u00d7 market; NS MR butterfly full repricing \u2014 use for Sharpe (daily, \u221a252)",
+    "mean_reversion_fly_dv01_pos": "date \u00d7 (market,tenor) MultiIndex; butterfly held DV01 positions \u2014 use for TC estimation",
     "momentum_a_daily": "date \u00d7 (market,tenor); daily TSMOM positions (252d window) \u2014 signal only",
     "momentum_a_daily_pnl": "date \u00d7 market; full repricing pos \u00d7 swap_pv \u00d7 10000 \u2014 use for Sharpe (daily, \u221a252)",
     "rx_m": "date \u00d7 (market,tenor); Sihvonen monthly log excess returns (bp)",

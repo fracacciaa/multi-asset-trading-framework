@@ -86,9 +86,12 @@ _EXPECTED_PARQUETS: dict[str, list[str]] = {
     "rates": [
         "momentum_a_daily_pnl.parquet",
         "carry_ois_par_pnl.parquet",
-        "mean_reversion_pnl.parquet",
+        "mean_reversion_fly_pnl.parquet",
         "momentum_a_daily.parquet",
         "carry_ois_par.parquet",
+        "mean_reversion_fly_dv01_pos.parquet",
+        # classic whole-curve MR kept for research
+        "mean_reversion_pnl.parquet",
         "mean_reversion_dv01_pos.parquet",
     ],
     "equities": [
@@ -177,7 +180,10 @@ def check_parquet_integrity() -> list[Check]:
                 continue
 
             # A.4 NaN coverage
-            if isinstance(df, pd.DataFrame) and df.shape[1] > 0:
+            # Skip intentionally sparse position/DV01 files: a 3-leg fly or
+            # multi-tenor position frame has most columns NaN by construction.
+            _sparse_pos = any(tok in f for tok in ("dv01_pos", "_positions", "_pos."))
+            if isinstance(df, pd.DataFrame) and df.shape[1] > 0 and not _sparse_pos:
                 # Use overall (all-cell) NaN rate; per-column max is misleading
                 # for wide position files where many instruments have different
                 # history start dates (structural absence ≠ data quality issue)

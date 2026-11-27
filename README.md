@@ -36,12 +36,13 @@ Two conventions are shared by every sleeve:
 ├── rates/
 │   ├── production/
 │   │   ├── run.py                      # ← entry point: generates all rates parquets
-│   │   ├── ns_classic/                 # Nelson-Siegel MR signal
+│   │   ├── ns_classic/                 # Nelson-Siegel MR signals
 │   │   │   ├── bootstrap.py            # OIS curve bootstrapping
 │   │   │   ├── ns_fit.py               # DV01-weighted NS regression + z-scores
 │   │   │   ├── signal.py               # build_dv01_positions (net-DV01 neutral)
+│   │   │   ├── fly_signal.py           # ← production MR: DV01-neutral 3-leg butterfly
 │   │   │   ├── spread_signal.py        # DV01-neutral two-tenor spread from NS residuals
-│   │   │   └── pnl.py                  # Full swap repricing backtest
+│   │   │   └── pnl.py                  # Full swap repricing backtest (classic whole-curve)
 │   │   ├── momentum/                   # Daily TSMOM signal
 │   │   │   ├── signal_a.py
 │   │   │   ├── returns.py
@@ -128,8 +129,10 @@ Outputs (all in `rates/signals/`):
 
 | File | Shape | Description |
 |---|---|---|
-| `mean_reversion_pnl.parquet` | date × market | NS classic MR daily PnL, full swap repricing (bp) |
-| `mean_reversion_dv01_pos.parquet` | date × (market, tenor) | Held DV01 positions — TC proxy |
+| `mean_reversion_fly_pnl.parquet` | date × market | **Production MR**: NS butterfly daily PnL, full swap repricing (bp) |
+| `mean_reversion_fly_dv01_pos.parquet` | date × (market, tenor) | Butterfly held DV01 positions — TC proxy |
+| `mean_reversion_pnl.parquet` | date × market | *Research*: NS classic whole-curve MR PnL (bp) |
+| `mean_reversion_dv01_pos.parquet` | date × (market, tenor) | *Research*: Classic MR held DV01 positions |
 | `mean_reversion_zscores.parquet` | date × (market, tenor) | NS residual z-scores |
 | `momentum_a_daily_pnl.parquet` | date × market | Daily TSMOM PnL, full repricing (bp) |
 | `momentum_a_daily.parquet` | date × (market, tenor) | TSMOM daily positions (DV01) |
@@ -158,11 +161,18 @@ Transaction costs are deducted per signal from their respective position parquet
 | Momentum | `\|Δpos\| × h_bp × eff_dur` | bp |
 | Mean reversion | `\|Δ(net_dv01)\| × h_bp` | bp — net across tenors, not tenor by tenor |
 
+To re-plug the classic NS whole-curve MR into the blend:
+
+```python
+from rates.blend import CLASSIC_SIGNAL_FILES, CLASSIC_POS_FILES, load_managed_returns
+F = load_managed_returns(signals=CLASSIC_SIGNAL_FILES)
+```
+
 ### Key design decisions
 
 - **Full swap repricing** — PnL is computed from `swap_pv(K, T−dt, curve_t)`, not `−D × Δy`. Carry, roll-down and curve moves are captured in one number.
-- **Net-DV01 neutral MR** — z-scores are demeaned row-wise before position sizing so `Σ_i dv01_tgt_i = 0` at every rebalance. The DV01-weighted OLS condition `Σ_i w_i·z_i = 0` is a property of the NS fit and is distinct from the plain-sum neutrality enforced here.
-- **TC on net DV01** — within-market tenor rebalancing (NS shape adjustment) is free; cost is charged only on changes in total market allocation.
+- **MR as a DV01-neutral butterfly** — the production `mean_reversion` signal trades a fixed 3-leg package (lower / body / upper) per market, selected a-priori from IS z-scores. Legs are DV01-weighted (−0.5, +1.0, −0.5), making the package neutral to level, slope and curvature by construction. This roughly halves gross turnover vs the classic 15-leg whole-curve book. The classic signal is kept in `mean_reversion_pnl.parquet` for research; swap back via `CLASSIC_SIGNAL_FILES`.
+- **TC on net DV01** — within-market tenor rebalancing is free; cost is charged only on changes in total market DV01 allocation.
 
 ---
 
@@ -231,7 +241,7 @@ Runs all four sleeves, then blends them with static inverse-vol capital weights 
 python -m pytest tests/
 ```
 
-221 tests.  The rates suite (`tests/rates/`) covers bootstrap round-trips, swap PV sign conventions, NS fit properties, leakage audits, placebo Sharpe distribution, net-DV01 neutrality, carry measures, and no-lookahead.  `test_layer_boundary.py` enforces that blend/core layers cannot import production modules at module level.
+236 tests.  The rates suite (`tests/rates/`) covers bootstrap round-trips, swap PV sign conventions, NS fit properties, leakage audits, placebo Sharpe distribution, net-DV01 neutrality, carry measures, no-lookahead, and butterfly fly signal (leg selection, DV01 neutrality, vol scaling).  `test_layer_boundary.py` enforces that blend/core layers cannot import production modules at module level.
 
 ---
 
