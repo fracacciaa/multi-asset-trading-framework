@@ -533,9 +533,15 @@ def tc_sweep_rates(
             else:
                 pos_m = pos_df[[mkt]]
             pos_m = pos_m.reindex(pnl_df.index, method="ffill")
-            # Net position per market (sum across tenors): TC is on the change in
-            # total market allocation, not the sum of within-market tenor moves.
-            daily_abs_chg = pos_m.sum(axis=1).diff().abs()
+            # For butterfly (mean_reversion): legs are individually traded, so charge
+            # on the sum of per-leg absolute changes. Net DV01 sum is ~0 by construction
+            # and would zero out TC if we summed first.
+            # For carry/momentum: tenors move together as one market view; net sum is
+            # the right proxy for total trade size.
+            if signal == "mean_reversion":
+                daily_abs_chg = pos_m.diff().abs().sum(axis=1)
+            else:
+                daily_abs_chg = pos_m.sum(axis=1).diff().abs()
             if signal == "momentum":
                 tc_cost = daily_abs_chg * h * _MOM_EFF_DUR
             else:
