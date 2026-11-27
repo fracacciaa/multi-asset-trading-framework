@@ -33,30 +33,44 @@ from rates.production.ois_data import OIS_MARKETS
 
 SIG_DIR = os.path.join(os.path.dirname(__file__), "signals")
 
-ENTRY_THRESHOLDS = [0.0, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 2.00]
+# (entry_z, exit_z) pairs to sweep
+THRESHOLDS = [
+    (0.0,  0.0),
+    (1.0,  0.0),
+    (1.5,  0.0),
+    (2.0,  0.0),
+    (2.0,  0.5),
+    (2.0,  1.0),
+    (2.5,  0.5),
+    (2.5,  1.0),
+]
 
 
-def _hysteresis_indicator(z: pd.Series, entry: float) -> pd.Series:
+def _hysteresis_indicator(z: pd.Series, entry: float, exit_z: float = 0.0) -> pd.Series:
     """
-    Returns 0/1 indicator: 1 = holding a position, 0 = flat.
-    Enter when |z| > entry, exit when z crosses zero.
-    entry=0.0 means always in-position (continuous).
+    Returns 0/1 indicator: 1 = holding, 0 = flat.
+    Enter when |z| > entry; exit when |z| < exit_z (same side as entry).
+    exit_z=0 means exit only when z crosses zero.
+    entry=0.0 means always in-position.
     """
     if entry == 0.0:
         return pd.Series(np.where(z.notna(), 1.0, np.nan), index=z.index)
     vals = z.to_numpy(dtype=float)
     out  = np.zeros(len(vals))
-    s    = 0  # 0=flat, 1=holding
+    s    = 0
+    prev_entry_sign = 0.0
     for i, x in enumerate(vals):
         if not np.isfinite(x):
             s = 0
             out[i] = np.nan
             continue
-        if s == 1 and x * prev_entry_sign <= 0.0:  # type: ignore[name-defined]
-            s = 0
+        if s == 1:
+            # exit when z has reverted past exit_z toward zero (same side)
+            if abs(x) < exit_z or x * prev_entry_sign <= 0.0:
+                s = 0
         if s == 0 and abs(x) > entry:
             s = 1
-            prev_entry_sign = float(np.sign(x))  # noqa: F841
+            prev_entry_sign = float(np.sign(x))
         out[i] = float(s)
     return pd.Series(out, index=z.index)
 
@@ -105,32 +119,34 @@ def run_sweep(markets: list[str] | None = None) -> pd.DataFrame:
         h_mkt_best = h_best.get(mkt, 2.0)
         h_mkt_base = h_base.get(mkt, 2.0)
 
-        # normalize fly_resid by its rolling EWMA vol for threshold comparison
-        fly_vol = fly_resid.diff().abs().ewm(halflife=DEFAULT_EWMA_HL).mean().shift(1)
-        fly_z   = (fly_resid / fly_vol.replace(0, np.nan)).reindex(pnl_m.index)
+        # normalize by expanding std of fly_resid level (causal, in z-score units)
+        # fly_resid is built from individual z-scores so std ≈ 1.2; this gives
+        # a true z-score where |fly_z|>2 fires ~5-10% of the time
+        fly_std = fly_resid.expanding(min_periods=DEFAULT_EWMA_HL).std()
+        fly_z   = (fly_resid / fly_std.replace(0, np.nan)).reindex(pnl_m.index)
 
-        for entry_z in ENTRY_THRESHOLDS:
-            I_hold = _hysteresis_indicator(fly_z, entry_z).reindex(pnl_m.index).fillna(0.0)
+        for entry_z, exit_z in THRESHOLDS:
+            I_hold = _hysteresis_indicator(fly_z, entry_z, exit_z).reindex(pnl_m.index).fillna(0.0)
 
             pnl_hyst = pnl_m * I_hold
 
             # ── TC model 1: continuous (daily rebalancing when in-position) ──────
             held_df  = target_df.multiply(I_hold, axis=0)
-            tc_cont  = held_df.diff().abs().sum(axis=1)   # per-leg daily changes
+            tc_cont  = held_df.diff().abs().sum(axis=1)
 
             # ── TC model 2: frozen (TC only on entry/exit events) ─────────────
-            transitions = I_hold.diff().abs().fillna(0.0)  # 1.0 at entry/exit
-            tc_frozen   = total_abs_dv01 * transitions     # full position at transition
+            transitions = I_hold.diff().abs().fillna(0.0)
+            tc_frozen   = total_abs_dv01 * transitions
 
             for period, sl in [("IS", slice(None, IS_END)), ("OOS", slice(OOS_START, None))]:
                 p = pnl_hyst.loc[sl].dropna()
                 if len(p) < 30:
                     continue
-                vol      = p.std() * np.sqrt(252)
+                vol    = p.std() * np.sqrt(252)
                 if vol < 1e-12:
                     continue
-                g_mean   = p.mean() * 252
-                i_active = I_hold.reindex(p.index).fillna(0.0)
+                g_mean = p.mean() * 252
+                i_act  = I_hold.reindex(p.index).fillna(0.0)
 
                 tc_c_best = tc_cont.reindex(p.index).fillna(0.0).mean() * 252 * h_mkt_best
                 tc_c_base = tc_cont.reindex(p.index).fillna(0.0).mean() * 252 * h_mkt_base
@@ -138,15 +154,13 @@ def run_sweep(markets: list[str] | None = None) -> pd.DataFrame:
                 tc_f_base = tc_frozen.reindex(p.index).fillna(0.0).mean() * 252 * h_mkt_base
 
                 rows.append(dict(
-                    mkt=mkt, entry_z=entry_z, period=period,
-                    gross_sr    = _sr(p),
-                    net_sr_cont_best = (g_mean - tc_c_best) / vol,
-                    net_sr_cont_base = (g_mean - tc_c_base) / vol,
+                    mkt=mkt, entry_z=entry_z, exit_z=exit_z, period=period,
+                    gross_sr         = _sr(p),
                     net_sr_frz_best  = (g_mean - tc_f_best) / vol,
                     net_sr_frz_base  = (g_mean - tc_f_base) / vol,
-                    dv01_pd_cont = tc_cont.reindex(p.index).fillna(0.0).mean(),
-                    dv01_pd_frz  = tc_frozen.reindex(p.index).fillna(0.0).mean(),
-                    pct_in_mkt  = float(i_active.mean()) * 100,
+                    net_sr_cont_best = (g_mean - tc_c_best) / vol,
+                    dv01_pd_frz      = tc_frozen.reindex(p.index).fillna(0.0).mean(),
+                    pct_in_mkt       = float(i_act.mean()) * 100,
                 ))
 
         print(f"  {mkt} done", flush=True)
@@ -162,11 +176,9 @@ if __name__ == "__main__":
     pd.set_option("display.float_format", "{:.2f}".format)
 
     print("\n=== Cross-market equal-weight average ===")
-    agg = (df.groupby(["entry_z", "period"])
-             [["gross_sr", "net_sr_cont_best", "net_sr_cont_base",
-               "net_sr_frz_best", "net_sr_frz_base",
-               "dv01_pd_cont", "dv01_pd_frz", "pct_in_mkt"]]
-             .mean().round(2))
+    cols = ["gross_sr", "net_sr_frz_best", "net_sr_frz_base", "net_sr_cont_best",
+            "dv01_pd_frz", "pct_in_mkt"]
+    agg = df.groupby(["entry_z", "exit_z", "period"])[cols].mean().round(2)
     print(agg.to_string())
 
     print("\n=== Per-market IS results ===")
