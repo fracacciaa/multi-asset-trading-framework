@@ -11,12 +11,8 @@ Outputs written to rates/signals/:
   mean_reversion_pnl.parquet  date × market                 NS classic MR daily PnL, full repricing (bp)
   mean_reversion_zscores.parquet date × (market, tenor)     NS classic MR z-scores
   mean_reversion_dv01_pos.parquet date × (market, tenor)    NS classic MR held DV01 positions
-  mean_reversion_fly_pnl.parquet      date × market         NS MR butterfly daily PnL (research)
-  mean_reversion_fly_dv01_pos.parquet date × (market,tenor) NS MR butterfly held DV01 positions (research)
-  mean_reversion_spread_pnl.parquet      date × market         NS MR 2-leg spread PnL (research)
-  mean_reversion_spread_dv01_pos.parquet date × (market,tenor) NS MR spread held DV01 positions (research)
-  mean_reversion_dir_pnl.parquet  date × market             NS MR direction+hysteresis PnL — PRODUCTION
-  mean_reversion_dir_dv01_pos.parquet date × (market,tenor) NS MR direction+hysteresis held DV01 positions — PRODUCTION
+  mean_reversion_dir_pnl.parquet  date × market             NS MR direction+hysteresis PnL (entry=2.5, exit=0.25)
+  mean_reversion_dir_dv01_pos.parquet date × (market,tenor) NS MR direction+hysteresis held DV01 positions
   carry_ois_par.parquet       date × (market, tenor)        within-curve carry OIS positions
   carry_ois_par_pnl.parquet   date × market                 within-curve carry OIS PnL, full repricing (bp)
   rx_m.parquet                date × (market, tenor)        Sihvonen monthly log excess returns (bp)
@@ -42,8 +38,6 @@ from rates.production.ns_classic.bootstrap import bootstrap_curves
 from rates.production.ns_classic.ns_fit import select_lambda
 from rates.production.ns_classic.pnl import classic_ns_pnl_repriced
 from rates.production.ns_classic.direction_signal import build_direction_signal
-from rates.production.ns_classic.fly_signal import fly_pnl_repriced
-from rates.production.ns_classic.spread_signal import spread_pnl_repriced
 from rates.production.momentum.returns import build_all_return_panels
 from rates.production.momentum.signal_a import build_signal_a_daily
 from rates.production.momentum.signal_a import DM_MARKETS as MOM_MARKETS
@@ -61,7 +55,6 @@ OUTPUT_DIR = Path(__file__).parent.parent / "signals"
 _LAM_TRAIN_END = "2015-12-31"
 _MR_TARGET_VOL = 100.0   # bp/yr vol target per market
 _MR_BURN_IN    = 252     # trading days before signal goes live
-_MR_FLY_LEG_IS_END = "2020-12-31"   # fly leg selection uses IS z-scores only
 
 
 def run(
@@ -208,7 +201,6 @@ def run(
     mr_pnl_dict:    dict[str, pd.Series]    = {}
     mr_zscore_dict: dict[str, pd.DataFrame] = {}
     mr_dv01_dict:   dict[str, pd.DataFrame] = {}
-    _lam_per_mkt:   dict[str, float]        = {}   # reused by fly + spread
 
     for mkt in markets:
         if mkt not in par_curves:
@@ -221,7 +213,6 @@ def run(
                 lam = lr["best_lambda"]
             except Exception:
                 lam = 2.5
-            _lam_per_mkt[mkt] = lam
             pnl, z_scores, resids, held_dv01 = classic_ns_pnl_repriced(
                 par_mkt, lam,
                 target_ann_vol=_MR_TARGET_VOL,
@@ -255,73 +246,6 @@ def run(
     else:
         mr_dv01_pos = pd.DataFrame()
     _save("mean_reversion_dv01_pos.parquet", mr_dv01_pos)
-
-    # ── NS classic MR — butterfly (research) ─────────────────────────────────
-    _log("NS classic MR: butterfly variant (research, full repricing)...")
-    fly_pnl_dict:  dict[str, pd.Series]    = {}
-    fly_pos_dict:  dict[str, pd.DataFrame] = {}
-    fly_legs_used: dict[str, list]         = {}
-    for mkt in markets:
-        if mkt not in par_curves or mkt not in _lam_per_mkt:
-            continue
-        try:
-            f_pnl, f_pos, f_legs = fly_pnl_repriced(
-                par_curves[mkt], _lam_per_mkt[mkt],
-                is_end=_MR_FLY_LEG_IS_END,
-                target_ann_vol=_MR_TARGET_VOL,
-                burn_in=_MR_BURN_IN,
-            )
-            fly_pnl_dict[mkt]  = f_pnl
-            fly_pos_dict[mkt]  = f_pos
-            fly_legs_used[mkt] = [float(x) for x in f_legs]
-            _log(f"  {mkt}: fly={tuple(int(x) for x in f_legs)}  n={f_pnl.dropna().__len__()}")
-        except Exception as exc:
-            _log(f"  Warning: NS MR butterfly failed for {mkt}: {exc}")
-
-    fly_pnl = pd.DataFrame(fly_pnl_dict)
-    fly_pnl.index.name = "date"
-    _save("mean_reversion_fly_pnl.parquet", fly_pnl)
-
-    if fly_pos_dict:
-        fly_pos = pd.concat(fly_pos_dict, axis=1)
-        fly_pos.columns.names = ["market", "tenor"]
-    else:
-        fly_pos = pd.DataFrame()
-    _save("mean_reversion_fly_dv01_pos.parquet", fly_pos)
-
-    # ── NS classic MR — spread (research, outer fly legs) ────────────────────
-    _log("NS classic MR: spread variant (research, outer fly legs, full repricing)...")
-    spread_pnl_dict: dict[str, pd.Series]    = {}
-    spread_pos_dict: dict[str, pd.DataFrame] = {}
-    for mkt in markets:
-        if mkt not in fly_legs_used or len(fly_legs_used[mkt]) < 2:
-            continue
-        T1 = float(min(fly_legs_used[mkt]))
-        T2 = float(max(fly_legs_used[mkt]))
-        try:
-            s_pnl, sp_z, _, k_arr = spread_pnl_repriced(
-                par_curves[mkt], _lam_per_mkt[mkt],
-                T1=T1, T2=T2,
-                target_ann_vol=_MR_TARGET_VOL,
-                burn_in=_MR_BURN_IN,
-            )
-            spread_pnl_dict[mkt] = s_pnl
-            held = k_arr * sp_z
-            spread_pos_dict[mkt] = pd.DataFrame({T1: held, T2: -held}, index=k_arr.index)
-            _log(f"  {mkt}: spread({T1}Y-{T2}Y)  n={s_pnl.dropna().__len__()}")
-        except Exception as exc:
-            _log(f"  Warning: NS MR spread failed for {mkt}: {exc}")
-
-    spread_pnl = pd.DataFrame(spread_pnl_dict)
-    spread_pnl.index.name = "date"
-    _save("mean_reversion_spread_pnl.parquet", spread_pnl)
-
-    if spread_pos_dict:
-        spread_pos = pd.concat(spread_pos_dict, axis=1)
-        spread_pos.columns.names = ["market", "tenor"]
-    else:
-        spread_pos = pd.DataFrame()
-    _save("mean_reversion_spread_dv01_pos.parquet", spread_pos)
 
     # ── NS classic MR — direction + asymmetric hysteresis (production signal) ──
     # entry_z=2.5, exit_z=0.25.  Fixed-k per tenor = IS median |continuous_dv01|.
@@ -372,12 +296,8 @@ def run(
             "mean_reversion_pnl":       "date × market; NS classic MR full repricing — use for Sharpe (daily, √252)",
             "mean_reversion_zscores":   "date × (market,tenor) MultiIndex; NS classic z-scores — diagnostic, NOT for TC",
             "mean_reversion_dv01_pos":  "date × (market,tenor) MultiIndex; held DV01 positions (daily rebalancing) — use for TC estimation in rates/blend.py",
-            "mean_reversion_fly_pnl":      "date × market; NS MR butterfly full repricing (research only)",
-            "mean_reversion_fly_dv01_pos": "date × (market,tenor) MultiIndex; butterfly held DV01 positions (research only)",
-            "mean_reversion_spread_pnl":      "date × market; NS MR 2-leg spread full repricing (research only)",
-            "mean_reversion_spread_dv01_pos": "date × (market,tenor) MultiIndex; spread held DV01 positions (research only)",
-            "mean_reversion_dir_pnl":      "date × market; NS MR direction+hysteresis (entry=2.5, exit=0.25) — PRODUCTION signal",
-            "mean_reversion_dir_dv01_pos": "date × (market,tenor) MultiIndex; direction+hysteresis held DV01 positions — PRODUCTION TC proxy",
+            "mean_reversion_dir_pnl":      "date × market; NS MR direction+hysteresis PnL (entry=2.5, exit=0.25) — use for Sharpe (daily, √252)",
+            "mean_reversion_dir_dv01_pos": "date × (market,tenor) MultiIndex; direction+hysteresis held DV01 positions — use for TC estimation",
             "momentum_a_daily":         "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
             "momentum_a_daily_pnl":     "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
             "rx_m":                     "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
@@ -402,12 +322,8 @@ def run(
         "carry_ois_par":           carry_pos,
         "carry_ois_par_pnl":       carry_pnl,
         "mean_reversion_pnl":      mr_pnl,
-        "mean_reversion_fly_pnl":          fly_pnl,
-        "mean_reversion_fly_dv01_pos":     fly_pos,
-        "mean_reversion_spread_pnl":       spread_pnl,
-        "mean_reversion_spread_dv01_pos":  spread_pos,
-        "mean_reversion_dir_pnl":          dir_pnl,
-        "mean_reversion_dir_dv01_pos":     dir_pos,
+        "mean_reversion_dir_pnl":      dir_pnl,
+        "mean_reversion_dir_dv01_pos": dir_pos,
         "mean_reversion_zscores":  mr_zscores,
         "mean_reversion_dv01_pos": mr_dv01_pos,
         "momentum_a_daily":        mom_a_daily,
