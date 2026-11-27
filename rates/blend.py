@@ -19,13 +19,7 @@ Pipeline:
 Signals (production, from rates/signals/):
     momentum        momentum_a_daily_pnl.parquet      daily TSMOM (8 markets)
     carry           carry_ois_par_pnl.parquet          within-curve OIS carry (7 markets)
-    mean_reversion  mean_reversion_fly_pnl.parquet     NS MR butterfly (3-leg DV01-neutral)
-
-To swap back to the NS classic whole-curve MR, pass CLASSIC_SIGNAL_FILES and
-CLASSIC_POS_FILES explicitly:
-
-    from rates.blend import CLASSIC_SIGNAL_FILES, CLASSIC_POS_FILES, load_managed_returns
-    F = load_managed_returns(signals=CLASSIC_SIGNAL_FILES)
+    mean_reversion  mean_reversion_dir_pnl.parquet     NS MR direction + hysteresis (entry=2.5, exit=0.25)
 
 Each PnL parquet is date × market (bp, daily).  load_managed_returns aggregates
 each signal to a scalar series using the signal-specific cross-market blend method.
@@ -77,28 +71,13 @@ _SIGNALS_DIR = Path(__file__).parent / "signals"
 SIGNAL_FILES: dict[str, str] = {
     "momentum":       "momentum_a_daily_pnl.parquet",
     "carry":          "carry_ois_par_pnl.parquet",
-    "mean_reversion": "mean_reversion_fly_pnl.parquet",
+    "mean_reversion": "mean_reversion_dir_pnl.parquet",
 }
 
 _POS_FILES: dict[str, str] = {
     "momentum":       "momentum_a_daily.parquet",
     "carry":          "carry_ois_par.parquet",
-    "mean_reversion": "mean_reversion_fly_dv01_pos.parquet",
-}
-
-# ── NS classic whole-curve MR — kept for research; not in production blend ────
-# To run the classic signal blend, pass these to load_managed_returns() or
-# tc_sweep_rates() instead of the defaults.
-CLASSIC_SIGNAL_FILES: dict[str, str] = {
-    "momentum":       "momentum_a_daily_pnl.parquet",
-    "carry":          "carry_ois_par_pnl.parquet",
-    "mean_reversion": "mean_reversion_pnl.parquet",
-}
-
-CLASSIC_POS_FILES: dict[str, str] = {
-    "momentum":       "momentum_a_daily.parquet",
-    "carry":          "carry_ois_par.parquet",
-    "mean_reversion": "mean_reversion_dv01_pos.parquet",
+    "mean_reversion": "mean_reversion_dir_dv01_pos.parquet",
 }
 
 IS_END    = "2020-12-31"
@@ -956,16 +935,16 @@ def try_mr_market_blend(
     vol_target: float = 0.10,
 ) -> dict:
     """
-    Evaluate all blend methods applied to per-market MR (butterfly) PnL.
+    Evaluate all blend methods applied to per-market MR (direction + hysteresis) PnL.
 
-    Uses mean_reversion_fly_pnl.parquet (date × market, bp/day).
+    Uses mean_reversion_dir_pnl.parquet (date × market, bp/day).
 
     Returns
     -------
     dict keyed by method name with IS/OOS {"sharpe", "mdd", "turnover"}.
     """
     return _try_market_blend(
-        pnl_file="mean_reversion_fly_pnl.parquet",
+        pnl_file="mean_reversion_dir_pnl.parquet",
         signal_label="MEAN REVERSION",
         signals_dir=signals_dir,
         is_end=is_end, lookback=lookback,
