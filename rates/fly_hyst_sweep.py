@@ -33,17 +33,10 @@ from rates.production.ois_data import OIS_MARKETS
 
 SIG_DIR = os.path.join(os.path.dirname(__file__), "signals")
 
-# (entry_z, exit_z) pairs to sweep
-THRESHOLDS = [
-    (0.0,  0.0),
-    (1.0,  0.0),
-    (1.5,  0.0),
-    (2.0,  0.0),
-    (2.0,  0.5),
-    (2.0,  1.0),
-    (2.5,  0.5),
-    (2.5,  1.0),
-]
+ENTRY_GRID = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+EXIT_GRID  = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+
+THRESHOLDS = [(0.0, 0.0)] + [(e, x) for e in ENTRY_GRID for x in EXIT_GRID if x < e]
 
 
 def _hysteresis_indicator(z: pd.Series, entry: float, exit_z: float = 0.0) -> pd.Series:
@@ -169,18 +162,34 @@ def run_sweep(markets: list[str] | None = None) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    print("Running butterfly hysteresis sweep...\n")
+    print("Running butterfly hysteresis grid search...\n")
     df = run_sweep()
 
     pd.set_option("display.width", 180)
     pd.set_option("display.float_format", "{:.2f}".format)
 
-    print("\n=== Cross-market equal-weight average ===")
-    cols = ["gross_sr", "net_sr_frz_best", "net_sr_frz_base", "net_sr_cont_best",
-            "dv01_pd_frz", "pct_in_mkt"]
-    agg = df.groupby(["entry_z", "exit_z", "period"])[cols].mean().round(2)
-    print(agg.to_string())
+    is_df  = df[df.period == "IS"].copy()
+    oos_df = df[df.period == "OOS"].copy()
 
-    print("\n=== Per-market IS results ===")
-    is_df = df[df.period == "IS"].drop(columns="period")
-    print(is_df.to_string(index=False))
+    best_is = (is_df.loc[is_df.groupby("mkt")["net_sr_frz_best"].idxmax()]
+                    .set_index("mkt")[["entry_z", "exit_z", "gross_sr",
+                                       "net_sr_frz_best", "net_sr_frz_base",
+                                       "dv01_pd_frz", "pct_in_mkt"]])
+
+    oos_at_best = (oos_df.merge(
+        best_is.reset_index()[["mkt", "entry_z", "exit_z"]],
+        on=["mkt", "entry_z", "exit_z"], how="inner"
+    ).set_index("mkt")[["entry_z", "exit_z", "gross_sr",
+                         "net_sr_frz_best", "net_sr_frz_base",
+                         "dv01_pd_frz", "pct_in_mkt"]])
+
+    print("=== Best IS params per market ===")
+    print(best_is.round(2).to_string())
+    print()
+    print("=== OOS performance at best-IS params ===")
+    print(oos_at_best.round(2).to_string())
+
+    print("\n=== Full IS grid (all markets averaged) ===")
+    cols = ["gross_sr", "net_sr_frz_best", "net_sr_frz_base", "dv01_pd_frz", "pct_in_mkt"]
+    agg = is_df.groupby(["entry_z", "exit_z"])[cols].mean().round(2)
+    print(agg.to_string())
