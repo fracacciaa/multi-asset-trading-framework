@@ -16,10 +16,19 @@ Pipeline:
     F_norm  →  RollingMSRR(penalty="ridge")  →  time-varying blend weights
     blend weights  →  combined portfolio return
 
-Signals (production, from rates/signals/):
+Production signals (from rates/signals/):
     momentum        momentum_a_daily_pnl.parquet      daily TSMOM (8 markets)
     carry           carry_ois_par_pnl.parquet          within-curve OIS carry (7 markets)
     mean_reversion  mean_reversion_dir_pnl.parquet     NS MR direction + hysteresis (entry=2.5, exit=0.25)
+
+Research MR variants (not in production blend, parquets available in rates/signals/):
+    classic   mean_reversion_pnl.parquet             continuous daily rebalancing, 15 tenors
+    fly       mean_reversion_fly_pnl.parquet         3-leg DV01-neutral butterfly
+    spread    mean_reversion_spread_pnl.parquet      2-leg DV01-neutral (outer fly legs)
+
+To evaluate a research blend, use MR_RESEARCH_FILES:
+    from rates.blend import MR_RESEARCH_FILES, MR_RESEARCH_POS_FILES, load_managed_returns
+    F = load_managed_returns(signals=MR_RESEARCH_FILES["classic"])
 
 Each PnL parquet is date × market (bp, daily).  load_managed_returns aggregates
 each signal to a scalar series using the signal-specific cross-market blend method.
@@ -82,6 +91,45 @@ _POS_FILES: dict[str, str] = {
 
 IS_END    = "2020-12-31"
 OOS_START = "2021-01-01"
+
+# ── Research-only MR signal variants ─────────────────────────────────────────
+# Not in production blend.  Pass to load_managed_returns(signals=...) or
+# tc_sweep_rates() to evaluate a specific MR structure.
+MR_RESEARCH_FILES: dict[str, dict[str, str]] = {
+    "classic": {
+        "momentum":       "momentum_a_daily_pnl.parquet",
+        "carry":          "carry_ois_par_pnl.parquet",
+        "mean_reversion": "mean_reversion_pnl.parquet",
+    },
+    "fly": {
+        "momentum":       "momentum_a_daily_pnl.parquet",
+        "carry":          "carry_ois_par_pnl.parquet",
+        "mean_reversion": "mean_reversion_fly_pnl.parquet",
+    },
+    "spread": {
+        "momentum":       "momentum_a_daily_pnl.parquet",
+        "carry":          "carry_ois_par_pnl.parquet",
+        "mean_reversion": "mean_reversion_spread_pnl.parquet",
+    },
+}
+
+MR_RESEARCH_POS_FILES: dict[str, dict[str, str]] = {
+    "classic": {
+        "momentum":       "momentum_a_daily.parquet",
+        "carry":          "carry_ois_par.parquet",
+        "mean_reversion": "mean_reversion_dv01_pos.parquet",
+    },
+    "fly": {
+        "momentum":       "momentum_a_daily.parquet",
+        "carry":          "carry_ois_par.parquet",
+        "mean_reversion": "mean_reversion_fly_dv01_pos.parquet",
+    },
+    "spread": {
+        "momentum":       "momentum_a_daily.parquet",
+        "carry":          "carry_ois_par.parquet",
+        "mean_reversion": "mean_reversion_spread_dv01_pos.parquet",
+    },
+}
 
 # ── Market-specific TC scenarios ─────────────────────────────────────────────
 # Half-spread estimates in bp of yield, one-way, per OIS market.
