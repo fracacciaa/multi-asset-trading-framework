@@ -9,6 +9,8 @@ Outputs written to rates/signals/:
   momentum_a_daily.parquet    date × (market, tenor)        MOP TSMOM position sizes
   momentum_a_daily_pnl.parquet date × market                momentum daily PnL, full repricing (bp)
   mean_reversion_pnl.parquet  date × market                 NS classic MR daily PnL, full repricing (bp)
+  mean_reversion_fly_pnl.parquet      date × market         NS MR butterfly daily PnL, full repricing (bp)
+  mean_reversion_fly_dv01_pos.parquet date × (market,tenor) NS MR butterfly held DV01 positions
   mean_reversion_zscores.parquet date × (market, tenor)     NS classic MR z-scores (signal + TC proxy)
   carry_ois_par.parquet       date × (market, tenor)        within-curve carry OIS positions
   carry_ois_par_pnl.parquet   date × market                 within-curve carry OIS PnL, full repricing (bp)
@@ -34,6 +36,7 @@ from rates.production.nelson_siegel import extract_factors_all_markets
 from rates.production.ns_classic.bootstrap import bootstrap_curves
 from rates.production.ns_classic.ns_fit import select_lambda
 from rates.production.ns_classic.pnl import classic_ns_pnl_repriced
+from rates.production.ns_classic.fly_signal import fly_pnl_repriced
 from rates.production.momentum.returns import build_all_return_panels
 from rates.production.momentum.signal_a import build_signal_a_daily
 from rates.production.momentum.signal_a import DM_MARKETS as MOM_MARKETS
@@ -51,6 +54,7 @@ OUTPUT_DIR = Path(__file__).parent.parent / "signals"
 _LAM_TRAIN_END = "2015-12-31"
 _MR_TARGET_VOL = 100.0   # bp/yr vol target per market
 _MR_BURN_IN    = 252     # trading days before signal goes live
+_MR_FLY_LEG_IS_END = "2020-12-31"   # fly legs chosen on IS z-scores only
 
 
 def run(
@@ -243,6 +247,48 @@ def run(
         mr_dv01_pos = pd.DataFrame()
     _save("mean_reversion_dv01_pos.parquet", mr_dv01_pos)
 
+    # ── NS classic MR as an explicit DV01-neutral butterfly ───────────────────
+    # Same residual idea, expressed as one three-leg package per market instead
+    # of a 15-leg whole-curve book.  Legs are picked by a fixed a-priori rule
+    # (see fly_signal.select_fly_legs); nothing is tuned per market.
+    _log("NS classic MR: butterfly variant (full swap repricing)...")
+    fly_pnl_dict:  dict[str, pd.Series]    = {}
+    fly_pos_dict:  dict[str, pd.DataFrame] = {}
+    fly_legs_used: dict[str, list]         = {}
+    for mkt in markets:
+        if mkt not in par_curves:
+            continue
+        try:
+            par_mkt   = par_curves[mkt]
+            zeros_mkt = bootstrap_curves(par_mkt)
+            try:
+                lam = select_lambda(zeros_mkt, end=_LAM_TRAIN_END)["best_lambda"]
+            except Exception:
+                lam = 2.5
+            f_pnl, f_pos, f_legs = fly_pnl_repriced(
+                par_mkt, lam,
+                is_end=_MR_FLY_LEG_IS_END,
+                target_ann_vol=_MR_TARGET_VOL,
+                burn_in=_MR_BURN_IN,
+            )
+            fly_pnl_dict[mkt]  = f_pnl
+            fly_pos_dict[mkt]  = f_pos
+            fly_legs_used[mkt] = [float(x) for x in f_legs]
+            _log(f"  {mkt}: fly={tuple(int(x) for x in f_legs)}  n={f_pnl.dropna().__len__()}")
+        except Exception as exc:
+            _log(f"  Warning: NS MR butterfly failed for {mkt}: {exc}")
+
+    fly_pnl = pd.DataFrame(fly_pnl_dict)
+    fly_pnl.index.name = "date"
+    _save("mean_reversion_fly_pnl.parquet", fly_pnl)
+
+    if fly_pos_dict:
+        fly_pos = pd.concat(fly_pos_dict, axis=1)
+        fly_pos.columns.names = ["market", "tenor"]
+    else:
+        fly_pos = pd.DataFrame()
+    _save("mean_reversion_fly_dv01_pos.parquet", fly_pos)
+
     # ── Manifest ───────────────────────────────────────────────────────────────
     _sha_r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                             capture_output=True, text=True)
@@ -278,6 +324,8 @@ def run(
             "mean_reversion_pnl":       "date × market; NS classic MR full repricing — use for Sharpe (daily, √252)",
             "mean_reversion_zscores":   "date × (market,tenor) MultiIndex; NS classic z-scores — diagnostic, NOT for TC",
             "mean_reversion_dv01_pos":  "date × (market,tenor) MultiIndex; held DV01 positions (daily rebalancing) — use for TC estimation in rates/blend.py",
+            "mean_reversion_fly_pnl":      "date × market; NS MR butterfly full repricing — use for Sharpe (daily, √252)",
+            "mean_reversion_fly_dv01_pos": "date × (market,tenor) MultiIndex; butterfly held DV01 positions — use for TC estimation",
             "momentum_a_daily":         "date × (market,tenor); daily TSMOM positions (252d window) — signal only",
             "momentum_a_daily_pnl":     "date × market; full repricing pos × swap_pv × 10000 — use for Sharpe (daily, √252)",
             "rx_m":                     "date × (market,tenor); Sihvonen monthly log excess returns (bp)",
@@ -302,6 +350,8 @@ def run(
         "carry_ois_par":           carry_pos,
         "carry_ois_par_pnl":       carry_pnl,
         "mean_reversion_pnl":      mr_pnl,
+        "mean_reversion_fly_pnl":  fly_pnl,
+        "mean_reversion_fly_dv01_pos": fly_pos,
         "mean_reversion_zscores":  mr_zscores,
         "mean_reversion_dv01_pos": mr_dv01_pos,
         "momentum_a_daily":        mom_a_daily,

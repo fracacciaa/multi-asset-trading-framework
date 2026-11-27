@@ -127,6 +127,38 @@ CROSS_MARKET_BLEND: dict[str, str] = {
     "carry":          "inv_vol",
     "mean_reversion": "inv_vol",
 }
+
+# ── Optional variant: mean reversion as a DV01-neutral butterfly ─────────────
+# Same NS residual idea as `mean_reversion`, expressed as one three-leg package
+# per market instead of a 15-leg whole-curve book (see
+# rates/production/ns_classic/fly_signal.py).  It roughly halves gross
+# tenor-level turnover and gives a cost that can be quoted as a single package
+# spread, at a lower gross Sharpe.
+#
+# NOT part of the default blend.  To trade it in place of the whole-curve
+# signal, pass these registries explicitly, e.g.
+#
+#     from rates.blend import FLY_SIGNAL_FILES, load_managed_returns
+#     F = load_managed_returns(signals=FLY_SIGNAL_FILES,
+#                              cross_market_blend=FLY_CROSS_MARKET_BLEND)
+#
+FLY_SIGNAL_FILES: dict[str, str] = {
+    "momentum":           "momentum_a_daily_pnl.parquet",
+    "carry":              "carry_ois_par_pnl.parquet",
+    "mean_reversion_fly": "mean_reversion_fly_pnl.parquet",
+}
+
+FLY_POS_FILES: dict[str, str] = {
+    "momentum":           "momentum_a_daily.parquet",
+    "carry":              "carry_ois_par.parquet",
+    "mean_reversion_fly": "mean_reversion_fly_dv01_pos.parquet",
+}
+
+FLY_CROSS_MARKET_BLEND: dict[str, str] = {
+    "momentum":           "inv_vol",
+    "carry":              "inv_vol",
+    "mean_reversion_fly": "inv_vol",
+}
 _CROSS_MARKET_MIN_MKT_DAYS: int   = 756   # min IS days a market needs to be included (≈3yr)
 
 
