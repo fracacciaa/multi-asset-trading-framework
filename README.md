@@ -31,6 +31,7 @@ Two conventions are shared by every sleeve:
 │   ├── paths.py            # Resolves MATF_DATA_DIR for raw Bloomberg exports
 │   ├── performance.py      # Sharpe, MDD, Calmar, VaR, CVaR, hit rate …
 │   ├── pipeline_report.py  # IS/OOS tearsheet formatter
+│   ├── refresh_cache.py    # Regenerate all core/cache report files
 │   └── signal_metrics.py   # Per-signal Sharpe / turnover helpers
 │
 ├── rates/
@@ -40,8 +41,9 @@ Two conventions are shared by every sleeve:
 │   │   │   ├── bootstrap.py            # OIS curve bootstrapping
 │   │   │   ├── ns_fit.py               # DV01-weighted NS regression + z-scores
 │   │   │   ├── signal.py               # build_dv01_positions (net-DV01 neutral)
-│   │   │   ├── fly_signal.py           # ← production MR: DV01-neutral 3-leg butterfly
-│   │   │   ├── spread_signal.py        # DV01-neutral two-tenor spread from NS residuals
+│   │   │   ├── direction_signal.py     # ← production MR: directional entry/exit with hysteresis
+│   │   │   ├── fly_signal.py           # Research: DV01-neutral 3-leg butterfly
+│   │   │   ├── spread_signal.py        # Research: DV01-neutral two-tenor spread
 │   │   │   └── pnl.py                  # Full swap repricing backtest (classic whole-curve)
 │   │   ├── momentum/                   # Daily TSMOM signal
 │   │   │   ├── signal_a.py
@@ -61,11 +63,15 @@ Two conventions are shared by every sleeve:
 │   │   ├── ns_core.py                  # Nelson-Siegel primitives shared across sub-packages
 │   │   └── data.py / ois_data.py       # Curve data loaders
 │   ├── signals/                        # ← parquet outputs (read by blend)
-│   │   ├── mean_reversion_pnl.parquet      date × market, bp
-│   │   ├── mean_reversion_dv01_pos.parquet date × (market, tenor)
-│   │   ├── mean_reversion_zscores.parquet  date × (market, tenor)
-│   │   ├── momentum_a_daily_pnl.parquet    date × market, bp
-│   │   ├── carry_ois_par_pnl.parquet       date × market, bp
+│   │   ├── mean_reversion_dir_pnl.parquet      date × market, bp  [PRODUCTION]
+│   │   ├── mean_reversion_dir_dv01_pos.parquet date × (market, tenor)  [PRODUCTION]
+│   │   ├── mean_reversion_pnl.parquet          date × market, bp  (classic input → direction)
+│   │   ├── mean_reversion_dv01_pos.parquet     date × (market, tenor)
+│   │   ├── mean_reversion_zscores.parquet      date × (market, tenor)
+│   │   ├── mean_reversion_fly_pnl.parquet      date × market, bp  [FROZEN research]
+│   │   ├── mean_reversion_spread_pnl.parquet   date × market, bp  [FROZEN research]
+│   │   ├── momentum_a_daily_pnl.parquet        date × market, bp
+│   │   ├── carry_ois_par_pnl.parquet           date × market, bp
 │   │   └── ns_factors.parquet / ret_d / rx_m …
 │   └── blend.py            # Rolling Ridge MSRR across the three signals
 │
@@ -129,11 +135,15 @@ Outputs (all in `rates/signals/`):
 
 | File | Shape | Description |
 |---|---|---|
-| `mean_reversion_fly_pnl.parquet` | date × market | **Production MR**: NS butterfly daily PnL, full swap repricing (bp) |
-| `mean_reversion_fly_dv01_pos.parquet` | date × (market, tenor) | Butterfly held DV01 positions — TC proxy |
-| `mean_reversion_pnl.parquet` | date × market | *Research*: NS classic whole-curve MR PnL (bp) |
-| `mean_reversion_dv01_pos.parquet` | date × (market, tenor) | *Research*: Classic MR held DV01 positions |
+| `mean_reversion_dir_pnl.parquet` | date × market | **Production MR**: direction + hysteresis PnL, full swap repricing (bp) |
+| `mean_reversion_dir_dv01_pos.parquet` | date × (market, tenor) | Direction signal held DV01 positions — TC proxy |
+| `mean_reversion_pnl.parquet` | date × market | Classic NS whole-curve MR PnL — input to direction signal |
+| `mean_reversion_dv01_pos.parquet` | date × (market, tenor) | Classic MR held DV01 positions |
 | `mean_reversion_zscores.parquet` | date × (market, tenor) | NS residual z-scores |
+| `mean_reversion_fly_pnl.parquet` | date × market | *Frozen research*: NS DV01-neutral 3-leg butterfly PnL |
+| `mean_reversion_fly_dv01_pos.parquet` | date × (market, tenor) | *Frozen research*: Butterfly held DV01 positions |
+| `mean_reversion_spread_pnl.parquet` | date × market | *Frozen research*: DV01-neutral 2-leg spread PnL |
+| `mean_reversion_spread_dv01_pos.parquet` | date × (market, tenor) | *Frozen research*: Spread held DV01 positions |
 | `momentum_a_daily_pnl.parquet` | date × market | Daily TSMOM PnL, full repricing (bp) |
 | `momentum_a_daily.parquet` | date × (market, tenor) | TSMOM daily positions (DV01) |
 | `carry_ois_par_pnl.parquet` | date × market | Within-curve OIS carry PnL, full repricing (bp) |
@@ -159,20 +169,21 @@ Transaction costs are deducted per signal from their respective position parquet
 |---|---|---|
 | Carry | `\|Δpos_dv01\| × h_bp` | bp |
 | Momentum | `\|Δpos\| × h_bp × eff_dur` | bp |
-| Mean reversion | `\|Δ(net_dv01)\| × h_bp` | bp — net across tenors, not tenor by tenor |
+| Mean reversion | `\|Δpos_dv01_tenor\| × h_bp` per tenor | bp — charged on each tenor leg individually |
 
-To re-plug the classic NS whole-curve MR into the blend:
+To load research MR variants (classic / fly / spread) into the blend:
 
 ```python
-from rates.blend import CLASSIC_SIGNAL_FILES, CLASSIC_POS_FILES, load_managed_returns
-F = load_managed_returns(signals=CLASSIC_SIGNAL_FILES)
+from rates.blend import MR_RESEARCH_FILES, MR_RESEARCH_POS_FILES, load_managed_returns
+F = load_managed_returns(signals=MR_RESEARCH_FILES["classic"])
 ```
 
 ### Key design decisions
 
 - **Full swap repricing** — PnL is computed from `swap_pv(K, T−dt, curve_t)`, not `−D × Δy`. Carry, roll-down and curve moves are captured in one number.
-- **MR as a DV01-neutral butterfly** — the production `mean_reversion` signal trades a fixed 3-leg package (lower / body / upper) per market, selected a-priori from IS z-scores. Legs are DV01-weighted (−0.5, +1.0, −0.5), making the package neutral to level, slope and curvature by construction. This roughly halves gross turnover vs the classic 15-leg whole-curve book. The classic signal is kept in `mean_reversion_pnl.parquet` for research; swap back via `CLASSIC_SIGNAL_FILES`.
-- **TC on net DV01** — within-market tenor rebalancing is free; cost is charged only on changes in total market DV01 allocation.
+- **MR as direction + asymmetric hysteresis** — the production `mean_reversion` signal (NS z-scores from `direction_signal.py`) enters when `|z| > 2.5` with `sign(z)`, holds a fixed DV01 position frozen at ±median IS DV01 per tenor, and exits only when `|z| ≤ 0.25`. ~0.6–1.1 round-trips per tenor per year (vs. 252 for the classic continuous signal), so TC has negligible impact. Rates blend IS +3.77 / OOS +2.55; base TC OOS +1.73.
+- **Research MR signals** — classic whole-curve, DV01-neutral butterfly (fly), and two-leg spread are kept as frozen parquets and accessible via `MR_RESEARCH_FILES` in `blend.py`. They are never rebuilt by the pipeline.
+- **TC on per-leg DV01** — cost is charged on each tenor leg's absolute change in position, not the net across tenors. This correctly prices multi-leg structures (fly, spread) at their true gross turnover.
 
 ---
 
@@ -232,6 +243,27 @@ python -m core.main
 ```
 
 Runs all four sleeves, then blends them with static inverse-vol capital weights on raw sleeve returns (w ∝ 1/σ_IS, frozen) targeting 10% annual vol.
+
+**Current performance** (IS ≤ 2020-12-31 | OOS ≥ 2021-01-01 | 10% vol target):
+
+| Scenario | IS Sharpe | OOS Sharpe | OOS MDD |
+|---|---|---|---|
+| Gross (no TC) | +3.66 | +3.74 | −4.1% |
+| Scenario 1 (best TC) | +3.34 | +3.47 | −4.5% |
+| Scenario 2 (base TC) ← **production** | +2.79 | +3.03 | −5.4% |
+| Scenario 3 (worst TC) | +1.07 | +1.74 | −8.8% |
+
+---
+
+## Refreshing Cache Reports
+
+`core/cache/` holds pre-computed IS/OOS metrics and TC sweep reports for all asset classes and the cross-asset blend.  After any pipeline run that changes signal parquets, regenerate all cache files with:
+
+```bash
+python -m core.refresh_cache
+```
+
+This rewrites `rates_blend_comparison`, `rates_tc_metrics`, `asset_blend_comparison`, `asset_tc_metrics` (CSV + TXT) and `signal_metrics` (CSV + TXT report).
 
 ---
 
