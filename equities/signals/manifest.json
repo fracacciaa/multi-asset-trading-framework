@@ -475,6 +475,6 @@
     "mean_reversion_positions": "date \u00d7 ticker; mean_reversion ViewFormation positions",
     "carry_positions": "date \u00d7 ticker; carry ViewFormation positions"
   },
-  "git_sha": "fa12c03",
-  "built_at": "2026-11-26T15:33:37.847826Z"
+  "git_sha": "13df625",
+  "built_at": "2026-11-28T00:12:20.424476Z"
 }

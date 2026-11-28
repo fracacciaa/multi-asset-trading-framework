@@ -1,4 +1,26 @@
 {
+  "universe": [
+    "AUDUSD",
+    "EURUSD",
+    "GBPUSD",
+    "NZDUSD",
+    "USDCAD",
+    "USDCHF",
+    "USDCNY",
+    "USDCZK",
+    "USDDKK",
+    "USDHUF",
+    "USDJPY",
+    "USDKRW",
+    "USDMXN",
+    "USDNOK",
+    "USDPLN",
+    "USDSEK",
+    "USDSGD",
+    "USDTHB",
+    "USDTRY",
+    "USDZAR"
+  ],
   "fcu_base": [
     "AUDUSD",
     "EURUSD",
@@ -87,17 +109,25 @@
     "fly_pnl_type": "rx_d",
     "oos_sr_fly": 0.366
   },
-  "blend": {
-    "method": "msrr_ridge",
-    "lam": 0.01,
-    "fit": "static (IS-fit once, frozen weights)",
-    "signals": ["momentum", "mean_reversion", "carry"],
-    "cross_pair_blend": "inv_vol",
-    "universe": "19-pair (excludes USDTRY, absent from mr_fly_positions)",
-    "is_end": "2020-12-31",
-    "oos_start": "2021-01-01",
-    "blend_start": "1999-10-29"
+  "start": "1999-01-01",
+  "end": null,
+  "is_end": "2020-12-31",
+  "oos_start": "2021-01-01",
+  "params": {
+    "lam_grid": "[0.2        0.27179487 0.34358974 0.41538462 0.48717949 0.55897436\n 0.63076923 0.7025641  0.77435897 0.84615385 0.91794872 0.98974359\n 1.06153846 1.13333333 1.20512821 1.27692308 1.34871795 1.42051282\n 1.49230769 1.56410256 1.63589744 1.70769231 1.77948718 1.85128205\n 1.92307692 1.99487179 2.06666667 2.13846154 2.21025641 2.28205128\n 2.35384615 2.42564103 2.4974359  2.56923077 2.64102564 2.71282051\n 2.78461538 2.85641026 2.92820513 3.        ]"
   },
-  "git_sha": "407fda5",
-  "built_at": "2026-11-26T16:57:10.097195Z"
+  "files": {
+    "returns": "date \u00d7 (surface-col, pair) MultiIndex cols; monthly",
+    "rx_d": "date \u00d7 pair; daily FX excess returns",
+    "signal_a_f9_h1": "date \u00d7 pair; XS momentum f=9m h=1 (monthly rebalance)",
+    "signal_d_E_only_weights_daily": "date \u00d7 pair; rolling MV carry, E-only (daily)",
+    "signal_e_carry_daily": "date \u00d7 (base_weights/e3_weights, pair); crash-risk carry (daily)",
+    "mr_ns_loo_signal": "date \u00d7 pair; NS LOO VF TS z-score (monthly rebalance)",
+    "mr_ns_loo_positions": "date \u00d7 pair; NS LOO VF TS positions (monthly)",
+    "mr_ns_loo_positions_daily": "date \u00d7 pair; NS LOO XS positions (daily, n=4)",
+    "mr_fly_signal": "date \u00d7 pair; NS fly z-score",
+    "mr_fly_positions": "date \u00d7 pair; NS fly XS positions (daily, n=4)"
+  },
+  "git_sha": "13df625",
+  "built_at": "2026-11-28T00:13:36.663802Z"
 }
